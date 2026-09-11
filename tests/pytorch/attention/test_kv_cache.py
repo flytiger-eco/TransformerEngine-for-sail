@@ -22,6 +22,7 @@ from transformer_engine.pytorch import (
     DotProductAttention,
     InferenceParams,
     is_bf16_available,
+    is_fp8_available,
 )
 from transformer_engine.common import recipe
 from transformer_engine.pytorch.attention.dot_product_attention.utils import (
@@ -54,6 +55,9 @@ model_configs_infer = {
 }
 
 qkv_formats = ["bshd", "sbhd", "thd"]
+
+# Only run FP8 tests on supported devices.
+fp8_available, reason_for_no_fp8 = is_fp8_available(return_reason=True)
 
 
 def to_pretty_string(x: torch.Tensor):
@@ -401,7 +405,15 @@ def get_tols(config, module, backend, dtype):
 @pytest.mark.parametrize("backend", ["FusedAttention", "FlashAttention", "UnfusedAttention"])
 @pytest.mark.parametrize("module", ["TransformerLayer", "DotProductAttention"])
 @pytest.mark.parametrize("is_cuda_graph", [False, True])
-@pytest.mark.parametrize("is_fp8", [False, True])
+@pytest.mark.parametrize(
+    "is_fp8",
+    [
+        False,
+        pytest.param(
+            True, marks=pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+        ),
+    ],
+)
 def test_kv_cache(dtype, model, qkv_format, is_paged, backend, module, is_cuda_graph, is_fp8):
     reset_rng_states()
     logger = logging.getLogger("test_kv_cache")

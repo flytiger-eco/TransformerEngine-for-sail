@@ -30,6 +30,11 @@ namespace mxfp8 {
 namespace group_quantize_kernel {
 
 using namespace dispatch::common;
+constexpr int MAX_SUPPORTED_TENSOR_DESCRIPTORS = 64;
+alignas(128) __device__ CUtensorMap g_tensor_maps_input[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
+alignas(128) __device__ CUtensorMap g_tensor_maps_act_input[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
+alignas(128) __device__  CUtensorMap g_tensor_maps_output_rowwise[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
+alignas(128) __device__ CUtensorMap g_tensor_maps_output_colwise[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
 
 struct TunableConfig {
   static constexpr uint CHUNK_DIM_Y = 128;

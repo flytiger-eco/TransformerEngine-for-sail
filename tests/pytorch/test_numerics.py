@@ -1998,10 +1998,10 @@ def test_grouped_linear_accuracy(
             torch.testing.assert_close(o, o_ref, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability() != (9, 0),
-    reason="Only enable CUTLASS grouped gemm on Hopper",
-)
+# @pytest.mark.skipif(
+#     torch.cuda.get_device_capability() != (9, 0),
+#     reason="Only enable CUTLASS grouped gemm on Hopper",
+# )
 @pytest.mark.parametrize("dtype", param_types, ids=str)
 @pytest.mark.parametrize("num_gemms", [3, 6])
 @pytest.mark.parametrize("bs", batch_sizes)

@@ -67,7 +67,7 @@ if is_bf16_available():  # bf16 requires sm_80 or higher
     _dtypes.append(torch.bfloat16)
 
 # Supported devices
-_devices: list[torch.device] = [torch.device("cpu"), torch.device("cuda")]
+_devices: list[torch.device] = [torch.device("cuda")]
 
 # Supported quantization recipes
 _quantization_list: list[Optional[str]] = [None]

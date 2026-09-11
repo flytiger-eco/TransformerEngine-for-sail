@@ -44,8 +44,9 @@ def scale_from_amax_tensor(
         exp = exp - 1
         # No subnormals and zero.
         assert (exp > -127).all()
-        unity = torch.tensor([1.0], device=exp.device)
-        torch.ldexp(unity, exp, out=scale)
+        # Construct 2**exp exactly from the IEEE-754 bit pattern.
+        exp_biased = exp.to(torch.int32) + 127
+        scale = (exp_biased << 23).view(torch.float32)
         # Case where amax is inf. The frexp, ldexp logic changes 0.0 scales
         # Return 0.0 for 0.0 scale for consistency with non-pow2 scale
         # calculation.

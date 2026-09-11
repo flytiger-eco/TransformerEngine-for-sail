@@ -114,8 +114,9 @@ bool has_mnnvl_fabric(int device_id) {
   CUdevice dev;
   NVTE_CALL_CHECK_CUDA_DRIVER(cuDeviceGet, &dev, device_id);
   int fabric_handle_supported = 0;
-  NVTE_CALL_CHECK_CUDA_DRIVER(cuDeviceGetAttribute, &fabric_handle_supported,
-                              CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
+  // Comment it because is unspported for sail api
+  // NVTE_CALL_CHECK_CUDA_DRIVER(cuDeviceGetAttribute, &fabric_handle_supported,
+  //                             CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
   if (fabric_handle_supported) {
     NVTE_CALL_CHECK_CUDA_NVML(nvmlInit_v2);
     nvmlDevice_t local_device;
