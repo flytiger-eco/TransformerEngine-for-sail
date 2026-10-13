@@ -1,0 +1,75 @@
+name: ppu-build
+
+on:
+  pull_request:
+      branches:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001"
+  NAMESPACE: "ppu-sched"
+  HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+  COMMAND: |
+    set -euo pipefail
+
+    # ---- 拉取源码（v2.16-SAIL 分支）并进入仓库目录 ----
+    # --recursive：TransformerEngine 编译依赖 3rdparty 下的子模块（cutlass / cudnn-frontend 等）
+    # 末尾的 TransformerEngine：把仓库克隆到该目录名，便于随后 cd
+    git clone --recursive https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.16-SAIL TransformerEngine
+    cd TransformerEngine
+
+    # ---- PPU SDK / NCCL 环境（镜像自带，存在即 source）----
+    SDK_INSTALL_DIR="${SDK_INSTALL_DIR:-/usr/local}"
+    if [[ -f "$SDK_INSTALL_DIR/PPU_SDK/envsetup.sh" ]]; then
+      set +u; source "$SDK_INSTALL_DIR/PPU_SDK/envsetup.sh"; set -u
+    fi
+    if [[ -f "$SDK_INSTALL_DIR/pccl/envsetup.sh" ]]; then
+      set +u; source "$SDK_INSTALL_DIR/pccl/envsetup.sh"; set -u
+    fi
+    command -v nvcc >/dev/null 2>&1 \
+      && echo "[build] nvcc: $(nvcc --version | tail -1)" \
+      || echo "[build] 警告: nvcc 不可用" >&2
+
+    # ================= 用户指定的编译命令 =================
+    export NVTE_BUILD_THREADS_PER_JOB=4
+    export MAX_JOBS=60
+
+    export NVTE_WITH_NCCL_EP=0 # 需要 sm90 及以上
+    export NVTE_CUDA_ARCHS="80;89"
+    export TORCH_CUDA_ARCH_LIST=8.0
+    export NVTE_FRAMEWORK=pytorch
+
+    BUILD_START=$(date +%s)
+    pip3 install --no-build-isolation -e . --no-deps 2>&1 | tee ppu_build.log
+    rc=${PIPESTATUS[0]}
+    BUILD_END=$(date +%s)
+    echo "[build] 编译耗时 $((BUILD_END - BUILD_START))s，退出码 ${rc}"
+    exit "${rc}"
+    # ======================================================
+
+jobs:
+  build:
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: "890P 单卡 (1 PPU)"
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=ZW-M890P"
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ env.IMAGE }}
+          command: ${{ env.COMMAND }}
+          namespace: ${{ env.NAMESPACE }}
+          timeout_minutes: 20
