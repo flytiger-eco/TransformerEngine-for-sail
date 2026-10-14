@@ -71,7 +71,7 @@ git clone https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.1
 
 # 2. Configure the build environment
 pip3 install -U packaging==24.2   
-pip install pybind==3.1.0
+pip install pybind11==3.1.0
 
 # The default configuration applies to artifact version v2.2, which requires
 # the separately provided PCCL NCCL wrapper. Download it from
