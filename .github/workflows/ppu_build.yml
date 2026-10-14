@@ -18,7 +18,7 @@ env:
   IMAGE: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001"
   NAMESPACE: "ppu-sched"
   HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
-  COMMAND: |
+  BUILD_COMMAND: |
     set -euo pipefail
     git clone https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.16-SAIL --recursive
 
@@ -46,11 +46,15 @@ env:
     export NVTE_CUDA_ARCHS="80;89"
 
     BUILD_START=$(date +%s)
-    pip3 install -v --no-build-isolation . 2>&1 | tee ppu_build.log
-    rc=${PIPESTATUS[0]}
+    rc=0
+    pip3 install -v --no-build-isolation . 2>&1 | tee ppu_build.log || rc=$?
     BUILD_END=$(date +%s)
     echo "[build] 编译耗时 $((BUILD_END - BUILD_START))s，退出码 ${rc}"
-    exit "${rc}"
+    [[ "${rc}" -eq 0 ]] || exit "${rc}"
+  TEST_SETUP: |
+    export TE_PATH="$PWD"
+    export XML_LOG_DIR="$PWD/logs"
+    pip install nvdlfw_inspect pydantic onnxscript einops
 
 jobs:
   build:
@@ -59,6 +63,7 @@ jobs:
       image: ghcr.io/actions/actions-runner:latest
     steps:
       - name: "890P 单卡 (1 PPU)"
+        id: build
         uses: flytiger-eco/ppu-distributed-action@main
         with:
           nnodes: 0
@@ -66,6 +71,54 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           host_volumes: ${{ env.HOST_VOLUMES }}
           image: ${{ env.IMAGE }}
-          command: ${{ env.COMMAND }}
+          command: ${{ env.BUILD_COMMAND }}
           namespace: ${{ env.NAMESPACE }}
           timeout_minutes: 20
+
+      - name: "L0 PyTorch Debug 单测 (1 PPU)"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=ZW-M890P"
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ env.IMAGE }}
+          command: |
+            ${{ env.BUILD_COMMAND }}
+            ${{ env.TEST_SETUP }}
+            bash qa/L0_pytorch_debug_unittest/test.sh
+          namespace: ${{ env.NAMESPACE }}
+          timeout_minutes: 120
+
+      - name: "L0 PyTorch 单测 (1 PPU)"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=ZW-M890P"
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ env.IMAGE }}
+          command: |
+            ${{ env.BUILD_COMMAND }}
+            ${{ env.TEST_SETUP }}
+            bash qa/L0_pytorch_unittest/test.sh
+          namespace: ${{ env.NAMESPACE }}
+          timeout_minutes: 240
+
+      - name: "L1 PyTorch 分布式单测 (4 PPU)"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 4
+          node_selector: "board-type=ZW-M890P"
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ env.IMAGE }}
+          command: |
+            ${{ env.BUILD_COMMAND }}
+            ${{ env.TEST_SETUP }}
+            bash qa/L1_pytorch_distributed_unittest/test.sh
+          namespace: ${{ env.NAMESPACE }}
+          timeout_minutes: 240
