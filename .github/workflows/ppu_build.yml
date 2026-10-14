@@ -20,41 +20,37 @@ env:
   HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
   COMMAND: |
     set -euo pipefail
+    git clone https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.16-SAIL --recursive
 
-    # ---- 拉取源码（v2.16-SAIL 分支）并进入仓库目录 ----
-    # --recursive：TransformerEngine 编译依赖 3rdparty 下的子模块（cutlass / cudnn-frontend 等）
-    # 末尾的 TransformerEngine：把仓库克隆到该目录名，便于随后 cd
-    git clone --recursive https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.16-SAIL TransformerEngine
-    cd TransformerEngine
+    pip3 install -U packaging==24.2
+    pip3 install pybind11==3.1.0
 
-    # ---- PPU SDK / NCCL 环境（镜像自带，存在即 source）----
     SDK_INSTALL_DIR="${SDK_INSTALL_DIR:-/usr/local}"
     if [[ -f "$SDK_INSTALL_DIR/PPU_SDK/envsetup.sh" ]]; then
       set +u; source "$SDK_INSTALL_DIR/PPU_SDK/envsetup.sh"; set -u
     fi
-    if [[ -f "$SDK_INSTALL_DIR/pccl/envsetup.sh" ]]; then
-      set +u; source "$SDK_INSTALL_DIR/pccl/envsetup.sh"; set -u
-    fi
-    command -v nvcc >/dev/null 2>&1 \
-      && echo "[build] nvcc: $(nvcc --version | tail -1)" \
-      || echo "[build] 警告: nvcc 不可用" >&2
 
-    # ================= 用户指定的编译命令 =================
+    PCCL_URL="https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
+    PCCL_TARBALL="/tmp/$(basename "${PCCL_URL}")"
+    wget -q -O "${PCCL_TARBALL}" "${PCCL_URL}"
+    tar zxf "${PCCL_TARBALL}" -C /usr/local
+    set +u; source /usr/local/pccl/envsetup.sh; set -u
+    export CPATH=${NCCL_HOME}/include${CPATH:+:$CPATH}
+
+    cd TransformerEngine-for-sail
     export NVTE_BUILD_THREADS_PER_JOB=4
     export MAX_JOBS=60
 
-    export NVTE_WITH_NCCL_EP=0 # 需要 sm90 及以上
-    export NVTE_CUDA_ARCHS="80;89"
-    export TORCH_CUDA_ARCH_LIST=8.0
     export NVTE_FRAMEWORK=pytorch
+    export NVTE_WITH_NCCL_EP=0
+    export NVTE_CUDA_ARCHS="80;89"
 
     BUILD_START=$(date +%s)
-    pip3 install --no-build-isolation -e . --no-deps 2>&1 | tee ppu_build.log
+    pip3 install -v --no-build-isolation . 2>&1 | tee ppu_build.log
     rc=${PIPESTATUS[0]}
     BUILD_END=$(date +%s)
     echo "[build] 编译耗时 $((BUILD_END - BUILD_START))s，退出码 ${rc}"
     exit "${rc}"
-    # ======================================================
 
 jobs:
   build:
