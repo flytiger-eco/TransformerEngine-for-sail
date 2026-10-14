@@ -54,21 +54,25 @@ For supported operating systems, CUDA Wrapper versions, and the full dependency 
 
 #### Docker (Recommended)
 
-TransformerEngine-for-SAIL is pre-installed in the matching SAIL runtime Docker image, so no extra installation is required. Using this image is recommended because it avoids manual setup of the base runtime environment.
+TransformerEngine-for-SAIL is pre-installed in the matching SGLang-for-SAIL Docker image, so no extra installation is required. Using this image is recommended because it avoids manual setup of the base runtime environment.
 
 #### Install from PyPI
 
 ```bash
-pip install transformer_engine==2.16.0 -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple  --no-deps --force
+pip install transformer_engine==2.16 -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple  --no-deps --force
 ```
 
 #### Source Installation
+Download a compatible PPU Docker image from the [Flytiger download page](https://www.flytiger-eco.com/download?businessType=DOCKER), then perform the build in the container.
 
 ```bash
 # 1. Clone the TransformerEngine source code and initialize submodules
 git clone https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.16-SAIL --recursive
 
 # 2. Configure the build environment
+pip3 install -U packaging==24.2   
+pip install pybind11==3.1.0
+
 # The default configuration applies to artifact version v2.2, which requires
 # the separately provided PCCL NCCL wrapper. Download it from
 # https://www.flytiger-eco.com/download?businessType=NCCL and select a package
@@ -77,7 +81,7 @@ tar zxf <matching-nccl-wrapper-package>.tar.gz -C /usr/local
 source /usr/local/pccl/envsetup.sh
 export CPATH=${NCCL_HOME}/include${CPATH:+:$CPATH}
 
-# 3. Build the package.
+# 3. Build the package
 cd TransformerEngine-for-sail
 export NVTE_FRAMEWORK=pytorch
 export NVTE_WITH_NCCL_EP=0
@@ -92,10 +96,8 @@ These environment variables can be set before installation to customize the buil
 * **CUDA_PATH**: Path to CUDA installation
 * **CUDNN_PATH**: Path to cuDNN installation
 * **CXX**: Path to C++ compiler
-* **NVTE_FRAMEWORK**: Comma-separated list of frameworks to build for (e.g., ``pytorch,jax``)
 * **MAX_JOBS**: Limit number of parallel build jobs (default varies by system)
 * **NVTE_BUILD_THREADS_PER_JOB**: Control threads per build job
-* **NVTE_CUDA_ARCHS**: Semicolon-separated list of CUDA compute architectures to compile for (e.g., ``80;90`` for A100 and H100). If not set, automatically determined based on CUDA version. Setting this can significantly reduce build time and binary size.
 
 ## Security
 For security information, please see [SECURITY.md](SECURITY.md).
