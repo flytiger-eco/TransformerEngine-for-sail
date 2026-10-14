@@ -65,7 +65,19 @@ pip install transformer_engine==2.16.0 -i https://pkg.flytiger-eco.com/artifacto
 #### Source Installation
 
 ```bash
-git clone https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.16 --recursive
+# 1. Clone the TransformerEngine source code and initialize submodules
+git clone https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.16-SAIL --recursive
+
+# 2. Configure the build environment
+# The default configuration applies to artifact version v2.2, which requires
+# the separately provided PCCL NCCL wrapper. Download it from
+# https://www.flytiger-eco.com/download?businessType=NCCL and select a package
+# matching the artifact version, CUDA version, and operating system.
+tar zxf <matching-nccl-wrapper-package>.tar.gz -C /usr/local
+source /usr/local/pccl/envsetup.sh
+export CPATH=${NCCL_HOME}/include${CPATH:+:$CPATH}
+
+# 3. Build the package.
 cd TransformerEngine-for-sail
 export NVTE_FRAMEWORK=pytorch
 export NVTE_WITH_NCCL_EP=0
