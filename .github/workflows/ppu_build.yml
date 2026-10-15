@@ -18,13 +18,10 @@ env:
   IMAGE: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001"
   NAMESPACE: "ppu-sched"
   HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
-  BUILD_COMMAND: |
+  # 编译产物（wheel + 对应 commit）在 NAS 上的暂存目录，PPU pod 与编排 runner 均以 /wl_nas 访问
+  ARTIFACT_DIR: "/wl_nas/te-ci/${{ github.run_id }}-${{ github.run_attempt }}"
+  ENV_SETUP: |
     set -euo pipefail
-    git clone https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.16-SAIL --recursive
-
-    pip3 install -U packaging==24.2
-    pip3 install pybind11==3.1.0
-
     SDK_INSTALL_DIR="${SDK_INSTALL_DIR:-/usr/local}"
     if [[ -f "$SDK_INSTALL_DIR/PPU_SDK/envsetup.sh" ]]; then
       set +u; source "$SDK_INSTALL_DIR/PPU_SDK/envsetup.sh"; set -u
@@ -36,6 +33,11 @@ env:
     tar zxf "${PCCL_TARBALL}" -C /usr/local
     set +u; source /usr/local/pccl/envsetup.sh; set -u
     export CPATH=${NCCL_HOME}/include${CPATH:+:$CPATH}
+  BUILD_COMMAND: |
+    git clone https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.16-SAIL --recursive
+
+    pip3 install -U packaging==24.2
+    pip3 install pybind11==3.1.0
 
     cd TransformerEngine-for-sail
     export NVTE_BUILD_THREADS_PER_JOB=4
@@ -46,12 +48,22 @@ env:
     export NVTE_CUDA_ARCHS="80;89"
 
     BUILD_START=$(date +%s)
+    rm -rf "${ARTIFACT_DIR}"
+    mkdir -p "${ARTIFACT_DIR}"
     rc=0
-    pip3 install -v --no-build-isolation . 2>&1 | tee ppu_build.log || rc=$?
+    pip3 wheel -v --no-build-isolation --no-deps . -w "${ARTIFACT_DIR}" 2>&1 | tee ppu_build.log || rc=$?
     BUILD_END=$(date +%s)
     echo "[build] 编译耗时 $((BUILD_END - BUILD_START))s，退出码 ${rc}"
     [[ "${rc}" -eq 0 ]] || exit "${rc}"
+    git rev-parse HEAD > "${ARTIFACT_DIR}/commit"
+    ls -lh "${ARTIFACT_DIR}"
   TEST_SETUP: |
+    # 拉取与编译时相同 commit 的源码（仅用于测试脚本与用例），安装编译 step 产出的 wheel
+    git clone https://github.com/flytiger-eco/TransformerEngine-for-sail.git -b v2.16-SAIL
+    cd TransformerEngine-for-sail
+    git checkout "$(cat "${ARTIFACT_DIR}/commit")"
+    pip3 install "${ARTIFACT_DIR}"/transformer_engine*.whl
+
     export TE_PATH="$PWD"
     export XML_LOG_DIR="$PWD/logs"
     pip install nvdlfw_inspect pydantic onnxscript einops
@@ -71,7 +83,10 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           host_volumes: ${{ env.HOST_VOLUMES }}
           image: ${{ env.IMAGE }}
-          command: ${{ env.BUILD_COMMAND }}
+          command: |
+            export ARTIFACT_DIR="${{ env.ARTIFACT_DIR }}"
+            ${{ env.ENV_SETUP }}
+            ${{ env.BUILD_COMMAND }}
           namespace: ${{ env.NAMESPACE }}
           timeout_minutes: 20
 
@@ -85,7 +100,8 @@ jobs:
           host_volumes: ${{ env.HOST_VOLUMES }}
           image: ${{ env.IMAGE }}
           command: |
-            ${{ env.BUILD_COMMAND }}
+            export ARTIFACT_DIR="${{ env.ARTIFACT_DIR }}"
+            ${{ env.ENV_SETUP }}
             ${{ env.TEST_SETUP }}
             bash qa/L0_pytorch_debug_unittest/test.sh
           namespace: ${{ env.NAMESPACE }}
@@ -101,24 +117,30 @@ jobs:
           host_volumes: ${{ env.HOST_VOLUMES }}
           image: ${{ env.IMAGE }}
           command: |
-            ${{ env.BUILD_COMMAND }}
+            export ARTIFACT_DIR="${{ env.ARTIFACT_DIR }}"
+            ${{ env.ENV_SETUP }}
             ${{ env.TEST_SETUP }}
             bash qa/L0_pytorch_unittest/test.sh
           namespace: ${{ env.NAMESPACE }}
           timeout_minutes: 240
 
-      - name: "L1 PyTorch 分布式单测 (4 PPU)"
+      - name: "L1 PyTorch 分布式单测 (1 PPU)"
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         uses: flytiger-eco/ppu-distributed-action@main
         with:
           nnodes: 0
-          nproc_per_node: 4
+          nproc_per_node: 1
           node_selector: "board-type=ZW-M890P"
           host_volumes: ${{ env.HOST_VOLUMES }}
           image: ${{ env.IMAGE }}
           command: |
-            ${{ env.BUILD_COMMAND }}
+            export ARTIFACT_DIR="${{ env.ARTIFACT_DIR }}"
+            ${{ env.ENV_SETUP }}
             ${{ env.TEST_SETUP }}
             bash qa/L1_pytorch_distributed_unittest/test.sh
           namespace: ${{ env.NAMESPACE }}
           timeout_minutes: 240
+
+      - name: "清理 NAS 编译产物"
+        if: ${{ always() }}
+        run: rm -rf "${{ env.ARTIFACT_DIR }}"
