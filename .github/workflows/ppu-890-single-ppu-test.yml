@@ -23,7 +23,6 @@ env:
   ARTIFACT_SUBDIR: "te-ci/${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}"
   ARTIFACT_DIR: "/mnt/wl_nas/te-ci/${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}"
   TE_REPO: "https://github.com/flytiger-eco/TransformerEngine-for-sail.git"
-  TE_BRANCH: "v2.16-SAIL"
   PCCL_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
 
   ENV_SETUP: |
@@ -44,9 +43,11 @@ env:
 
   TEST_SETUP: |
     # 拉取与编译时相同 commit 的源码（仅用于测试脚本与用例），安装编译 step 产出的 wheel
-    git clone -b "${TE_BRANCH}" "${TE_REPO}"
+    git init -q TransformerEngine-for-sail
     cd TransformerEngine-for-sail
-    git checkout "$(cat "${ARTIFACT_DIR}/commit")"
+    git remote add origin "${TE_REPO}"
+    git fetch -q --depth=1 origin "$(cat "${ARTIFACT_DIR}/commit")"
+    git checkout -q FETCH_HEAD
 
     pip3 install "${ARTIFACT_DIR}"/transformer_engine*.whl
     pip3 install nvdlfw_inspect pydantic onnxscript einops

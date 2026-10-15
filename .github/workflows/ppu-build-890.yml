@@ -22,7 +22,7 @@ env:
   ARTIFACT_SUBDIR: "te-ci/${{ github.run_id }}-${{ github.run_attempt }}"
   ARTIFACT_DIR: "/mnt/wl_nas/te-ci/${{ github.run_id }}-${{ github.run_attempt }}"
   TE_REPO: "https://github.com/flytiger-eco/TransformerEngine-for-sail.git"
-  TE_BRANCH: "v2.16-SAIL"
+  TE_REF: "${{ github.event.pull_request.head.sha || github.sha }}"
   PCCL_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
 
   ENV_SETUP: |
@@ -42,8 +42,12 @@ env:
     export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
 
   BUILD_COMMAND: |
-    git clone --recursive -b "${TE_BRANCH}" "${TE_REPO}"
+    git init -q TransformerEngine-for-sail
     cd TransformerEngine-for-sail
+    git remote add origin "${TE_REPO}"
+    git fetch -q --depth=1 origin "${TE_REF}"
+    git checkout -q FETCH_HEAD
+    git submodule update --init --recursive
 
     pip3 install -U packaging==24.2 pybind11==3.1.0
 
