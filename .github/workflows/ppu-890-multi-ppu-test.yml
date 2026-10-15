@@ -1,0 +1,89 @@
+name: ppu-890-multi-ppu-test
+
+on:
+  workflow_run:
+    workflows:
+      - "ppu-890-build"
+    types:
+      - completed
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001"
+  NAMESPACE: "ppu-sched"
+  NODE_SELECTOR: "board-type=ZW-M890P"
+  HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+  ARTIFACT_SUBDIR: "te-ci/${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}"
+  ARTIFACT_DIR: "/mnt/wl_nas/te-ci/${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}"
+  TE_REPO: "https://github.com/flytiger-eco/TransformerEngine-for-sail.git"
+  PCCL_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
+
+  ENV_SETUP: |
+    set -euo pipefail
+
+    # PPU SDK
+    SDK_INSTALL_DIR="${SDK_INSTALL_DIR:-/usr/local}"
+    if [[ -f "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh" ]]; then
+      set +u; source "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh"; set -u
+    fi
+
+    # PCCL (NCCL wrapper)
+    PCCL_TARBALL="/tmp/$(basename "${PCCL_URL}")"
+    wget -q -O "${PCCL_TARBALL}" "${PCCL_URL}"
+    tar zxf "${PCCL_TARBALL}" -C /usr/local
+    set +u; source /usr/local/pccl/envsetup.sh; set -u
+    export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
+
+  TEST_SETUP: |
+    # 拉取与编译时相同 commit 的源码（仅用于测试脚本与用例），安装编译 step 产出的 wheel
+    git init -q TransformerEngine-for-sail
+    cd TransformerEngine-for-sail
+    git remote add origin "${TE_REPO}"
+    git fetch -q --depth=1 origin "$(cat "${ARTIFACT_DIR}/commit")"
+    git checkout -q FETCH_HEAD
+
+    pip3 install "${ARTIFACT_DIR}"/transformer_engine*.whl
+    pip3 install nvdlfw_inspect pydantic onnxscript einops
+
+    export TE_PATH="${PWD}"
+    export XML_LOG_DIR="${PWD}/logs"
+
+jobs:
+  test:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: "L1 PyTorch 分布式单测 (890P, 4 PPU)"
+        if: ${{ !cancelled() }}
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          nnodes: 0
+          nproc_per_node: 4
+          timeout_minutes: 240
+          command: |
+            ${{ env.ENV_SETUP }}
+            ${{ env.TEST_SETUP }}
+            bash qa/L1_pytorch_distributed_unittest/test.sh
+
+      - name: "标记多 PPU 测试完成并按需清理 NAS 产物"
+        if: always()
+        run: |
+          artifact_dir="/wl_nas/${{ env.ARTIFACT_SUBDIR }}"
+          mkdir -p "${artifact_dir}"
+          touch "${artifact_dir}/multi.done"
+          if [[ -f "${artifact_dir}/single.done" ]]; then
+            rm -rf "${artifact_dir}"
+          fi
