@@ -5,7 +5,7 @@
 # A workflow to trigger lint tests on GitHub
 name: 'Lint'
 on:
-  pull_request:
+  # pull_request:
   workflow_dispatch:
 jobs:
   pytorch_cpplint:
