@@ -802,6 +802,8 @@ class FlashAttention(torch.nn.Module):
         use_flash_attn_3 = False
         if flash_attention_backend is not None and flash_attention_backend > PkgVersion("3.0.0b"):
             use_flash_attn_3 = True
+        if alibi_slopes is not None or self.attention_dropout != 0.0:
+            use_flash_attn_3 = False
         if context_parallel and all(
             not isinstance(x, Float8Tensor) for x in [query_layer, key_layer, value_layer]
         ):

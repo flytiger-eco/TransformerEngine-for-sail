@@ -1,3 +1,9 @@
+[submodule "3rdparty/actlize"]
+	path = 3rdparty/actlize
+	url = https://github.com/t-head/actlize.git
+[submodule "3rdparty/cudafy-for-sail"]
+	path = 3rdparty/cudafy-for-sail
+	url = https://github.com/flytiger-eco/cudafy-for-sail.git
 [submodule "3rdparty/googletest"]
 	path = 3rdparty/googletest
 	url = https://github.com/google/googletest.git

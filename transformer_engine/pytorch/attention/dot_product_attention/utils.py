@@ -398,12 +398,21 @@ def get_attention_backend(
     flash_attention_backend = None
     use_fused_attention = int(os.getenv("NVTE_FUSED_ATTN", "1"))
     use_unfused_attention = int(os.getenv("NVTE_UNFUSED_ATTN", "1"))
+
+    # HACK: Force FlashAttention preference over FusedAttention
+    # Redirect FusedAttention to FlashAttention when FusedAttention is unavailable
+    if use_fused_attention:
+        logger.debug("FusedAttention is selected but unavailable, redirecting to FlashAttention")
+        use_fused_attention = False
+        use_flash_attention = True
+        use_flash_attention_2 = use_flash_attention_2 and use_flash_attention
+        use_flash_attention_3 = use_flash_attention_3 and use_flash_attention
     if not use_flash_attention_2 and FlashAttentionUtils.is_installed:
         logger.debug("Disabling FlashAttention 2 due to NVTE_FLASH_ATTN=0")
     if not use_flash_attention_3 and FlashAttentionUtils.v3_is_installed:
         logger.debug("Disabling FlashAttention 3 due to NVTE_FLASH_ATTN=0")
     if not use_fused_attention:
-        logger.debug("Disabling FusedAttention due to NVTE_FUSED_ATTN=0")
+        logger.debug("Disabling FusedAttention due to NVTE_FUSED_ATTN=0 and ppu cudnn fused_attn unavailable")
     if not use_unfused_attention:
         logger.debug("Disabling UnfusedDotProductAttention due to NVTE_UNFUSED_ATTN=0")
 
@@ -415,10 +424,11 @@ def get_attention_backend(
         if use_fused_attention:
             logger.debug("Disabling FusedAttention for compute capability < sm80")
             use_fused_attention = False
-    if device_compute_capability != (9, 0):
-        if use_flash_attention_3 and FlashAttentionUtils.v3_is_installed:
-            logger.debug("Disabling FlashAttention 3 for compute capability != sm90")
-        use_flash_attention_3 = False
+    # SAIL/PPU: device compute capability is (8, 9); keep FlashAttention 3 enabled
+    # if device_compute_capability != (9, 0):
+    #     if use_flash_attention_3 and FlashAttentionUtils.v3_is_installed:
+    #         logger.debug("Disabling FlashAttention 3 for compute capability != sm90")
+    #     use_flash_attention_3 = False
 
     # Filter: Data type
     if qkv_dtype not in [torch.bfloat16, torch.float16]:

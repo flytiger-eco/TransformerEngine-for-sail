@@ -64,7 +64,7 @@ def check_nvfp4_support() -> Tuple[bool, str]:
 def check_fp8_block_scaling_support() -> Tuple[bool, str]:
     """Return if fp8 block scaling support is available"""
     if (
-        get_device_compute_capability() >= (9, 0)
+        get_device_compute_capability() >= (8, 9)  # SAIL/PPU: was (9, 0); lowered to admit PPU (8.9)
         and get_device_compute_capability() < (10, 0)
         and float(torch.version.cuda) >= 12.9
     ):
