@@ -1245,6 +1245,8 @@ class FlashAttention(torch.nn.Module):
             query_layer, key_layer, value_layer = [
                 x.contiguous() for x in (query_layer, key_layer, value_layer)
             ]
+        if alibi_slopes is not None or self.attention_dropout != 0.0:
+            use_flash_attn_3 = False
         if context_parallel and all(
             not isinstance(x, Float8Tensor) for x in [query_layer, key_layer, value_layer]
         ):

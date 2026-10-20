@@ -28,8 +28,8 @@ namespace mxfp8 {
 namespace group_dequantize_kernel {
 
 constexpr int MAX_SUPPORTED_TENSOR_DESCRIPTORS = 64;
-__device__ alignas(128) CUtensorMap g_tensor_maps_input[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
-__device__ alignas(128) CUtensorMap g_tensor_maps_output[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
+alignas(128) __device__ CUtensorMap g_tensor_maps_input[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
+alignas(128) __device__ CUtensorMap g_tensor_maps_output[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
 
 // Reuse helper types and functions from common namespace
 using common::fence_acquire_tensormap;

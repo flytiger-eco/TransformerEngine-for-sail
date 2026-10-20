@@ -4,6 +4,21 @@
 
 cmake_minimum_required(VERSION 3.21)
 
+# Run cudafy for actlize
+set(NVTE_ROOT_DIR ${CMAKE_CURRENT_LIST_DIR}/../..)
+execute_process(
+  COMMAND python3 ${NVTE_ROOT_DIR}/3rdparty/cudafy-for-sail/cudafy.py
+          actlize --version=1.0.0 ${NVTE_ROOT_DIR}/3rdparty/actlize/include
+  WORKING_DIRECTORY ${NVTE_ROOT_DIR}
+  RESULT_VARIABLE CUDAFY_RESULT
+  OUTPUT_VARIABLE CUDAFY_OUTPUT
+  ERROR_VARIABLE CUDAFY_OUTPUT
+)
+if(NOT CUDAFY_RESULT EQUAL 0)
+  message(FATAL_ERROR "cudafy.py failed (exit code ${CUDAFY_RESULT}):\n${CUDAFY_OUTPUT}")
+endif()
+message(STATUS "cudafy.py actlize done")
+
 # Language options
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
@@ -87,15 +102,15 @@ if (CUDAToolkit_VERSION VERSION_LESS 12.1)
 endif()
 
 # Process GPU architectures
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.0)
-    set(CMAKE_CUDA_ARCHITECTURES 75 80 89 90 100 120)
+  set(CMAKE_CUDA_ARCHITECTURES 75 80 89 90 100 120)
   elseif (CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.8)
-    set(CMAKE_CUDA_ARCHITECTURES 70 80 89 90 100 120)
+  set(CMAKE_CUDA_ARCHITECTURES 70 80 89 90 100 120)
   else ()
-    set(CMAKE_CUDA_ARCHITECTURES 70 80 89 90)
+  set(CMAKE_CUDA_ARCHITECTURES 70 80 89 90)
   endif()
-endif()
+  endif()
 
 # Process CMAKE_CUDA_ARCHITECTURES to separate standard, generic, and specific architectures.
 # - NVTE_STANDARD_ARCHS: pre-Blackwell archs (e.g. 75, 80, 89, 90). Applied to all CUDA sources.
@@ -164,6 +179,11 @@ set(CUTLASS_INCLUDE_DIR
 set(CUTLASS_TOOLS_INCLUDE_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/cutlass/tools/util/include")
 
+set(ACTLIZE_INCLUDE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/actlize/include")
+set(ACTLIZE_TOOLS_INCLUDE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/actlize/tools/util/include")
+
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
@@ -185,6 +205,7 @@ find_path(NCCL_INCLUDE_DIR
           HINTS "${Python_SITEARCH}/nvidia/nccl"
                 "/opt/nvidia/nccl"
                 "/usr/local/nccl"
+                "$ENV{CUDA_SDK}/targets/x86_64-linux/include"
             PATH_SUFFIXES include
             REQUIRED)
 
@@ -428,7 +449,7 @@ foreach(cuda_source IN LISTS transformer_engine_cuda_arch_specific_sources)
     )
   endif()
 endforeach()
-
+ 
 add_library(transformer_engine SHARED ${transformer_engine_SOURCES})
 nvte_enable_bolt_compatible_compile_options(transformer_engine)
 
@@ -477,7 +498,33 @@ set_property(
   SOURCE ${CUTLASS_KERNEL_SOURCES}
   APPEND
   PROPERTY
-  COMPILE_OPTIONS "-g0;-dopt=on")
+  COMPILE_OPTIONS "-g0;-dopt=on;-Xcompiler=-fPIC")
+
+set(transformer_engine_grouped_gemm_sources
+    gemm/cutlass_grouped_gemm_ppu.cu
+    )
+
+add_library(transformer_engine_groupgemm_ppu STATIC ${transformer_engine_grouped_gemm_sources})
+set_property(TARGET transformer_engine_groupgemm_ppu PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET transformer_engine_groupgemm_ppu PROPERTY CUDA_ARCHITECTURES OFF)
+
+set_property(
+  SOURCE gemm/cutlass_grouped_gemm_ppu.cu
+  APPEND
+  PROPERTY
+  COMPILE_OPTIONS "--generate-code=arch=compute_80a,code=sm_80a;--generate-code=arch=compute_89,code=sm_89;-g0")
+
+target_include_directories(transformer_engine_groupgemm_ppu PRIVATE
+                          ${ACTLIZE_INCLUDE_DIR}
+                          ${ACTLIZE_TOOLS_INCLUDE_DIR})
+target_include_directories(transformer_engine_groupgemm_ppu PUBLIC
+                          "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(transformer_engine_groupgemm_ppu PRIVATE 
+                          "${CUDNN_FRONTEND_INCLUDE_DIR}")
+target_compile_definitions(transformer_engine_groupgemm_ppu PRIVATE
+                          NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+                          )
+target_link_libraries(transformer_engine PUBLIC transformer_engine_groupgemm_ppu)
 
 # Configure dependencies
 target_link_libraries(transformer_engine PUBLIC
