@@ -4,6 +4,8 @@ on:
   pull_request:
     branches:
       - 'v2.16-SAIL'
+  schedule:
+    - cron: '0 2 * * 1'
   workflow_dispatch:
 
 concurrency:
