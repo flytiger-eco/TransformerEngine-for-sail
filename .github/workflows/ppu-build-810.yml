@@ -101,7 +101,3 @@ jobs:
           command: |
             ${{ env.ENV_SETUP }}
             ${{ env.BUILD_COMMAND }}
-
-      - name: "清理 NAS 编译产物"
-        if: always()
-        run: rm -rf "/wl_nas/${{ env.ARTIFACT_SUBDIR }}"
