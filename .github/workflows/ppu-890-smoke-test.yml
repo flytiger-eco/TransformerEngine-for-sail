@@ -1,0 +1,109 @@
+name: ppu-890-smoke-test
+
+on:
+  workflow_run:
+    workflows:
+      - "ppu-890-build"
+    types:
+      - completed
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001"
+  NAMESPACE: "ppu-sched"
+  NODE_SELECTOR: "board-type=ZW-M890P"
+  HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+  ARTIFACT_SUBDIR: "te-ci/${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}"
+  ARTIFACT_DIR: "/mnt/wl_nas/te-ci/${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}"
+  TE_REPO: "https://github.com/flytiger-eco/TransformerEngine-for-sail.git"
+  PCCL_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
+
+  ENV_SETUP: |
+    set -euo pipefail
+
+    # PPU SDK
+    SDK_INSTALL_DIR="${SDK_INSTALL_DIR:-/usr/local}"
+    if [[ -f "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh" ]]; then
+      set +u; source "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh"; set -u
+    fi
+
+    # PCCL (NCCL wrapper)
+    PCCL_TARBALL="/tmp/$(basename "${PCCL_URL}")"
+    wget -q -O "${PCCL_TARBALL}" "${PCCL_URL}"
+    tar zxf "${PCCL_TARBALL}" -C /usr/local
+    set +u; source /usr/local/pccl/envsetup.sh; set -u
+    export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
+
+  TEST_SETUP: |
+    # 拉取与编译时相同 commit 的源码（仅用于测试脚本与用例），安装编译 step 产出的 wheel
+    git init -q TransformerEngine-for-sail
+    cd TransformerEngine-for-sail
+    git remote add origin "${TE_REPO}"
+    git fetch -q --depth=1 origin "$(cat "${ARTIFACT_DIR}/commit")"
+    git checkout -q FETCH_HEAD
+
+    pip3 install "${ARTIFACT_DIR}"/transformer_engine*.whl
+    pip3 install nvdlfw_inspect pydantic onnxscript einops psutil transformers scipy==1.18.1 pytest==8.2.1
+
+    export TE_PATH="${PWD}"
+    export XML_LOG_DIR="${PWD}/logs"
+    mkdir -p "$XML_LOG_DIR"
+
+  SMOKE_TEST: |
+    set -x
+    : ${NVTE_TEST_NVINSPECT_FEATURE_DIRS:=$TE_PATH/transformer_engine/debug/features}
+
+    RET=0
+    FAILED_CASES=""
+
+    pytest -v -s $TE_PATH/tests/pytorch/debug/test_sanity.py --feature_dirs=$NVTE_TEST_NVINSPECT_FEATURE_DIRS || FAILED_CASES="$FAILED_CASES debug/test_sanity.py"
+    pytest -v -s $TE_PATH/tests/pytorch/debug/test_config.py --feature_dirs=$NVTE_TEST_NVINSPECT_FEATURE_DIRS || FAILED_CASES="$FAILED_CASES debug/test_config.py"
+
+    NVTE_GROUPED_LINEAR_SINGLE_PARAM=1 python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_sanity.py || FAILED_CASES="$FAILED_CASES test_sanity.py"
+    python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_recipe.py || FAILED_CASES="$FAILED_CASES test_recipe.py"
+    python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_jit.py || FAILED_CASES="$FAILED_CASES test_jit.py"
+    NVTE_GROUPED_LINEAR_SINGLE_PARAM=1 python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_grouped_tensor.py || FAILED_CASES="$FAILED_CASES test_grouped_tensor.py"
+    python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/attention/test_attention.py || FAILED_CASES="$FAILED_CASES test_attention.py"
+    NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/attention/test_attention.py || FAILED_CASES="$FAILED_CASES NVTE_ALLOW_NONDETERMINISTIC_ALGO=0/test_attention.py"
+
+    if [ -n "$FAILED_CASES" ]; then
+      echo "Smoke test failed cases:$FAILED_CASES"
+      RET=1
+    else
+      echo "All smoke tests passed"
+    fi
+    exit $RET
+
+jobs:
+  test:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: "Smoke Test (890P, 1 PPU)"
+        if: ${{ !cancelled() }}
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          nnodes: 0
+          nproc_per_node: 1
+          timeout_minutes: 120
+          command: |
+            ${{ env.ENV_SETUP }}
+            ${{ env.TEST_SETUP }}
+            ${{ env.SMOKE_TEST }}
+
+      - name: "清理 NAS 产物"
+        if: always()
+        run: rm -rf "/wl_nas/${{ env.ARTIFACT_SUBDIR }}"
