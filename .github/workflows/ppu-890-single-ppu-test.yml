@@ -109,13 +109,3 @@ jobs:
             ${{ env.ENV_SETUP }}
             ${{ env.TEST_SETUP }}
             bash qa/L1_pytorch_distributed_unittest/test.sh
-
-      - name: "标记单 PPU 测试完成并按需清理 NAS 产物"
-        if: always()
-        run: |
-          artifact_dir="/wl_nas/${{ env.ARTIFACT_SUBDIR }}"
-          mkdir -p "${artifact_dir}"
-          touch "${artifact_dir}/single.done"
-          if [[ -f "${artifact_dir}/multi.done" ]]; then
-            rm -rf "${artifact_dir}"
-          fi
