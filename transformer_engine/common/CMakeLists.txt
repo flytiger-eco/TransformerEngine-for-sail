@@ -4,20 +4,8 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-# Run cudafy for actlize
+# Repo root, used by the actlize effective-tree materialization below.
 set(NVTE_ROOT_DIR ${CMAKE_CURRENT_LIST_DIR}/../..)
-execute_process(
-  COMMAND python3 ${NVTE_ROOT_DIR}/3rdparty/cudafy-for-sail/cudafy.py
-          actlize --version=1.0.0 ${NVTE_ROOT_DIR}/3rdparty/actlize/include
-  WORKING_DIRECTORY ${NVTE_ROOT_DIR}
-  RESULT_VARIABLE CUDAFY_RESULT
-  OUTPUT_VARIABLE CUDAFY_OUTPUT
-  ERROR_VARIABLE CUDAFY_OUTPUT
-)
-if(NOT CUDAFY_RESULT EQUAL 0)
-  message(FATAL_ERROR "cudafy.py failed (exit code ${CUDAFY_RESULT}):\n${CUDAFY_OUTPUT}")
-endif()
-message(STATUS "cudafy.py actlize done")
 
 # Language options
 set(CMAKE_CXX_STANDARD 17)
@@ -118,10 +106,64 @@ set(CUTLASS_INCLUDE_DIR
 set(CUTLASS_TOOLS_INCLUDE_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/cutlass/tools/util/include")
 
+# The RTC grouped-GEMM path was developed against a separate cutlass3 checkout.
+# v2.16_dev uses the actlize submodule as the CUTLASS 3.x + PPU header source
+# (actlize is a PPU-modified CUTLASS 3.x). Redirect the legacy names there.
 set(ACTLIZE_INCLUDE_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/actlize/include")
 set(ACTLIZE_TOOLS_INCLUDE_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/actlize/tools/util/include")
+
+# TE-maintained overlay over the actlize submodule: CUDA-converted headers that
+# carry the RTC grouped-GEMM mainloop and epilogue implementations.
+# The submodule itself stays at pristine upstream v1.0.0 and is never modified
+# in place.
+set(ACTLIZE_OVERLAY_INCLUDE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/gemm/actlize_overlay/include")
+
+# Materialize the single effective include tree that the whole build (the host
+# nvcc TU and runtime NVRTC alike) compiles against: a copy of the pristine
+# actlize headers with the overlay files copied over them. One physical tree
+# is REQUIRED: these headers use #pragma once (per-path dedup), so a pure
+# -I-order overlay would expand both the overlay copy and the submodule copy
+# and fail with redefinition errors (some includes also resolve relatively
+# from the include root before -I is consulted). Like the cudafy step below,
+# this snapshot is taken at configure time -- re-run cmake after editing
+# actlize or overlay headers.
+set(NVTE_GG_EFFECTIVE_ACTLIZE "${CMAKE_BINARY_DIR}/actlize_effective")
+set(NVTE_GG_EFFECTIVE_ACTLIZE_INCLUDE "${NVTE_GG_EFFECTIVE_ACTLIZE}/include")
+set(NVTE_GG_EFFECTIVE_ACTLIZE_TOOLS_INCLUDE
+  "${NVTE_GG_EFFECTIVE_ACTLIZE}/tools/util/include")
+file(COPY "${ACTLIZE_INCLUDE_DIR}/"
+     DESTINATION "${NVTE_GG_EFFECTIVE_ACTLIZE_INCLUDE}/")
+file(COPY "${ACTLIZE_OVERLAY_INCLUDE_DIR}/cutlass/"
+     DESTINATION "${NVTE_GG_EFFECTIVE_ACTLIZE_INCLUDE}/cutlass/")
+# cudafy.py locates tools headers as <include_dir>/../tools/util/include, so
+# the effective tree must mirror the actlize repo layout.
+file(COPY "${ACTLIZE_TOOLS_INCLUDE_DIR}/"
+     DESTINATION "${NVTE_GG_EFFECTIVE_ACTLIZE_TOOLS_INCLUDE}/")
+
+# Run cudafy on the effective tree (hggc -> cuda mechanical conversion).
+# Idempotent; the overlay files are already in CUDA form and pass through
+# unchanged, and the submodule working tree is left pristine.
+execute_process(
+  COMMAND python3 ${NVTE_ROOT_DIR}/3rdparty/cudafy-for-sail/cudafy.py
+          actlize --version=1.0.0 ${NVTE_GG_EFFECTIVE_ACTLIZE_INCLUDE}
+  WORKING_DIRECTORY ${NVTE_ROOT_DIR}
+  RESULT_VARIABLE CUDAFY_RESULT
+  OUTPUT_VARIABLE CUDAFY_OUTPUT
+  ERROR_VARIABLE CUDAFY_OUTPUT
+)
+if(NOT CUDAFY_RESULT EQUAL 0)
+  message(FATAL_ERROR "cudafy.py failed (exit code ${CUDAFY_RESULT}):\n${CUDAFY_OUTPUT}")
+endif()
+message(STATUS "cudafy.py actlize (effective tree) done")
+
+# The RTC grouped-GEMM path compiles against the effective tree: pristine
+# actlize + TE overlay files, cudafy-converted. Runtime NVRTC resolves this
+# same directory via the build-time baked path (string_path_cutlass3_include).
+set(CUTLASS3_INCLUDE_DIR "${NVTE_GG_EFFECTIVE_ACTLIZE_INCLUDE}")
+set(CUTLASS3_TOOLS_INCLUDE_DIR "${NVTE_GG_EFFECTIVE_ACTLIZE_TOOLS_INCLUDE}")
 
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
@@ -245,6 +287,7 @@ list(APPEND transformer_engine_cuda_sources
      fused_attn/utils.cu
      gemm/cublaslt_gemm.cu
      gemm/cublaslt_grouped_gemm.cu
+     gemm/cutlass_grouped_gemm_rtc.cu
      normalization/layernorm/ln_bwd_semi_cuda_kernel.cu
      normalization/layernorm/ln_fwd_cuda_kernel.cu
      normalization/rmsnorm/rmsnorm_bwd_semi_cuda_kernel.cu
@@ -350,7 +393,26 @@ foreach(cuda_source IN LISTS transformer_engine_cuda_arch_specific_sources)
     )
   endif()
 endforeach()
- 
+
+# The RTC grouped-GEMM host TU mirrors PPU CUTLASS 3.x types (same Traits as
+# the NVRTC kernel template at gemm/rtc/cutlass_grouped_gemm.cu), so it needs
+# CUTLASS 3.x + ppu/ headers and USE_SAIL=1 just like the statically-built
+# PPU paths above. This is a per-source addition because the rtc host TU
+# lives in the main `transformer_engine` target rather than
+# `transformer_engine_groupgemm`.
+set_property(
+  SOURCE gemm/cutlass_grouped_gemm_rtc.cu
+  APPEND PROPERTY INCLUDE_DIRECTORIES
+  "${CUTLASS3_INCLUDE_DIR}"
+  "${CUTLASS3_TOOLS_INCLUDE_DIR}")
+# The PPU generation is selected entirely by the ArchTag template argument
+# (cutlass::arch::PPU0010 for sm80, PPU0015 for sm89), which this TU picks at
+# runtime from the device's compute capability -- exactly like the static
+# cutlass_grouped_gemm_ppu.cu path. No preprocessor version macro is involved,
+# so one host TU covers both PPU generations.
+set_property(
+  SOURCE gemm/cutlass_grouped_gemm_rtc.cu
+  APPEND PROPERTY COMPILE_DEFINITIONS USE_SAIL=1)
 add_library(transformer_engine SHARED ${transformer_engine_SOURCES})
 # Disable CMake's automatic architecture flag injection.
 # All architectures are handled explicitly via per-source COMPILE_OPTIONS
@@ -376,8 +438,10 @@ set_property(
   SOURCE ${CUTLASS_KERNEL_SOURCES}
   APPEND
   PROPERTY
-  COMPILE_OPTIONS "-g0;-dopt=on;-Xcompiler=-fPIC")
+  COMPILE_OPTIONS "-g0;-dopt=on")
 
+# PPU (SM80/SM89) grouped GEMM is built into a separate static library so that it
+# can be compiled against actlize headers without affecting the rest of the library.
 set(transformer_engine_grouped_gemm_sources
     gemm/cutlass_grouped_gemm_ppu.cu
     )
@@ -393,11 +457,11 @@ set_property(
   COMPILE_OPTIONS "--generate-code=arch=compute_80a,code=sm_80a;--generate-code=arch=compute_89,code=sm_89;-g0")
 
 target_include_directories(transformer_engine_groupgemm_ppu PRIVATE
-                          ${ACTLIZE_INCLUDE_DIR}
-                          ${ACTLIZE_TOOLS_INCLUDE_DIR})
+                          ${NVTE_GG_EFFECTIVE_ACTLIZE_INCLUDE}
+                          ${NVTE_GG_EFFECTIVE_ACTLIZE_TOOLS_INCLUDE})
 target_include_directories(transformer_engine_groupgemm_ppu PUBLIC
                           "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_include_directories(transformer_engine_groupgemm_ppu PRIVATE 
+target_include_directories(transformer_engine_groupgemm_ppu PRIVATE
                           "${CUDNN_FRONTEND_INCLUDE_DIR}")
 target_compile_definitions(transformer_engine_groupgemm_ppu PRIVATE
                           NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
@@ -596,6 +660,8 @@ endfunction()
 list(GET CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES 0 cuda_include_path)
 make_string_header("${cuda_include_path}"
                    string_path_cuda_include)
+make_string_header("${CUTLASS3_INCLUDE_DIR}"
+                   string_path_cutlass3_include)
 make_string_header_from_file(transpose/rtc/cast_transpose_fusion.cu
                              string_code_transpose_rtc_cast_transpose_fusion_cu)
 make_string_header_from_file(transpose/rtc/cast_transpose.cu
@@ -604,6 +670,8 @@ make_string_header_from_file(transpose/rtc/transpose.cu
                              string_code_transpose_rtc_transpose_cu)
 make_string_header_from_file(transpose/rtc/swap_first_dims.cu
                              string_code_transpose_rtc_swap_first_dims_cu)
+make_string_header_from_file(gemm/rtc/cutlass_grouped_gemm.cu
+                             string_code_gemm_rtc_cutlass_grouped_gemm_cu)
 make_string_header_from_file(utils.cuh
                              string_code_utils_cuh)
 make_string_header_from_file(util/math.h
@@ -673,3 +741,13 @@ message(STATUS "Threads per parallel build job: ${BUILD_THREADS_PER_JOB}")
 
 # Install library
 install(TARGETS transformer_engine DESTINATION .)
+
+# Install CUTLASS 3.x + PPU headers for runtime NVRTC compilation.
+# At runtime, resolve_cutlass_include_dir() uses the build-time baked path
+# (string_path_cutlass3_include) which points here for installed packages.
+install(DIRECTORY "${CUTLASS3_INCLUDE_DIR}/cutlass"
+                  "${CUTLASS3_INCLUDE_DIR}/cute"
+                  "${CUTLASS3_INCLUDE_DIR}/ppu"
+        DESTINATION include/cutlass3
+        FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp" PATTERN "*.inl"
+                       PATTERN "*.cuh")
