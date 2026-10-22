@@ -545,10 +545,13 @@ void fused_qkv_rope_forward_launcher(const scalar_t *qkv_input, const float *q_f
                                      const int qkv_split_arg_list_0, const int qkv_split_arg_list_1,
                                      const int qkv_split_arg_list_2, cudaStream_t stream) {
   const int THREADS_PER_WARP = 32;
-  int warps_per_block = (h <= 8) ? h : 8;
+  const size_t grid_blocks = static_cast<size_t>(s) * static_cast<size_t>(b);
+  const int shared_mem_size = 4 * d2 * sizeof(float);  // cos, sin * q ,k
+  const int warps_per_block = fused_rope_qkv_warps_per_block(
+      reinterpret_cast<const void *>(fused_qkv_rope_forward_kernel<scalar_t>), grid_blocks, h, d,
+      d2, qkv_split_arg_list_0, qkv_split_arg_list_1, qkv_split_arg_list_2, shared_mem_size);
   dim3 blocks(s, b);
   dim3 threads(THREADS_PER_WARP, warps_per_block);
-  const int shared_mem_size = 4 * d2 * sizeof(float);  // cos, sin * q ,k
 
   fused_qkv_rope_forward_kernel<<<blocks, threads, shared_mem_size, stream>>>(
       qkv_input, q_freqs, k_freqs, start_positions, q_out, k_out, v_out, qkv_format, interleaved,
@@ -568,10 +571,13 @@ void fused_qkv_rope_backward_launcher(const scalar_t *q_grad_out, const scalar_t
                                       const int qkv_split_arg_list_1,
                                       const int qkv_split_arg_list_2, cudaStream_t stream) {
   const int THREADS_PER_WARP = 32;
-  const int warps_per_block = (h <= 8) ? h : 8;
+  const size_t grid_blocks = static_cast<size_t>(s) * static_cast<size_t>(b);
+  const int shared_mem_size = 4 * d2 * sizeof(float);  // cos, sin * q ,k
+  const int warps_per_block = fused_rope_qkv_warps_per_block(
+      reinterpret_cast<const void *>(fused_qkv_rope_backward_kernel<scalar_t>), grid_blocks, h, d,
+      d2, qkv_split_arg_list_0, qkv_split_arg_list_1, qkv_split_arg_list_2, shared_mem_size);
   dim3 blocks(s, b);
   dim3 threads(THREADS_PER_WARP, warps_per_block);
-  const int shared_mem_size = 4 * d2 * sizeof(float);  // cos, sin * q ,k
 
   fused_qkv_rope_backward_kernel<<<blocks, threads, shared_mem_size, stream>>>(
       q_grad_out, k_grad_out, v_grad_out, q_freqs, k_freqs, qkv_grad_input, qkv_format, interleaved,

@@ -4,8 +4,9 @@
  * See LICENSE for license information.
  ************************************************************************/
 
-// The fused_rope forward and backward kernels pick their blockDim.y from the grid size, the head
-// count and the head dimension, replacing the fixed `h < 16 ? 4 : 8` heuristic. Nothing
+// The fused_rope and fused_qkv_rope forward and backward kernels pick their blockDim.y from the
+// grid size, the head count and the head dimension -- and, for qkv, the number of output tensors
+// walked per head -- replacing fixed `h < 16 ? 4 : 8` and `h <= 8 ? h : 8` heuristics. Nothing
 // about those choices can change the result: a block owns exactly one (s, b) pair -- or one packed
 // token on the THD linear-grid path -- and inside the block the head loop strides by blockDim.y
 // while the rotary and copy-the-rest loops stride by blockDim.x, so every warp count covers the
@@ -15,8 +16,16 @@
 // cross-thread reduction anywhere in either family, so the output at (s_id, b_id) depends only on
 // the input at (s_id, b_id) and on freqs[s_id].
 //
+// fused_qkv_rope needs one extra clause, because its block helper is called three times per block,
+// once each for q, k and v. In the forward those three calls write three separate output tensors;
+// in the backward they write one packed tensor at the disjoint per-head row offsets 0, q_split and
+// q_split + k_split. Either way every output element is written by exactly one thread with no
+// accumulation, and the v call passes freqs == nullptr so it neither writes nor reads the scratch.
+// The argument above therefore carries over unchanged -- but a qkv block retires three
+// __syncthreads() rather than one, which is where its element weight comes from.
+//
 // These tests pin that invariant, which is what makes the launch-shape tuning safe, and they pin
-// the rule's decision boundaries so that a change to it shows up.
+// both rules' decision boundaries so that a change to either shows up.
 //
 // The rules themselves are not measured here. Three sweeps of 820, 600 and 480 cells over
 // warps_per_block in {1, 2, 4, 8, 16} x grid mode in {shipped, legacy, linear} x {fp32, bf16} x
@@ -27,6 +36,27 @@
 // regressions and introduced 2 more on a disjoint sweep; and a fixed cost per wave rather than per
 // warp, which cannot select the fastest measured warp count in 25 of those 324 groups at any value
 // of its constant. Measurements and the fit: docs/common_op_optimization.md, Op 8.
+//
+// The qkv pair was swept separately: 1640 measurements over 41 shapes x 2 dtypes x 2 directions x
+// blockDim.y in {1..8, 12, 16}, every one byte-identical, scored over the 148 cells whose own
+// shipped-vs-shipped controls reproduced to within 1%. The adopted rule reaches a 1.1272x geomean
+// against the old heuristic, worst cell 0.9502x, against a per-shape oracle of 1.1293x, with two
+// provable regressions -- both the same h = 3 shape, whose measurement contradicts itself across
+// dtype. Its element weight is derived rather than fitted, from the three barriers per block, and
+// leave-one-group-out cross-validation has the derived value beating a re-fitted one out of sample
+// in 4 of 6 folds. Three alternatives were measured and rejected: the smooth, non-ceil wave term,
+// at 1.0418x with a worst cell of 0.6779x; a fixed cost per wave rather than per warp, for which
+// 10 of the 148 groups have no constant at all that selects their fastest measured warp count; and
+// powers-of-two-only candidates, which cost 0.5-2.6% at h in {5, 7} and leave ten provable
+// regressions at every hysteresis margin in [0, 0.30]. Measurements and the fit:
+// docs/common_op_optimization.md, Op 8b.
+//
+// One qkv pin is a regression test for a defect that was in the *model* rather than the kernel: the
+// fit once assumed a single device-wide resident-warp capacity shared by every candidate
+// blockDim.y, when blocks_per_sm(w) = floor(W1 / w) only divides evenly at powers of two. The
+// shipped C++ never had that bug -- it queries the occupancy per candidate -- but a model that
+// does will silently disagree with it, and QkvCapacityIsQuantisedNotConstant is the pin that
+// catches the assumption.
 
 #include <algorithm>
 #include <array>
@@ -267,6 +297,423 @@ std::vector<size_t> sPrefixes() {
 std::vector<size_t> bPrefixes() {
   return {1,  2,  3,  4,  8,   9,   16,  19,  20,  31,  32,  39,
           40, 64, 78, 79, 100, 120, 127, 128};
+}
+
+// ---------------------------------------------------------------------------------------------
+// fused_qkv_rope
+// ---------------------------------------------------------------------------------------------
+
+// The part the Op 8b sweep was measured on: 39 SMs, and fused_qkv_rope kernels that keep 64
+// one-warp blocks resident per SM. Both limits agree at 64 there -- 131072 registers per SM over
+// 32 lanes times 64 registers per thread, and 2048 threads per SM over 32 lanes -- which is what
+// makes blocks_per_sm(w) == floor(64 / w) for every candidate.
+constexpr size_t kQkvMeasuredSmCount = 39;
+constexpr size_t kQkvMeasuredWarpsPerSm = 64;
+
+// Device-wide resident warps at a given blockDim.y. floor(W1 / w) only divides evenly at powers of
+// two, so capacity(w) = sm_count * floor(W1 / w) * w is 2496 at w = 1, 2, 4, 8 and 16 on the
+// measured part and strictly less at every other blockDim.y: 2457 at w = 3 and 7, 2340 at w = 5, 6
+// and 12. The shipped rule obtains this per candidate from the occupancy query; the pins below
+// restate the measured values so the arithmetic can be asserted on any device.
+size_t quantisedCapacity(const size_t sm_count, const size_t warps_per_sm, const int warps) {
+  const size_t w = static_cast<size_t>(warps);
+  return sm_count * (warps_per_sm / w) * w;
+}
+
+size_t measuredCapacity(const int warps) {
+  return quantisedCapacity(kQkvMeasuredSmCount, kQkvMeasuredWarpsPerSm, warps);
+}
+
+// The same quantisation evaluated on whatever part the test runs on. maxThreadsPerMultiProcessor /
+// 32 is an upper bound on W1 -- the register file can bind lower -- so this over-estimates the
+// capacity, which is the right bias for a positive control: the ladders are required to span the
+// rule's buckets at the bound, and a part with less capacity only moves the boundaries down.
+size_t localCapacityBound(const int warps) {
+  int device = 0;
+  EXPECT_EQ(cudaGetDevice(&device), cudaSuccess);
+  cudaDeviceProp prop{};
+  EXPECT_EQ(cudaGetDeviceProperties(&prop, device), cudaSuccess);
+  return quantisedCapacity(static_cast<size_t>(prop.multiProcessorCount),
+                           static_cast<size_t>(prop.maxThreadsPerMultiProcessor) / THREADS_PER_WARP,
+                           warps);
+}
+
+// One capacity for every candidate: the assumption a model must not make. Kept only so that
+// QkvCapacityIsQuantisedNotConstant can show it changes the pick.
+size_t uniformCapacity(const int) { return kQkvMeasuredSmCount * kQkvMeasuredWarpsPerSm; }
+
+using CapacityFn = size_t (*)(int);
+
+// blockDim.y the shipped qkv rule picks, given how to obtain each candidate's capacity. Asks the
+// real fused_rope_qkv_candidates and fused_rope_select_warps_qkv rather than restating them.
+int pickQkvWith(const CapacityFn cap, const int h, const int d, const int d2, const int segments,
+                const size_t grid_blocks) {
+  int cand[kFusedRopeQkvWarpCandidates];
+  const int n = fused_rope_qkv_candidates(h, cand);
+  size_t capacity[kFusedRopeQkvWarpCandidates];
+  for (int i = 0; i < n; ++i) capacity[i] = cap(cand[i]);
+  return fused_rope_select_warps_qkv(h, d, d2, segments, grid_blocks, n, cand, capacity);
+}
+
+int pickQkv(const int h, const int d, const int d2, const int segments, const size_t grid_blocks) {
+  return pickQkvWith(measuredCapacity, h, d, d2, segments, grid_blocks);
+}
+
+int pickQkvUniform(const int h, const int d, const int d2, const int segments,
+                   const size_t grid_blocks) {
+  return pickQkvWith(uniformCapacity, h, d, d2, segments, grid_blocks);
+}
+
+// The modelled cost of every candidate, in candidate order, from the same entry point the rule
+// uses. The picks below carry their costs as trailing comments; this exists so the hysteresis test
+// can assert the margin as a number rather than imply it from a pick.
+std::vector<uint64_t> qkvCosts(const int h, const int d, const int d2, const int segments,
+                               const size_t grid_blocks) {
+  int cand[kFusedRopeQkvWarpCandidates];
+  const int n = fused_rope_qkv_candidates(h, cand);
+  int elems[kFusedRopeQkvWarpCandidates];
+  size_t capacity[kFusedRopeQkvWarpCandidates];
+  for (int i = 0; i < n; ++i) {
+    elems[i] = fused_rope_qkv_elems_per_thread(h, d, d2, segments, cand[i]);
+    capacity[i] = measuredCapacity(cand[i]);
+  }
+  std::vector<uint64_t> cost(n);
+  fused_rope_select_from_candidates(n, cand, capacity, elems, kFusedRopeQkvWarpWeight,
+                                    kFusedRopeQkvElemWeight, grid_blocks,
+                                    fused_rope_qkv_fixed_warps(h), cost.data());
+  return cost;
+}
+
+// True when the incumbent -- the candidate the hysteresis protects -- is inside the rule's margin
+// of the argmin, i.e. when the rule keeps the shape that has been running rather than the model's
+// pick.
+bool qkvHysteresisFires(const std::vector<uint64_t> &cost, const size_t incumbent_index) {
+  const uint64_t best = *std::min_element(cost.begin(), cost.end());
+  return cost[incumbent_index] * kFusedRopeQkvHysteresisDen <= best * kFusedRopeQkvHysteresisNum;
+}
+
+// The largest blockDim.y the qkv candidate list can contain, i.e. pow2_ceil(h) under the same
+// clamp. Restated as a bound so the assertions can name it rather than recompute it.
+int qkvWarpCapOf(const int h) {
+  int cap = 1;
+  while (cap < h && cap < kFusedRopeMaxWarpsPerBlock) cap <<= 1;
+  return cap;
+}
+
+// One qkv shape for the ladders. nq, nk and nv are the per-head row lengths of the three outputs in
+// units of d, so segments == nq + nk + nv and the packed input row is (nq + nk + nv) * d long.
+// tests/pytorch/test_fused_rope.py:469 passes qkv_split_arg_list = [hidden_size * 4, hidden_size,
+// hidden_size], i.e. nq = 4 and nk = nv = 1: that is the seg = 6 row, and it is why the segments
+// factor exists at all.
+//
+// This table is the single source of truth for both the positive control and the bit-exactness
+// tests, so a ladder that stops crossing the rule's buckets cannot silently stop being exercised.
+struct QkvLadder {
+  const char *tag;
+  NVTE_QKV_Format fmt;
+  bool interleaved;
+  DType dtype;
+  int h, d, d2;
+  int nq, nk, nv;
+  bool vary_s;  // false varies b instead, which is the BSHD stride order
+  size_t s_full, b_full;
+  const std::vector<size_t> *prefixes;
+
+  int segments() const { return nq + nk + nv; }
+  size_t total_d() const { return static_cast<size_t>(segments()) * static_cast<size_t>(d); }
+};
+
+// Every ladder spans at least three distinct blockDim.y over its prefix list on the measured part;
+// QkvPrefixLaddersSpanMultipleWarpCounts asserts that on the part actually running the test,
+// because a bit-exactness comparison that never changes the launch shape proves nothing.
+const std::vector<QkvLadder> &qkvLadders() {
+  static const std::vector<size_t> s_prefixes = sPrefixes();
+  static const std::vector<size_t> b_prefixes = bPrefixes();
+  constexpr DType kBF16 = DType::kBFloat16, kFP32 = DType::kFloat32, kFP16 = DType::kFloat16;
+  static const std::vector<QkvLadder> ladders = {
+      // seg 6 is the shape the PyTorch caller actually produces, at the head count and dimension a
+      // GQA qkv projection gives: h = 32 heads of d = 128, q four times as wide as k and v.
+      {"qkv_sbhd_bf16_seg6", NVTE_SBHD, false, kBF16, 32, 128, 128, 4, 1, 1, true, 256, 4,
+       &s_prefixes},
+      // seg 3 drops the GQA widening: q, k and v all one d wide.
+      {"qkv_sbhd_bf16_seg3", NVTE_SBHD, false, kBF16, 32, 128, 128, 1, 1, 1, true, 256, 8,
+       &s_prefixes},
+      // seg 10 at d = 64 pushes segments up while lanes_per_head falls to 2, so E(w) moves in the
+      // other direction from the seg 3 row above.
+      {"qkv_sbhd_bf16_seg10_d64", NVTE_SBHD, false, kBF16, 8, 64, 64, 8, 1, 1, true, 128, 32,
+       &s_prefixes},
+      // rotary_percent 0.5, which takes the `d > d2` copy-the-rest loop: a second strided loop over
+      // blockDim.y that has to be equally shape-independent.
+      {"qkv_sbhd_bf16_d2half", NVTE_SBHD, false, kBF16, 32, 128, 64, 4, 1, 1, true, 256, 4,
+       &s_prefixes},
+      // h = 3, 5 and 7 are the head counts where the candidate list is not powers of two, because
+      // fused_rope_qkv_fixed_warps(h) == h there. These are the only h at which the resident-warp
+      // capacity is quantised rather than constant, and they carry the rule's two provable
+      // regressions.
+      {"qkv_sbhd_bf16_h3_seg6", NVTE_SBHD, false, kBF16, 3, 128, 128, 4, 1, 1, true, 512, 8,
+       &s_prefixes},
+      {"qkv_sbhd_bf16_h5_seg6", NVTE_SBHD, false, kBF16, 5, 128, 128, 4, 1, 1, true, 512, 8,
+       &s_prefixes},
+      {"qkv_sbhd_bf16_h7_seg6", NVTE_SBHD, false, kBF16, 7, 128, 128, 4, 1, 1, true, 512, 8,
+       &s_prefixes},
+      // BSHD swaps which dimension strides over the batch, and interleaved swaps the rotate partner
+      // from d_id +/- d2/2 to d_id +/- 1. h = 8 also pins the warp_cap clamp.
+      {"qkv_bshd_bf16_interleaved_seg6", NVTE_BSHD, true, kBF16, 8, 128, 128, 4, 1, 1, false, 64,
+       64, &b_prefixes},
+      // The other two instantiations the type switch reaches.
+      {"qkv_sbhd_fp32_seg3_d2half", NVTE_SBHD, false, kFP32, 16, 64, 32, 1, 1, 1, true, 128, 4,
+       &s_prefixes},
+      {"qkv_sbhd_fp16_seg6_d64", NVTE_SBHD, false, kFP16, 16, 64, 64, 4, 1, 1, true, 128, 4,
+       &s_prefixes},
+  };
+  return ladders;
+}
+
+// The three forward outputs, kept separate so that each can carry its own negative control: q and k
+// are roped with different angles and v is a straight copy, so an error that only touched one of
+// the three would be invisible in a concatenation.
+template <typename T>
+struct QkvOut {
+  std::vector<T> q, k, v;
+};
+
+template <typename T>
+std::vector<T> detach(test::Tensor &t, const size_t n) {
+  const T *p = t.rowwise_cpu_dptr<T>();
+  return std::vector<T>(p, p + n);
+}
+
+// Contiguous [s, b, h, row] for SBHD and [b, s, h, row] for BSHD. The qkv kernels take no strides
+// at all -- they derive every offset from s, b, h and the three split arguments -- so the buffers
+// have to be in exactly this layout.
+std::vector<size_t> qkvShape(const NVTE_QKV_Format fmt, const size_t s, const size_t b,
+                             const size_t h, const size_t row) {
+  return (fmt == NVTE_SBHD) ? std::vector<size_t>{s, b, h, row}
+                            : std::vector<size_t>{b, s, h, row};
+}
+
+// One fused_qkv_rope forward over a packed input whose per-(s, b, h) row is q || k || v.
+// start_positions is a zero-element tensor, whose device pointer is null; that is what makes the
+// kernel take its begin_offset = 0 branch, and what the PyTorch binding passes for None.
+template <typename T>
+QkvOut<T> runQkvForwardDense(const NVTE_QKV_Format fmt, const bool interleaved, const size_t s,
+                             const size_t b, const size_t h, const size_t d, const size_t d2,
+                             const size_t nq, const size_t nk, const size_t nv,
+                             const std::vector<T> &host_in,
+                             const std::vector<float> &host_q_freqs,
+                             const std::vector<float> &host_k_freqs, const char *tag) {
+  const size_t q_split = nq * d, k_split = nk * d, v_split = nv * d;
+  const size_t total_d = q_split + k_split + v_split;
+  test::Tensor input(tag, qkvShape(fmt, s, b, h, total_d), test::TypeInfo<T>::dtype);
+  test::Tensor q(tag, qkvShape(fmt, s, b, h, q_split), test::TypeInfo<T>::dtype);
+  test::Tensor k(tag, qkvShape(fmt, s, b, h, k_split), test::TypeInfo<T>::dtype);
+  test::Tensor v(tag, qkvShape(fmt, s, b, h, v_split), test::TypeInfo<T>::dtype);
+  test::Tensor qf(tag, std::vector<size_t>{s, d2}, test::TypeInfo<float>::dtype);
+  test::Tensor kf(tag, std::vector<size_t>{s, d2}, test::TypeInfo<float>::dtype);
+  test::Tensor null_ivp(tag, std::vector<size_t>{0}, test::TypeInfo<int>::dtype);
+
+  std::memcpy(input.rowwise_cpu_dptr<T>(), host_in.data(), s * b * h * total_d * sizeof(T));
+  std::memcpy(qf.rowwise_cpu_dptr<float>(), host_q_freqs.data(), s * d2 * sizeof(float));
+  std::memcpy(kf.rowwise_cpu_dptr<float>(), host_k_freqs.data(), s * d2 * sizeof(float));
+  input.from_cpu();
+  qf.from_cpu();
+  kf.from_cpu();
+
+  nvte_fused_qkv_rope_forward(input.data(), qf.data(), kf.data(), null_ivp.data(), q.data(),
+                              k.data(), v.data(), fmt, interleaved, /*cp_size=*/1, /*cp_rank=*/0,
+                              static_cast<int>(s), static_cast<int>(b), static_cast<int>(h),
+                              static_cast<int>(d), static_cast<int>(d2),
+                              static_cast<int>(q_split), static_cast<int>(k_split),
+                              static_cast<int>(v_split), nullptr);
+  cudaDeviceSynchronize();
+  EXPECT_EQ(cudaGetLastError(), cudaSuccess) << cudaGetErrorString(cudaGetLastError());
+
+  q.to_cpu();
+  k.to_cpu();
+  v.to_cpu();
+  QkvOut<T> out;
+  out.q = detach<T>(q, s * b * h * q_split);
+  out.k = detach<T>(k, s * b * h * k_split);
+  out.v = detach<T>(v, s * b * h * v_split);
+  return out;
+}
+
+// One fused_qkv_rope backward: three separate grad tensors in, one packed grad out, whose per-head
+// row is q || k || v at the disjoint offsets 0, q_split and q_split + k_split.
+template <typename T>
+std::vector<T> runQkvBackwardDense(const NVTE_QKV_Format fmt, const bool interleaved,
+                                   const size_t s, const size_t b, const size_t h, const size_t d,
+                                   const size_t d2, const size_t nq, const size_t nk,
+                                   const size_t nv, const std::vector<T> &host_q,
+                                   const std::vector<T> &host_k, const std::vector<T> &host_v,
+                                   const std::vector<float> &host_q_freqs,
+                                   const std::vector<float> &host_k_freqs, const char *tag) {
+  const size_t q_split = nq * d, k_split = nk * d, v_split = nv * d;
+  const size_t total_d = q_split + k_split + v_split;
+  test::Tensor q(tag, qkvShape(fmt, s, b, h, q_split), test::TypeInfo<T>::dtype);
+  test::Tensor k(tag, qkvShape(fmt, s, b, h, k_split), test::TypeInfo<T>::dtype);
+  test::Tensor v(tag, qkvShape(fmt, s, b, h, v_split), test::TypeInfo<T>::dtype);
+  test::Tensor out(tag, qkvShape(fmt, s, b, h, total_d), test::TypeInfo<T>::dtype);
+  test::Tensor qf(tag, std::vector<size_t>{s, d2}, test::TypeInfo<float>::dtype);
+  test::Tensor kf(tag, std::vector<size_t>{s, d2}, test::TypeInfo<float>::dtype);
+
+  std::memcpy(q.rowwise_cpu_dptr<T>(), host_q.data(), s * b * h * q_split * sizeof(T));
+  std::memcpy(k.rowwise_cpu_dptr<T>(), host_k.data(), s * b * h * k_split * sizeof(T));
+  std::memcpy(v.rowwise_cpu_dptr<T>(), host_v.data(), s * b * h * v_split * sizeof(T));
+  std::memcpy(qf.rowwise_cpu_dptr<float>(), host_q_freqs.data(), s * d2 * sizeof(float));
+  std::memcpy(kf.rowwise_cpu_dptr<float>(), host_k_freqs.data(), s * d2 * sizeof(float));
+  q.from_cpu();
+  k.from_cpu();
+  v.from_cpu();
+  qf.from_cpu();
+  kf.from_cpu();
+
+  nvte_fused_qkv_rope_backward(q.data(), k.data(), v.data(), qf.data(), kf.data(), out.data(), fmt,
+                               interleaved, /*cp_size=*/1, /*cp_rank=*/0, static_cast<int>(s),
+                               static_cast<int>(b), static_cast<int>(h), static_cast<int>(d),
+                               static_cast<int>(d2), static_cast<int>(q_split),
+                               static_cast<int>(k_split), static_cast<int>(v_split), nullptr);
+  cudaDeviceSynchronize();
+  EXPECT_EQ(cudaGetLastError(), cudaSuccess) << cudaGetErrorString(cudaGetLastError());
+
+  out.to_cpu();
+  return detach<T>(out, s * b * h * total_d);
+}
+
+// The comparison every qkv bit-exactness test makes: run the full tensor, then run a leading slice
+// of it as a tensor in its own right, and require the two to agree byte for byte. A leading slice
+// is a contiguous prefix in both formats, and it changes the grid -- dim3(s, b) either way --
+// which is what makes the launcher pick a different blockDim.y for different ladder entries.
+template <typename T>
+void performQkvPrefixTest(const bool forward, const QkvLadder &l, const char *tag) {
+  const NVTE_QKV_Format fmt = l.fmt;
+  const bool interleaved = l.interleaved;
+  const size_t h = l.h, d = l.d, d2 = l.d2;
+  const size_t q_split = l.nq * d, k_split = l.nk * d, v_split = l.nv * d;
+  const size_t total_d = q_split + k_split + v_split;
+  const size_t s_full = l.s_full, b_full = l.b_full;
+
+  // Distinct seeds per operand. q and k are roped with different angles and v is copied, so sharing
+  // a seed would let the block helper read the wrong frequency tensor, or the wrong output segment,
+  // and still produce the expected bytes.
+  std::vector<float> host_q_freqs(s_full * d2), host_k_freqs(s_full * d2);
+  fillFreqs(host_q_freqs.data(), host_q_freqs.size(), 0xD1B54A32D192ED03ull);
+  fillFreqs(host_k_freqs.data(), host_k_freqs.size(), 0xC2B2AE3D27D4EB4Full);
+
+  // The forward takes one packed buffer, so host_a carries q || k || v and there is nothing else to
+  // fill. The backward takes three separate grads, so host_a is the q grad and host_b, host_c are k
+  // and v.
+  std::vector<T> host_a(s_full * b_full * h * (forward ? total_d : q_split));
+  fillDeterministic(host_a.data(), host_a.size(), 0x9E3779B97F4A7C15ull);
+  std::vector<T> host_b, host_c;
+  if (!forward) {
+    host_b.resize(s_full * b_full * h * k_split);
+    host_c.resize(s_full * b_full * h * v_split);
+    fillDeterministic(host_b.data(), host_b.size(), 0xBF58476D1CE4E5B9ull);
+    fillDeterministic(host_c.data(), host_c.size(), 0x94D049BB133111EBull);
+  }
+
+  const size_t row_q = h * q_split, row_k = h * k_split, row_v = h * v_split;
+  const size_t row_in = h * total_d;
+
+  QkvOut<T> full_fwd;
+  std::vector<T> full_bwd;
+  if (forward) {
+    full_fwd = runQkvForwardDense<T>(fmt, interleaved, s_full, b_full, h, d, d2, l.nq, l.nk, l.nv,
+                                     host_a, host_q_freqs, host_k_freqs, tag);
+    ASSERT_EQ(full_fwd.q.size(), s_full * b_full * row_q);
+    ASSERT_EQ(full_fwd.k.size(), s_full * b_full * row_k);
+    ASSERT_EQ(full_fwd.v.size(), s_full * b_full * row_v);
+  } else {
+    full_bwd = runQkvBackwardDense<T>(fmt, interleaved, s_full, b_full, h, d, d2, l.nq, l.nk, l.nv,
+                                      host_a, host_b, host_c, host_q_freqs, host_k_freqs, tag);
+    ASSERT_EQ(full_bwd.size(), s_full * b_full * row_in);
+  }
+
+  size_t compared = 0;
+  for (const size_t prefix : *l.prefixes) {
+    const size_t ps = l.vary_s ? prefix : s_full;
+    const size_t pb = l.vary_s ? b_full : prefix;
+    // The prefix ladders are shared between ladders of different full sizes; entries that do not
+    // fit this one are simply not prefixes of it.
+    if (ps > s_full || pb > b_full) continue;
+    const size_t n = ps * pb;
+
+    if (forward) {
+      const std::vector<T> sub_a(host_a.begin(), host_a.begin() + n * row_in);
+      const std::vector<float> sub_qf(host_q_freqs.begin(), host_q_freqs.begin() + ps * d2);
+      const std::vector<float> sub_kf(host_k_freqs.begin(), host_k_freqs.begin() + ps * d2);
+      const QkvOut<T> got = runQkvForwardDense<T>(fmt, interleaved, ps, pb, h, d, d2, l.nq, l.nk,
+                                                  l.nv, sub_a, sub_qf, sub_kf, tag);
+      ASSERT_EQ(got.q.size(), n * row_q);
+      ASSERT_EQ(got.k.size(), n * row_k);
+      ASSERT_EQ(got.v.size(), n * row_v);
+
+      // Bit-exact, not tolerance-based: blockDim.y cannot change any arithmetic, so anything other
+      // than identical bytes is a defect.
+      EXPECT_EQ(0, std::memcmp(got.q.data(), full_fwd.q.data(), n * row_q * sizeof(T)))
+          << tag << ": q depends on the launch shape at s=" << ps << " b=" << pb;
+      EXPECT_EQ(0, std::memcmp(got.k.data(), full_fwd.k.data(), n * row_k * sizeof(T)))
+          << tag << ": k depends on the launch shape at s=" << ps << " b=" << pb;
+      EXPECT_EQ(0, std::memcmp(got.v.data(), full_fwd.v.data(), n * row_v * sizeof(T)))
+          << tag << ": v depends on the launch shape at s=" << ps << " b=" << pb;
+
+      // Negative control, one per output. The comparisons above are byte-exact, so they would also
+      // catch an s, b, h or d indexing error rather than passing vacuously; shifting the expected
+      // data by one (s, b) row has to change each of them.
+      if (n < s_full * b_full) {
+        EXPECT_NE(0, std::memcmp(got.q.data(), full_fwd.q.data() + row_q, n * row_q * sizeof(T)))
+            << tag << ": q negative control failed at s=" << ps << " b=" << pb;
+        EXPECT_NE(0, std::memcmp(got.k.data(), full_fwd.k.data() + row_k, n * row_k * sizeof(T)))
+            << tag << ": k negative control failed at s=" << ps << " b=" << pb;
+        EXPECT_NE(0, std::memcmp(got.v.data(), full_fwd.v.data() + row_v, n * row_v * sizeof(T)))
+            << tag << ": v negative control failed at s=" << ps << " b=" << pb;
+      }
+    } else {
+      const std::vector<T> sub_a(host_a.begin(), host_a.begin() + n * row_q);
+      const std::vector<T> sub_b(host_b.begin(), host_b.begin() + n * row_k);
+      const std::vector<T> sub_c(host_c.begin(), host_c.begin() + n * row_v);
+      const std::vector<float> sub_qf(host_q_freqs.begin(), host_q_freqs.begin() + ps * d2);
+      const std::vector<float> sub_kf(host_k_freqs.begin(), host_k_freqs.begin() + ps * d2);
+      const std::vector<T> got =
+          runQkvBackwardDense<T>(fmt, interleaved, ps, pb, h, d, d2, l.nq, l.nk, l.nv, sub_a, sub_b,
+                                 sub_c, sub_qf, sub_kf, tag);
+      ASSERT_EQ(got.size(), n * row_in);
+      EXPECT_EQ(0, std::memcmp(got.data(), full_bwd.data(), n * row_in * sizeof(T)))
+          << tag << ": qkv grad depends on the launch shape at s=" << ps << " b=" << pb;
+      if (n < s_full * b_full) {
+        EXPECT_NE(0, std::memcmp(got.data(), full_bwd.data() + row_in, n * row_in * sizeof(T)))
+            << tag << ": negative control failed at s=" << ps << " b=" << pb;
+      }
+    }
+    ++compared;
+  }
+  // Guard against the prefix list being filtered down to nothing by the size check above, which
+  // would make the whole test vacuous.
+  EXPECT_GE(compared, 8u) << tag << ": the prefix ladder does not fit this shape";
+}
+
+// Both directions of one ladder at its own dtype. The dtype lives in the table rather than in the
+// call site so that the positive control and the bit-exactness tests cannot drift apart.
+void runQkvLadder(const QkvLadder &l) {
+  const std::string fwd = std::string(l.tag) + "_fwd";
+  const std::string bwd = std::string(l.tag) + "_bwd";
+  switch (l.dtype) {
+    case DType::kFloat32:
+      performQkvPrefixTest<float>(/*forward=*/true, l, fwd.c_str());
+      performQkvPrefixTest<float>(/*forward=*/false, l, bwd.c_str());
+      break;
+    case DType::kFloat16:
+      performQkvPrefixTest<__half>(/*forward=*/true, l, fwd.c_str());
+      performQkvPrefixTest<__half>(/*forward=*/false, l, bwd.c_str());
+      break;
+    case DType::kBFloat16:
+      performQkvPrefixTest<__nv_bfloat16>(/*forward=*/true, l, fwd.c_str());
+      performQkvPrefixTest<__nv_bfloat16>(/*forward=*/false, l, bwd.c_str());
+      break;
+    default:
+      FAIL() << l.tag << ": the qkv ladder names a dtype the type switch does not reach";
+  }
 }
 
 }  // namespace
@@ -529,4 +976,330 @@ TEST(FusedRopeLaunchShape, ThdLinearGridMatchesLegacyGrid) {
   EXPECT_NE(0, std::memcmp(linear.data(), legacy.data() + kRow,
                            (kT - 1) * kRow * sizeof(__nv_bfloat16)))
       << "negative control failed";
+}
+
+// ---------------------------------------------------------------------------------------------
+// fused_qkv_rope
+// ---------------------------------------------------------------------------------------------
+
+// The qkv rule is given one capacity per candidate, not one for the whole device, and this pins the
+// difference. blocks_per_sm(w) == floor(W1 / w) divides evenly only at powers of two, so on the
+// part the Op 8b sweep was measured on the resident warp count falls off a plateau at every other
+// blockDim.y. A cost model that assumes a single capacity disagrees with the shipped rule at h in
+// {3, 5, 6, 7} -- and only there, which is why a sweep over power-of-two blockDim.y alone could
+// not have caught the assumption.
+TEST(FusedRopeLaunchShape, QkvCapacityIsQuantisedNotConstant) {
+  // 39 SMs, and fused_qkv_rope kernels that keep 64 one-warp blocks resident per SM. Both limits
+  // agree at 64 on that part: 131072 registers per SM over 32 lanes times 64 registers per thread,
+  // and 2048 threads per SM over 32 lanes.
+  EXPECT_EQ(measuredCapacity(1), 2496u);
+  EXPECT_EQ(measuredCapacity(2), 2496u);
+  EXPECT_EQ(measuredCapacity(3), 2457u);
+  EXPECT_EQ(measuredCapacity(4), 2496u);
+  EXPECT_EQ(measuredCapacity(5), 2340u);
+  EXPECT_EQ(measuredCapacity(6), 2340u);
+  EXPECT_EQ(measuredCapacity(7), 2457u);
+  EXPECT_EQ(measuredCapacity(8), 2496u);
+  EXPECT_EQ(measuredCapacity(12), 2340u);
+  EXPECT_EQ(measuredCapacity(16), 2496u);
+
+  // Why the table above is a function of w alone: the dynamic scratch never binds. It is 4 * d2
+  // floats -- cos and sin for q and for k -- and fused_rope_warp_capacity clamps blocks_per_sm by
+  // shared_mem_per_sm / shared_mem_size. At the largest d2 in the ladders that clamp still admits
+  // 64 blocks, equal to the register- and thread-limited W1, so it is never the tighter of the two.
+  constexpr size_t kQkvMeasuredSharedMemPerSm = 262144;
+  EXPECT_GE(kQkvMeasuredSharedMemPerSm / (4 * 256 * sizeof(float)), kQkvMeasuredWarpsPerSm);
+
+  // Exactly which head counts see a quantised capacity, i.e. have a candidate list whose entries do
+  // not all sit on the top plateau.
+  std::set<int> quantised_h;
+  for (int h = 1; h <= 128; ++h) {
+    int cand[kFusedRopeQkvWarpCandidates];
+    const int n = fused_rope_qkv_candidates(h, cand);
+    bool constant = true;
+    for (int i = 1; i < n; ++i) {
+      constant &= measuredCapacity(cand[i]) == measuredCapacity(cand[0]);
+    }
+    if (!constant) quantised_h.insert(h);
+  }
+  EXPECT_EQ(quantised_h.size(), 4u);
+  for (const int h : {3, 5, 6, 7}) {
+    EXPECT_EQ(quantised_h.count(h), 1u) << "h=" << h;
+  }
+
+  // And that the difference changes the pick, which is the whole point. h = 3 at 4096 blocks: with
+  // the real capacity w = 3 needs 6 waves and loses to w = 1; under a uniform capacity it needs 5
+  // and wins. Both are the shipped rule; only the capacity table differs.
+  EXPECT_EQ(pickQkv(3, 128, 128, 6, 4096), 1);          // quantised: 726 984 774 924
+  EXPECT_EQ(pickQkvUniform(3, 128, 128, 6, 4096), 3);   // uniform:   726 984 645 924
+  EXPECT_NE(pickQkv(3, 128, 128, 6, 4096), pickQkvUniform(3, 128, 128, 6, 4096));
+}
+
+// The candidate list, pinned. fused_rope_qkv_candidates(h) is the powers of two up to pow2_ceil(h)
+// under the kFusedRopeMaxWarpsPerBlock clamp, plus fused_rope_qkv_fixed_warps(h) -- h itself at
+// h <= 8. That extra entry is what puts 3, 5, 6 and 7 into the list, and what bounds the damage at
+// odd h: the rule can always fall back to the old shape by choosing it rather than by being forced
+// to it. Measured, dropping it costs 0.5-2.6% at h in {5, 7} and leaves ten provable regressions at
+// every hysteresis margin in [0, 0.30].
+TEST(FusedRopeLaunchShape, QkvCandidateListsArePinned) {
+  const std::vector<std::pair<int, std::vector<int>>> rows = {
+      {1, {1}},                {2, {1, 2}},           {3, {1, 2, 3, 4}},
+      {4, {1, 2, 4}},          {5, {1, 2, 4, 5, 8}},  {6, {1, 2, 4, 6, 8}},
+      {7, {1, 2, 4, 7, 8}},    {8, {1, 2, 4, 8}},     {9, {1, 2, 4, 8, 16}},
+      {12, {1, 2, 4, 8, 16}},  {16, {1, 2, 4, 8, 16}}, {17, {1, 2, 4, 8, 16}},
+      {32, {1, 2, 4, 8, 16}},  {64, {1, 2, 4, 8, 16}}, {128, {1, 2, 4, 8, 16}},
+  };
+  for (const auto &row : rows) {
+    const int h = row.first;
+    int cand[kFusedRopeQkvWarpCandidates];
+    const int n = fused_rope_qkv_candidates(h, cand);
+    ASSERT_LE(static_cast<size_t>(n), row.second.size()) << "h=" << h;
+    EXPECT_EQ(std::vector<int>(cand, cand + n), row.second) << "h=" << h;
+    EXPECT_LE(n, kFusedRopeQkvWarpCandidates) << "h=" << h;
+    EXPECT_EQ(fused_rope_qkv_fixed_warps(h), h <= 8 ? h : 8) << "h=" << h;
+    EXPECT_NE(std::find(cand, cand + n, fused_rope_qkv_fixed_warps(h)), cand + n) << "h=" << h;
+    for (int i = 0; i < n; ++i) {
+      EXPECT_GE(cand[i], 1) << "h=" << h;
+      EXPECT_LE(cand[i], qkvWarpCapOf(h)) << "h=" << h << " candidate " << i;
+      EXPECT_LE(cand[i], kFusedRopeMaxWarpsPerBlock) << "h=" << h;
+    }
+    // Ascending, which fused_rope_select_from_candidates' strict `<` relies on to resolve a tie
+    // towards fewer warps.
+    for (int i = 1; i < n; ++i) EXPECT_LT(cand[i - 1], cand[i]) << "h=" << h;
+  }
+}
+
+// The qkv cost model, pinned regime by regime.
+// cost(w) = waves(w) * (kFusedRopeQkvWarpWeight * w + kFusedRopeQkvElemWeight * E(w)),
+// waves(w) = max(1, ceil(grid_blocks * w / capacity(w))),
+// E(w) = ceil(h / w) * segments * lanes_per_head(d, d2).
+// The trailing comments are the modelled costs of the candidates in ascending order, so that a
+// change to either weight shows up here as a changed pick instead of as a silent re-fit.
+//
+// The weights are 3 and 5, i.e. WEIGHT == elem_weight / warp_weight == 5/3. That ratio is derived,
+// not fitted: WEIGHT == 1 / K1 where K1 == barriers_per_block * t_barrier / t_elem, and a qkv block
+// retires three __syncthreads() -- one per fused_qkv_rope_block_* call -- against the rope block's
+// one, so K1 is three times Op 8's and WEIGHT is a third of Op 8's 5.
+TEST(FusedRopeLaunchShape, QkvTermsAndClampsArePinned) {
+  EXPECT_EQ(kFusedRopeQkvWarpWeight, 3);
+  EXPECT_EQ(kFusedRopeQkvElemWeight, 5);
+
+  // E(w). segments and lanes_per_head enter only through their product, so d = 128 with d2 = 128
+  // (4 lanes) at seg 3 and d = 64 with d2 = 32 (2 lanes) at seg 6 give the same E.
+  EXPECT_EQ(fused_rope_qkv_elems_per_thread(8, 128, 128, 6, 1), 192);
+  EXPECT_EQ(fused_rope_qkv_elems_per_thread(8, 128, 128, 6, 8), 24);
+  EXPECT_EQ(fused_rope_qkv_elems_per_thread(64, 128, 128, 6, 4), 384);
+  EXPECT_EQ(fused_rope_qkv_elems_per_thread(32, 128, 64, 3, 2), 192);
+  EXPECT_EQ(fused_rope_qkv_elems_per_thread(16, 64, 32, 6, 1), 192);
+  EXPECT_EQ(fused_rope_qkv_elems_per_thread(1, 128, 128, 6, 16), 24);
+  EXPECT_EQ(fused_rope_qkv_elems_per_thread(8, 128, 128, 3, 1),
+            fused_rope_qkv_elems_per_thread(8, 64, 32, 6, 1));
+
+  // segments is the one factor the rope rule does not have, and it moves the pick on its own: at
+  // h = 64 and 1024 blocks the same shape wants w = 2 when each head walks one d-wide output and
+  // w = 16 when it walks six.
+  EXPECT_EQ(pickQkv(64, 128, 128, 1, 1024), 2);    // 1283 646 664 736 896
+  EXPECT_EQ(pickQkv(64, 128, 128, 6, 1024), 16);   // 7683 3846 3864 3936 3696
+  EXPECT_EQ(pickQkv(64, 128, 128, 16, 1024), 16);  // 20483 10246 10264 10336 9296
+
+  // One partial wave. waves(w) is 1 for every candidate, so only the bracket is left and E falls
+  // faster than 3w rises: the pick is the warp_cap clamp.
+  EXPECT_EQ(pickQkv(64, 128, 128, 6, 1), 16);   // 7683 3846 1932 984 528
+  EXPECT_EQ(pickQkv(8, 128, 128, 6, 1), 8);     // 963 486 252 144
+  EXPECT_EQ(pickQkv(32, 128, 128, 3, 1), 16);   // 1923 966 492 264 168
+
+  // grid_blocks == capacity, so w = 1 is exactly one wave and every larger w opens another. The
+  // barrier term then has nothing to trade against and w = 1 wins at every head count.
+  EXPECT_EQ(pickQkv(8, 128, 128, 6, 2496), 1);   // 963 972 1008 1152
+  EXPECT_EQ(pickQkv(64, 128, 128, 6, 2496), 1);  // 7683 7692 7728 7872 8448
+
+  // A ceil() cliff. h = 128 at d2 = 64 has E(8) = 384 and E(16) = 192; 312 blocks still fit one
+  // wave at w = 8 but 313 does not, and the extra wave costs more than the halved E saves.
+  EXPECT_EQ(pickQkv(128, 128, 64, 6, 312), 8);   // 15363 7686 3852 1944 2016
+  EXPECT_EQ(pickQkv(128, 128, 64, 6, 313), 16);  // 15363 7686 3852 3888 3024
+
+  // Interior optima, i.e. cells where neither "stay inside one wave" nor "shrink E to a fixed
+  // target" selects the fastest measured warp count but the two-term model does.
+  EXPECT_EQ(pickQkv(16, 64, 32, 6, 1024), 2);  // 963 486 504 576 756
+  EXPECT_EQ(pickQkv(64, 64, 64, 6, 4096), 4);  // 7686 7704 6804 7056 7776
+  EXPECT_EQ(pickQkv(9, 128, 128, 6, 1024), 2);  // 1083 606 744 1056 1176
+
+  // Many waves. waves(w) becomes proportional to w, so the cost grows like w^2 plus a constant and
+  // the pick collapses to w = 1.
+  EXPECT_EQ(pickQkv(32, 128, 128, 6, 131072), 1);  // 203679 204156 205092 212184 242208
+  EXPECT_EQ(pickQkv(8, 128, 128, 6, 16384), 1);    // 6741 6804 6804 7632
+  // That last one also has an exact tie at 6804 between w = 2 and w = 4, which the ascending
+  // candidate list plus a strict `<` resolves towards fewer warps.
+  {
+    const std::vector<uint64_t> cost = qkvCosts(8, 128, 128, 6, 16384);
+    ASSERT_EQ(cost.size(), 4u);
+    EXPECT_EQ(cost[1], cost[2]);
+  }
+
+  // warp_cap: ceil(h / w) saturates at 1 once w >= h, so warps past pow2_ceil(h) only add barrier
+  // cost. h = 1 leaves a single candidate, for which there is nothing to choose.
+  EXPECT_EQ(pickQkv(8, 128, 128, 6, 256), 8);   // 963 486 252 144, w = 16 excluded
+  EXPECT_EQ(pickQkv(1, 128, 128, 6, 4096), 1);  // 246
+}
+
+// A capacity of 0 means cudaOccupancyMaxActiveBlocksPerMultiprocessor was unavailable, which
+// kernel_blocks_per_sm also reports when a kernel spills to local memory. There is then no wave
+// count and hence no cost to compare, so the launcher must fall back to the fixed shape this rule
+// replaced rather than to 0 or to an arbitrary candidate.
+TEST(FusedRopeLaunchShape, QkvZeroCapacityFallsBack) {
+  std::array<size_t, kFusedRopeQkvWarpCandidates> no_capacity{};
+  for (const int h : {1, 2, 3, 5, 6, 7, 8, 9, 12, 16, 32, 64, 128}) {
+    int cand[kFusedRopeQkvWarpCandidates];
+    const int n = fused_rope_qkv_candidates(h, cand);
+    for (const size_t grid : {1u, 2496u, 131072u}) {
+      EXPECT_EQ(fused_rope_select_warps_qkv(h, 128, 128, 6, grid, n, cand, no_capacity.data()),
+                fused_rope_qkv_fixed_warps(h))
+          << "h=" << h << " grid=" << grid;
+    }
+    EXPECT_EQ(fused_rope_qkv_fixed_warps(h), h <= 8 ? h : 8) << "h=" << h;
+  }
+
+  // One zero among non-zero capacities is equally fatal. fused_rope_select_from_candidates returns
+  // on the first zero rather than skipping that candidate, because a comparison against a cost that
+  // could not be evaluated is meaningless in both directions.
+  int cand[kFusedRopeQkvWarpCandidates];
+  const int n = fused_rope_qkv_candidates(64, cand);
+  std::array<size_t, kFusedRopeQkvWarpCandidates> partial;
+  for (int i = 0; i < n; ++i) partial[i] = measuredCapacity(cand[i]);
+  ASSERT_EQ(cand[2], 4);
+  partial[2] = 0;
+  EXPECT_EQ(fused_rope_select_warps_qkv(64, 128, 128, 6, 512, n, cand, partial.data()), 8);
+  EXPECT_EQ(pickQkv(64, 128, 128, 6, 512), 8);  // and 8 is what it picks with every capacity known
+}
+
+// Hysteresis, pinned from both sides. The wave count is a step function of grid_blocks * w /
+// capacity, so near a step the model has no resolution: it can prefer a candidate by a margin
+// smaller than one wave out of many, which is less than the quantisation it is being asked to see
+// through. Keeping the incumbent there is not a safety net for a broken model -- measured over the
+// 148 usable cells of the Op 8b sweep it raises the geomean from 1.1268 to 1.1272, cuts provable
+// regressions from 15 to 2 and cuts moves from 127 to 99.
+TEST(FusedRopeLaunchShape, QkvHysteresisIsPinned) {
+  EXPECT_EQ(kFusedRopeQkvHysteresisNum, 51u);
+  EXPECT_EQ(kFusedRopeQkvHysteresisDen, 50u);
+
+  // Fires. In each of these the incumbent -- min(fused_rope_qkv_fixed_warps(h), warp_cap) -- is
+  // within the 1/50 margin of the argmin, so the shape that has been running is kept. The first two
+  // are why the fixed-shape entry is in the candidate list at all: without hysteresis h = 5 and
+  // h = 7 fall to w = 1 on a modelled margin of 0.7% and 0.4%.
+  {
+    const std::vector<uint64_t> c = qkvCosts(5, 128, 128, 6, 4096);
+    ASSERT_EQ(c.size(), 5u);  // candidates 1, 2, 4, 5, 8
+    EXPECT_EQ(c[0], 1206u);   // w = 1, the argmin
+    EXPECT_EQ(c[3], 1215u);   // w = 5, the incumbent
+    EXPECT_TRUE(qkvHysteresisFires(c, 3));
+    EXPECT_EQ(pickQkv(5, 128, 128, 6, 4096), 5);
+  }
+  {
+    const std::vector<uint64_t> c = qkvCosts(7, 128, 128, 6, 4096);
+    ASSERT_EQ(c.size(), 5u);  // candidates 1, 2, 4, 7, 8
+    EXPECT_EQ(c[0], 1686u);   // w = 1, the argmin
+    EXPECT_EQ(c[3], 1692u);   // w = 7, the incumbent
+    EXPECT_TRUE(qkvHysteresisFires(c, 3));
+    EXPECT_EQ(pickQkv(7, 128, 128, 6, 4096), 7);
+  }
+  // At many waves every candidate is within a few tenths of a percent of every other, so the
+  // incumbent wins the margin test even though w = 1 is the argmin.
+  EXPECT_EQ(pickQkv(64, 128, 128, 6, 131072), 8);  // 407199 407676 407652 414264 444048
+  // Two different (d, d2, segments) triples with the same E per candidate, hence the same costs and
+  // the same pick: segments and lanes_per_head really do enter only as a product.
+  EXPECT_EQ(pickQkv(64, 256, 256, 3, 512), 8);   // 7683 3846 1932 1968 2112
+  EXPECT_EQ(pickQkv(64, 128, 128, 6, 512), 8);   // 7683 3846 1932 1968 2112
+  {
+    const std::vector<uint64_t> c = qkvCosts(64, 128, 128, 6, 512);
+    ASSERT_EQ(c.size(), 5u);  // candidates 1, 2, 4, 8, 16
+    EXPECT_EQ(c[2], 1932u);   // w = 4, the argmin
+    EXPECT_EQ(c[3], 1968u);   // w = 8, the incumbent
+    EXPECT_TRUE(qkvHysteresisFires(c, 3));
+  }
+
+  // Does not fire. The same h = 5 at a grid one wave smaller: the argmin moves to w = 1 by 12%
+  // rather than 0.7%, which is outside the margin, and the rule follows the model.
+  {
+    const std::vector<uint64_t> c = qkvCosts(5, 128, 128, 6, 2048);
+    ASSERT_EQ(c.size(), 5u);
+    EXPECT_EQ(c[0], 603u);   // w = 1, the argmin
+    EXPECT_EQ(c[3], 675u);   // w = 5, the incumbent
+    EXPECT_FALSE(qkvHysteresisFires(c, 3));
+    EXPECT_EQ(pickQkv(5, 128, 128, 6, 2048), 1);
+  }
+  {
+    const std::vector<uint64_t> c = qkvCosts(3, 128, 128, 6, 1024);
+    ASSERT_EQ(c.size(), 4u);  // candidates 1, 2, 3, 4
+    EXPECT_EQ(c[1], 246u);    // w = 2, the argmin
+    EXPECT_EQ(c[2], 258u);    // w = 3, the incumbent
+    EXPECT_FALSE(qkvHysteresisFires(c, 2));
+    EXPECT_EQ(pickQkv(3, 128, 128, 6, 1024), 2);
+  }
+
+  // The margin is tight, and it is what separates those two groups: 1968 / 1932 fires at 1/50 and
+  // 258 / 246 does not. Widening it to 1/10 flips the second one, which is why the margin was
+  // chosen against 1/10 by disagreement analysis rather than by score -- over the sweep the two
+  // differ on 48 cells and 46 of them favour 1/50, at a 1.0328x geomean.
+  EXPECT_LE(1968 * kFusedRopeQkvHysteresisDen, 1932 * kFusedRopeQkvHysteresisNum);
+  EXPECT_GT(258 * kFusedRopeQkvHysteresisDen, 246 * kFusedRopeQkvHysteresisNum);
+  EXPECT_LE(258 * 10, 246 * 11);
+}
+
+// Positive control for the qkv ladders. Those fix h, d, d2 and segments and vary only the grid, so
+// whether they cross the rule's buckets depends on the device's resident warp capacity -- which a
+// test cannot query, because cuda::kernel_blocks_per_sm is internal to libtransformer_engine and
+// not in its version script. It is bounded above by sm_count * maxThreadsPerSM / 32, quantised per
+// candidate exactly as the measured table is; on the 39 SM, 2048 thread per SM part the Op 8b
+// sweep was measured on that bound is the measured capacity. Requiring the ladders to span buckets
+// at the bound therefore pins the case that was measured, and a device with less capacity only
+// moves the boundaries down, which the prefix lists straddle widely enough to follow.
+TEST(FusedRopeLaunchShape, QkvPrefixLaddersSpanMultipleWarpCounts) {
+  for (const QkvLadder &l : qkvLadders()) {
+    std::set<int> picks;
+    size_t cells = 0;
+    for (const size_t prefix : *l.prefixes) {
+      const size_t ps = l.vary_s ? prefix : l.s_full;
+      const size_t pb = l.vary_s ? l.b_full : prefix;
+      if (ps > l.s_full || pb > l.b_full) continue;
+      ++cells;
+      const int w = pickQkvWith(localCapacityBound, l.h, l.d, l.d2, l.segments(), ps * pb);
+      EXPECT_GE(w, 1) << l.tag;
+      EXPECT_LE(w, qkvWarpCapOf(l.h)) << l.tag << " prefix=" << prefix;
+      EXPECT_LE(w, kFusedRopeMaxWarpsPerBlock) << l.tag;
+      picks.insert(w);
+    }
+    EXPECT_GE(cells, 8u) << l.tag << ": the prefix ladder does not fit this shape";
+    EXPECT_GE(picks.size(), 3u)
+        << l.tag << ": the prefix ladder does not cross the qkv rule's buckets on this device, so "
+                      "its bit-exactness comparisons would pass vacuously";
+  }
+}
+
+// SBHD, forward and backward, over every SBHD ladder. A leading slice of the packed host buffer is
+// a valid [s', b, h, total_d] tensor with the same layout and a grid of s' * b blocks, so the
+// slice and the full tensor must agree byte for byte on all three outputs.
+TEST(FusedRopeLaunchShape, QkvSbhdPrefixIsShapeIndependent) {
+  size_t run = 0;
+  for (const QkvLadder &l : qkvLadders()) {
+    if (l.fmt != NVTE_SBHD) continue;
+    runQkvLadder(l);
+    ++run;
+  }
+  EXPECT_GE(run, 8u) << "the qkv ladder table lost its SBHD rows";
+}
+
+// BSHD swaps which dimension strides over the batch, and interleaved swaps the rotate partner from
+// d_id +/- d2/2 to d_id +/- 1. Both have to be equally shape-independent, and so do the other two
+// instantiations the type switch reaches. The backward writes one packed tensor at the disjoint
+// per-head row offsets 0, q_split and q_split + k_split, which the forward does not exercise.
+TEST(FusedRopeLaunchShape, QkvBshdInterleavedAndOtherDtypesAreShapeIndependent) {
+  size_t bshd = 0, non_bf16 = 0;
+  for (const QkvLadder &l : qkvLadders()) {
+    if (l.fmt == NVTE_SBHD && l.dtype == DType::kBFloat16) continue;
+    if (l.fmt == NVTE_BSHD) ++bshd;
+    if (l.dtype != DType::kBFloat16) ++non_bf16;
+    runQkvLadder(l);
+  }
+  EXPECT_GE(bshd, 1u) << "the qkv ladder table lost its BSHD row";
+  EXPECT_GE(non_bf16, 2u) << "the qkv ladder table lost its fp32 and fp16 rows";
 }

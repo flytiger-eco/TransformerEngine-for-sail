@@ -73,6 +73,73 @@ constexpr int kFusedRopeElemWeight = 5;
 // blockDim.y is only ever a power of two, so the candidate list is 1, 2, 4, 8, 16.
 constexpr int kFusedRopeWarpCandidates = 5;
 
+// The fused_qkv_rope pair launches on the same dim3(s, b) grid with the same dim3(32, w) block, so
+// the same model applies, but two of its inputs change.
+//
+// Per-thread work acquires a `segments` factor. fused_qkv_rope_block_forward is called three times
+// per block -- once each for q, k and v at fused_rope.cu:543, :545 and :547 -- and each call walks
+// `for (i = 0; i < out_row_length; i += d)` over its own output tensor, so one thread covers
+// ceil(h / w) * (ceil(q_split/d) + ceil(k_split/d) + ceil(v_split/d)) * lanes(d, d2) elements
+// instead of ceil(h / w) * lanes(d, d2).
+//
+// The element weight is 5/3 of the warp weight, i.e. WEIGHT = 5/3 where the single-tensor kernel's
+// is 5. That value is derived rather than fitted. K1 = barriers_per_block * t_barrier / t_elem and
+// WEIGHT = 1/K1; the qkv block retires three __syncthreads() (fused_rope.cu:377, reached three
+// times) where the single-tensor kernel retires one, so K1 triples and WEIGHT divides by three.
+//
+// The measurements do not pin WEIGHT tightly, and Op 8's selection discipline applied literally
+// would settle on a worse value than the derived one. Scanning candidate set x WEIGHT in [1/16, 16]
+// x margin in [0, 1/5], 674 of the triples reach provable zero and they span WEIGHT 7/6 to 16, so
+// "fewest provable regressions, then best geomean" resolves to WEIGHT 7/6 at a geomean of only
+// 1.1195. Decomposing the headroom by group shows why that is the wrong question here: non-power-
+// of-two h (16 cells) has a per-shape oracle of 1.0081, i.e. the shipped h <= 8 ? h : 8 is already
+// within 1% of the best measured warp count, while power-of-two h (132 cells) has an oracle of
+// 1.1449 against which this rule scores 1.1431 at provable zero. The whole win is in the group
+// where the rule never provably loses. WEIGHT 3/2 scores 1.1278 and 5/3 scores 1.1272, both at
+// provable two, differing on 8 of the 148 cells and on none at all at zero margin. They are the
+// same rule to within measurement resolution, so the derived value ships.
+//
+// At WEIGHT 5/3 the rule scores geomean 1.1272 against the old heuristic over the 148 usable cells,
+// worst cell 0.9502, best 1.8454, changing blockDim.y in 99 of them. Six cells fall below their own
+// shipped-vs-shipped floor, but four of the six pick the shipped shape and so are the control's own
+// noise appearing in the rule's column; a shipped-vs-shipped control scores ten by that count. The
+// honest statistic -- slower than shipped *and* not the shipped shape -- is two, both the same
+// (h = 3, grid 4096) bf16 cell, where the measurement contradicts itself across dtype: bf16 prefers
+// the old w = 3 by 5.0%/2.0% while fp32 prefers the new w = 1 by 3.4%/4.6%, so the family rolls up
+// to 1.0020 and is net neutral. The per-shape oracle, which no rule can beat, scores 1.1293.
+//
+// Rejected alternatives, all measured on the same 148 cells. Dropping the ceil in waves(): the
+// quantisation is load-bearing rather than an artifact, and the smooth form scores 1.0418 with a
+// worst cell of 0.6779 and 77 provable regressions, reaching only 1.1037 even at a 1/5 margin. A
+// fixed cost per *wave* rather than per warp: 10 of the 148 groups have no integer constant at all
+// that selects their fastest measured warp count, so that form cannot represent the data. A
+// parameter-free hysteresis -- move only if it saves a whole wave, or only if the gain exceeds
+// 1/waves(best): 1.0886 at provable 15, and 1.0598 at provable 0 but only 28 moves. Measurements,
+// the noise-resolution filter that decides which cells are usable at all, and both
+// cross-validations: docs/common_op_optimization.md, Op 8b.
+constexpr int kFusedRopeQkvWarpWeight = 3;
+constexpr int kFusedRopeQkvElemWeight = 5;
+// Keep the incumbent unless another candidate is cheaper by more than 1/50 of the incumbent's cost.
+// waves() is a step function, so near a step the model can prefer a candidate by less than the
+// quantisation it is being asked to see through. Measured, this raises the geomean rather than
+// trading it away for safety: 1.1268 -> 1.1272, with provable regressions 15 -> 2 and moves
+// 127 -> 99. The margin was chosen against 1/10 by disagreement analysis rather than by score. The
+// two differ on 48 cells, 46 of which favour 1/50 at a 1.0328 geomean and only 2 of which favour
+// 1/10 -- both the self-contradictory h = 3 cell above. A margin of 1/10 would score 1.1164 at
+// provable zero, i.e. it buys the guarantee by giving up 46 measured wins to protect one shape.
+constexpr uint64_t kFusedRopeQkvHysteresisNum = 51;
+constexpr uint64_t kFusedRopeQkvHysteresisDen = 50;
+// The qkv candidate list is powers of two plus the shape the heuristic this replaces would have
+// used, which is h itself for h <= 8. That extra entry is the only way the rule can express the
+// incumbent, and it is load-bearing: with powers of two alone the model is forced off h in {5, 7}
+// onto 1 and loses 0.5-2.6% there, and the provable-regression count is ten at *every* margin in
+// [0, 0.30], whereas this list reaches zero from a margin of 0.0662 upwards. Admitting every
+// integer instead is no better and not simpler -- 1.1270 against this list's 1.1272 -- because a
+// non-power-of-two blockDim.y is exactly what loses resident-warp capacity. On the measured device
+// blocks_per_sm * w == 64 only at powers of two, so w = 3, 5, 6, 7 and 12 all sit on a lower
+// capacity plateau, 2457 or 2340 device-wide warps against 2496.
+constexpr int kFusedRopeQkvWarpCandidates = 6;
+
 /* \brief Rotary lanes one warp covers per head per output tensor
  *
  * The rotary loop covers `d_id < d2` striding by blockDim.x, and the `if (d > d2)` copy-the-rest
@@ -98,6 +165,52 @@ inline int fused_rope_lanes_per_head(const int d, const int d2) {
 inline int fused_rope_elems_per_thread(const int h, const int d, const int d2,
                                        const int warps_per_block) {
   return DIVUP(h, warps_per_block) * fused_rope_lanes_per_head(d, d2);
+}
+
+/* \brief Elements one thread of a fused_qkv_rope kernel reads and writes
+ *
+ * \param[in] h Number of heads
+ * \param[in] d Head dimension
+ * \param[in] d2 Rotary dimension, d2 <= d
+ * \param[in] segments Output tensors walked per head, counted in units of d
+ * \param[in] warps_per_block Candidate blockDim.y
+ */
+inline int fused_rope_qkv_elems_per_thread(const int h, const int d, const int d2,
+                                           const int segments, const int warps_per_block) {
+  return DIVUP(h, warps_per_block) * segments * fused_rope_lanes_per_head(d, d2);
+}
+
+/* \brief The blockDim.y the fused_qkv_rope launchers used before this rule existed
+ *
+ * Also the fallback when the occupancy query is unavailable, and -- because it is added to the
+ * candidate list -- the shape the rule can always fall back to *by choosing it*, which is what
+ * bounds the damage at odd h <= 7.
+ *
+ * \param[in] h Number of heads
+ */
+inline int fused_rope_qkv_fixed_warps(const int h) { return h <= 8 ? h : 8; }
+
+/* \brief Fills the fused_qkv_rope candidate list: powers of two, plus the fixed shape
+ *
+ * \param[in] h Number of heads
+ * \param[out] cand_warps At least kFusedRopeQkvWarpCandidates entries, ascending
+ *
+ * \return Number of entries written
+ */
+inline int fused_rope_qkv_candidates(const int h, int *cand_warps) {
+  // ceil(h / w) saturates at 1 once w >= h, so warps beyond pow2_ceil(h) remove no work and only
+  // lengthen the sincos preludes and the three __syncthreads barriers that follow them.
+  int warp_cap = 1;
+  while (warp_cap < h && warp_cap < kFusedRopeMaxWarpsPerBlock) warp_cap <<= 1;
+
+  int n = 0;
+  for (int w = 1; w <= warp_cap; w <<= 1) cand_warps[n++] = w;
+  const int fixed = std::min(fused_rope_qkv_fixed_warps(h), warp_cap);
+  bool present = false;
+  for (int i = 0; i < n; ++i) present |= cand_warps[i] == fixed;
+  if (!present) cand_warps[n++] = fixed;
+  std::sort(cand_warps, cand_warps + n);
+  return n;
 }
 
 /* \brief Chooses blockDim.y by minimising waves(w) * (warp_weight*w + elem_weight*E(w))
@@ -219,6 +332,54 @@ inline int fused_rope_select_warps(const int h, const int d, const int d2, const
                                            nullptr);
 }
 
+/* \brief Chooses blockDim.y for a fused_qkv_rope launch, given the candidate capacities
+ *
+ * Pure arithmetic, for the same reason and with the same testability as fused_rope_select_warps.
+ *
+ * \param[in] h Number of heads
+ * \param[in] d Head dimension
+ * \param[in] d2 Rotary dimension, d2 <= d
+ * \param[in] segments Output tensors walked per head, counted in units of d
+ * \param[in] grid_blocks Number of blocks in the chosen grid
+ * \param[in] n_cand Number of candidates, as returned by fused_rope_qkv_candidates
+ * \param[in] cand_warps Candidate blockDim.y values, ascending
+ * \param[in] cand_capacity cand_capacity[i] is the device-wide resident warp count at
+ *                          cand_warps[i], or 0 if that candidate could not be queried, in which
+ *                          case the model cannot be evaluated and the fallback below is returned
+ *
+ * \return One of cand_warps, or fused_rope_qkv_fixed_warps(h)
+ */
+inline int fused_rope_select_warps_qkv(const int h, const int d, const int d2, const int segments,
+                                       const size_t grid_blocks, const int n_cand,
+                                       const int *cand_warps, const size_t *cand_capacity) {
+  int cand_elems[kFusedRopeQkvWarpCandidates];
+  for (int i = 0; i < n_cand; ++i) {
+    cand_elems[i] = fused_rope_qkv_elems_per_thread(h, d, d2, segments, cand_warps[i]);
+  }
+  uint64_t cand_cost[kFusedRopeQkvWarpCandidates];
+  const int fallback = fused_rope_qkv_fixed_warps(h);
+  const int best = fused_rope_select_from_candidates(
+      n_cand, cand_warps, cand_capacity, cand_elems, kFusedRopeQkvWarpWeight,
+      kFusedRopeQkvElemWeight, grid_blocks, fallback, cand_cost);
+
+  // The wave count is a step function of grid_blocks * w / capacity, so near a step the model has
+  // no resolution: it can prefer a candidate by a margin smaller than one wave out of many, which
+  // is less than the quantisation it is being asked to see through. Hysteresis keeps the incumbent
+  // in that regime. This is not a safety net for a broken model -- measured over the 148 usable
+  // cells it *raises* the geomean, from 1.1268 to 1.1272, and cuts provable regressions from 15 to
+  // 2, because in near-ties the shape that has been running is empirically the better of the two.
+  const int incumbent = std::min(fallback, cand_warps[n_cand - 1]);
+  uint64_t best_cost = UINT64_MAX;
+  for (int i = 0; i < n_cand; ++i) best_cost = std::min(best_cost, cand_cost[i]);
+  for (int i = 0; i < n_cand && best_cost != UINT64_MAX; ++i) {
+    if (cand_warps[i] == incumbent &&
+        cand_cost[i] * kFusedRopeQkvHysteresisDen <= best_cost * kFusedRopeQkvHysteresisNum) {
+      return incumbent;
+    }
+  }
+  return best;
+}
+
 /* \brief Chooses blockDim.y for a fused_rope launch
  *
  * \param[in] kernel_func Kernel that is about to be launched
@@ -238,6 +399,38 @@ inline int fused_rope_warps_per_block(const void *kernel_func, const size_t grid
     warp_capacity[i] = fused_rope_warp_capacity(kernel_func, 1 << i, shared_mem_size);
   }
   return fused_rope_select_warps(h, d, d2, grid_blocks, warp_capacity);
+}
+
+/* \brief Chooses blockDim.y for a fused_qkv_rope launch
+ *
+ * \param[in] kernel_func Kernel that is about to be launched
+ * \param[in] grid_blocks Number of blocks in the chosen grid
+ * \param[in] h Number of heads
+ * \param[in] d Head dimension
+ * \param[in] d2 Rotary dimension, d2 <= d
+ * \param[in] q_split_arg Row length of the q output, in elements
+ * \param[in] k_split_arg Row length of the k output, in elements
+ * \param[in] v_split_arg Row length of the v output, in elements
+ * \param[in] shared_mem_size Dynamic shared memory per block
+ *
+ * \return warps_per_block in [1, kFusedRopeMaxWarpsPerBlock]
+ */
+inline int fused_rope_qkv_warps_per_block(const void *kernel_func, const size_t grid_blocks,
+                                          const int h, const int d, const int d2,
+                                          const int q_split_arg, const int k_split_arg,
+                                          const int v_split_arg, const size_t shared_mem_size) {
+  // Each fused_qkv_rope_block_* call walks `for (i = 0; i < out_row_length; i += d)`, so the
+  // per-tensor trip count is DIVUP(split, d) and not split / d.
+  const int segments = DIVUP(q_split_arg, d) + DIVUP(k_split_arg, d) + DIVUP(v_split_arg, d);
+
+  int cand_warps[kFusedRopeQkvWarpCandidates];
+  const int n_cand = fused_rope_qkv_candidates(h, cand_warps);
+  size_t cand_capacity[kFusedRopeQkvWarpCandidates];
+  for (int i = 0; i < n_cand; ++i) {
+    cand_capacity[i] = fused_rope_warp_capacity(kernel_func, cand_warps[i], shared_mem_size);
+  }
+  return fused_rope_select_warps_qkv(h, d, d2, segments, grid_blocks, n_cand, cand_warps,
+                                     cand_capacity);
 }
 
 }  // namespace transformer_engine
