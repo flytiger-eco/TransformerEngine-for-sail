@@ -346,3 +346,10 @@ void CutlassGroupedGemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
 void cutlass_grouped_gemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D, int num_gemms,
                           bool transa, bool transb, bool grad, NVTETensor* workspace,
                           bool accumulate, int device, int math_sm_count, cudaStream_t stream);
+
+// NVRTC-JIT grouped GEMM for SM80/SM89. Returns true on success; false
+// signals the caller should fall back to cuBLAS.
+bool cutlass_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                              int num_gemms, bool transa, bool transb, bool grad,
+                              NVTETensor* workspace, bool accumulate, int device,
+                              int math_sm_count, cudaStream_t stream);

@@ -25,12 +25,17 @@
 #include "../util/system.h"
 #include "./config.h"
 
-// Grouped GEMM entry points, defined in cutlass_grouped_gemm.cu (SM90/TMA) and
-// cutlass_grouped_gemm_ppu.cu (SM80/SM89).
+// Grouped GEMM entry points, defined in cutlass_grouped_gemm.cu (SM90/TMA),
+// cutlass_grouped_gemm_ppu.cu (SM80/SM89), and cutlass_grouped_gemm_rtc.cu
+// (NVRTC-JIT fast path for SM80/SM89).
 void cutlass_grouped_gemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D, int num_gemms,
                           bool transa, bool transb, bool grad, NVTETensor* workspace,
                           bool accumulate, int device, int math_sm_count, cudaStream_t stream);
 void cutlass_grouped_gemm_ppu(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                              int num_gemms, bool transa, bool transb, bool grad,
+                              NVTETensor* workspace, bool accumulate, int device,
+                              int math_sm_count, cudaStream_t stream);
+bool cutlass_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
                               int num_gemms, bool transa, bool transb, bool grad,
                               NVTETensor* workspace, bool accumulate, int device,
                               int math_sm_count, cudaStream_t stream);
@@ -1075,7 +1080,10 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   const bool is_sm80 = (transformer_engine::cuda::sm_arch(current_device) == 80);
   const bool is_sm89 = (transformer_engine::cuda::sm_arch(current_device) == 89);
   const bool use_cutlass = transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", false);
-  const bool sm80_disable_alignment_check = (is_sm80 || is_sm89) && transformer_engine::getenv<bool>("NVTE_DISABLE_ALIGNMENT_CHECK", true);
+  const bool use_cutlass_rtc =
+      transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM_RTC", true);
+  const bool sm80_disable_alignment_check =
+      (is_sm80 || is_sm89) && transformer_engine::getenv<bool>("NVTE_DISABLE_ALIGNMENT_CHECK", true);
   const bool warn_fallback =
       transformer_engine::getenv<bool>("NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", false);
 
@@ -1086,6 +1094,15 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
 
   // Currently only support cutlass group gemm on Hopper Arch
   if (!((is_sm80 || is_sm89 || is_hopper) && use_cutlass)) {
+    cublas_path();
+    return;
+  }
+
+  // Every group may be empty (e.g. GroupedLinear with all-zero m_splits): the
+  // framework drops zero-numel groups, so num_gemms == 0 with A/B/D pointing at
+  // empty arrays. The CUTLASS gate below dereferences A[0]/B[0]/D[0], so hand
+  // the no-op back to the cuBLAS path.
+  if (num_gemms == 0) {
     cublas_path();
     return;
   }
@@ -1112,6 +1129,28 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
         return false;
     }
 
+    return true;
+  };
+
+  // The CUTLASS kernels are instantiated with an 8-element alignment for A/B/D
+  // (16B vector accesses for FP16/BF16). NVTE_DISABLE_ALIGNMENT_CHECK only
+  // relaxes the uniform-K / K%128 requirement of the TMA path; it does not make
+  // the kernels handle arbitrary extents. Shapes whose contiguous dimension is
+  // not a multiple of 8 (e.g. hidden_size = 69 in the sanity tests) make the
+  // kernel issue misaligned accesses and abort the context with an
+  // "unspecified launch failure", so they must always go to cuBLAS.
+  auto all_groups_min_aligned = [&]() -> bool {
+    auto contiguous_extent_ok = [](const NVTETensor t) -> bool {
+      const auto *tensor = transformer_engine::convertNVTETensorCheck(t);
+      const auto &shape = tensor->data.shape;
+      return !shape.empty() && (shape.back() % 8 == 0);
+    };
+    for (int i = 0; i < num_gemms; ++i) {
+      if (!contiguous_extent_ok(A[i]) || !contiguous_extent_ok(B[i]) ||
+          !contiguous_extent_ok(D[i])) {
+        return false;
+      }
+    }
     return true;
   };
 
@@ -1147,7 +1186,26 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   //
   // Otherwise, fall back to cuBLAS.
   if (is_empty_arr(bias) && is_empty_arr(pre_gelu_out) && is_supported_dtype() &&
+      all_groups_min_aligned() &&
       (sm80_disable_alignment_check || all_groups_uniform_k128(B, transb))) {
+    // Optional NVRTC-JIT fast path for SM80/SM89.
+    if (use_cutlass_rtc && (is_sm80 || is_sm89)) {
+      const bool ok = cutlass_grouped_gemm_rtc(
+          A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
+          current_device, math_sm_count, stream);
+      if (ok) return;
+      // Diagnostic: when set, a failed RTC call hard-errors instead of
+      // silently falling back to cuBLAS. Useful to prove the RTC path is what
+      // produced the result.
+      NVTE_CHECK(!transformer_engine::getenv<bool>("NVTE_FORCE_RTC_NO_FALLBACK", false),
+                 "CUTLASS RTC grouped GEMM failed and NVTE_FORCE_RTC_NO_FALLBACK=1.");
+      if (warn_fallback) {
+        NVTE_WARN("CUTLASS RTC grouped GEMM unavailable, falling back to cuBLAS.");
+      }
+      cublas_path();
+      return;
+    }
+
     if (is_hopper) {
       // SM90: CUTLASS grouped GEMM with TMA (cutlass_grouped_gemm.cu)
       cutlass_grouped_gemm(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
