@@ -9,21 +9,31 @@
 
 #include <cfloat>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 #include "../common.h"
+#include "../util/cuda_runtime.h"
 #include "../utils.cuh"
 
 namespace transformer_engine {
 
 namespace {
 
-// Parameters to tune
-constexpr int n_warps_per_tile = 4;
-constexpr int threads_per_block = THREADS_PER_WARP * n_warps_per_tile;
-constexpr int desired_load_size = 8;
-constexpr int desired_store_size = 8;
+// Fallback launch configuration, i.e. the parameters this kernel has always
+// used. Reached only when no candidate configuration tiles every input tensor
+// exactly, in which case behavior is unchanged.
+constexpr int kFallbackWarpsPerTile = 4;
+constexpr int kFallbackLoadSize = 8;
+constexpr int kFallbackStoreSize = 8;
 constexpr int kMaxTensorsPerKernel = 64;  // Args must be <4 KB
+
+// Candidates use 8 warps per tile: a measured sweep of 40 configurations over
+// 9 workloads found 8 warps optimal for every workload, and halving it doubles
+// the per-thread register staging, which is what limits the fallback
+// configuration to 4 resident blocks per SM. The candidate list itself lives in
+// NVTE_MCT_CANDIDATE_LIST below, where the launch dispatch can share it.
+constexpr int kCandidateWarpsPerTile = 8;
 
 struct MultiCastTransposeArgs {
   // (input) Data buffers for input tensors
@@ -49,8 +59,9 @@ struct MultiCastTransposeArgs {
   int num_tensors;
 };
 
-template <int nvec_in, int nvec_out, bool aligned, typename CType, typename IType, typename OType>
-__global__ void __launch_bounds__(threads_per_block)
+template <int nvec_in, int nvec_out, int warps_per_tile, bool aligned, typename CType,
+          typename IType, typename OType>
+__global__ void __launch_bounds__(THREADS_PER_WARP * warps_per_tile)
     multi_cast_transpose_kernel(MultiCastTransposeArgs args) {
   using IVec = Vec<IType, nvec_in>;
   using OVecC = Vec<OType, nvec_in>;
@@ -59,7 +70,7 @@ __global__ void __launch_bounds__(threads_per_block)
   // Thread indices
   // Note: Block is interpreted as a warp_size x num_warps grid
   constexpr int bdimx = THREADS_PER_WARP;
-  constexpr int bdimy = n_warps_per_tile;
+  constexpr int bdimy = warps_per_tile;
   const int tid = threadIdx.x;
   const int tidx = tid % bdimx;
   const int tidy = tid / bdimx;
@@ -72,7 +83,7 @@ __global__ void __launch_bounds__(threads_per_block)
 
   // Number of nvec_out x nvec_in subtiles for each thread to
   // load/store
-  constexpr int n_iterations = THREADS_PER_WARP / n_warps_per_tile;
+  constexpr int n_iterations = THREADS_PER_WARP / warps_per_tile;
 
   // Find tensor corresponding to block
   int tensor_id = 0;
@@ -183,7 +194,7 @@ __global__ void __launch_bounds__(threads_per_block)
   }
 
   // Finalize fp8 factors
-  local_amax = reduce_max<n_warps_per_tile>(local_amax, tidy);
+  local_amax = reduce_max<warps_per_tile>(local_amax, tidy);
   if (tid == 0) {
     static_assert(std::is_same<CType, float>::value);
     if (amax_ptr != nullptr) atomicMaxFloat(amax_ptr, local_amax);
@@ -193,7 +204,259 @@ __global__ void __launch_bounds__(threads_per_block)
   }
 }
 
+/* Launch configuration for the fused kernel */
+struct KernelConfig {
+  /** Elements per vectorized input load */
+  int nvec_in = 0;
+  /** Elements per vectorized transposed store */
+  int nvec_out = 0;
+  /** Warps per tile (block size = THREADS_PER_WARP * warps_per_tile) */
+  int warps_per_tile = 0;
+};
+
+/* Estimated per-thread work for one tile
+ *
+ * Counts the instruction stream: vectorized input loads and cast stores
+ * (nvec_out of each per iteration), transposed stores (nvec_in per iteration),
+ * shared memory staging (write plus read of each staged vector), and
+ * per-element arithmetic (cast to compute type, scale multiply, amax update,
+ * cast to output type).
+ *
+ * This kernel is memory-bound, so global memory instructions get the dominant
+ * weight: shared memory staging hits on-chip SRAM and consumes no DRAM
+ * bandwidth. The weights decide correctly between configurations that move
+ * the same number of bytes with different vector widths, which occupancy
+ * alone cannot separate. They were validated against the measured sweep: the
+ * cost argmin lands on the measured optimum for all 9 workloads, and 223 of
+ * the 400 triples in a surrounding weight scan do the same, so this choice
+ * sits on a broad plateau rather than a fitted spike. Integer arithmetic keeps
+ * the ordering stable. See docs/common_op_optimization.md.
+ */
+inline size_t kernel_work(int nvec_in, int nvec_out, int warps_per_tile) {
+  constexpr size_t w_mem = 4;
+  constexpr size_t w_smem = 1;
+  constexpr size_t w_comp = 4;
+  const size_t num_iterations = THREADS_PER_WARP / warps_per_tile;
+  const size_t n_load = num_iterations * nvec_out;
+  const size_t n_store_t = nvec_in * num_iterations;
+  const size_t n_smem = 2 * nvec_in * num_iterations;
+  const size_t elts_per_thread = nvec_in * nvec_out * num_iterations;
+  return w_mem * (2 * n_load + n_store_t) + w_smem * n_smem + w_comp * elts_per_thread;
+}
+
+/* Candidate launch configurations, as (load size in bytes, transposed store
+ * vector width) pairs. Load sizes are in bytes so that the same targets apply
+ * to every input dtype; store widths are element counts, since the transposed
+ * store width is what drives register pressure. This list is the single source
+ * of truth for both the cost-model search and the launch dispatch, so the two
+ * cannot drift apart.
+ */
+#define NVTE_MCT_CANDIDATE_LIST(ACTION)   \
+  ACTION(4, 1) ACTION(4, 2) ACTION(4, 4)  \
+  ACTION(8, 1) ACTION(8, 2) ACTION(8, 4)  \
+  ACTION(16, 1) ACTION(16, 2) ACTION(16, 4)
+
+/* Score one candidate configuration against a batch of tensors
+ *
+ * Leaves best untouched if the candidate is unusable: because the load size is
+ * not a whole number of input elements, because some tensor is not tiled
+ * exactly (which would force the bounds-checked kernel), or because the driver
+ * reports that it spills registers to local memory.
+ */
+template <size_t load_size, int store_vec, typename IType, typename OType>
+void score_candidate(const std::vector<Tensor *> &input_list, const cuda::DeviceProps &props,
+                     KernelConfig &best, size_t &best_cost) {
+  if constexpr (load_size % sizeof(IType) != 0) {
+    return;
+  } else {
+    constexpr int nvec_in = static_cast<int>(load_size / sizeof(IType));
+    constexpr int nvec_out = store_vec;
+    constexpr int tile_dim_m = THREADS_PER_WARP * nvec_out;
+    constexpr int tile_dim_n = THREADS_PER_WARP * nvec_in;
+
+    size_t num_blocks = 0;
+    for (const auto *input : input_list) {
+      const int num_rows = input->data.shape[0];
+      const int row_length = input->data.shape[1];
+      if (num_rows % tile_dim_m != 0 || row_length % tile_dim_n != 0) return;
+      num_blocks += (num_rows / tile_dim_m) * (row_length / tile_dim_n);
+    }
+    if (num_blocks == 0) return;
+
+    const int blocks_per_sm = cuda::kernel_blocks_per_sm(
+        reinterpret_cast<const void *>(multi_cast_transpose_kernel<
+                                       nvec_in, nvec_out, kCandidateWarpsPerTile, true, fp32, IType,
+                                       OType>),
+        THREADS_PER_WARP * kCandidateWarpsPerTile);
+    if (blocks_per_sm <= 0) return;
+
+    const size_t concurrent_blocks = static_cast<size_t>(blocks_per_sm) * props.sm_count;
+    const size_t cost =
+        DIVUP(num_blocks, concurrent_blocks) *
+        kernel_work(nvec_in, nvec_out, kCandidateWarpsPerTile);
+    if (cost < best_cost) {
+      best_cost = cost;
+      best.nvec_in = nvec_in;
+      best.nvec_out = nvec_out;
+      best.warps_per_tile = kCandidateWarpsPerTile;
+    }
+  }
+}
+
+/* Choose the launch configuration for a fused batch of tensors
+ *
+ * Estimated cost is waves * work, where waves is the number of passes the
+ * device needs over the aggregate grid. Occupancy comes from the CUDA runtime
+ * rather than a register estimate, because these kernels are compiled
+ * statically and the driver knows their exact register and shared memory
+ * footprint.
+ *
+ * Only configurations that tile every input tensor exactly are considered, so
+ * the selected launch always uses the aligned kernel. If none qualifies the
+ * fallback configuration is returned and behavior is unchanged.
+ */
+template <typename IType, typename OType>
+KernelConfig select_kernel_config(const std::vector<Tensor *> &input_list) {
+  KernelConfig config;
+  config.nvec_in = kFallbackLoadSize / sizeof(IType);
+  config.nvec_out = kFallbackStoreSize / sizeof(OType);
+  config.warps_per_tile = kFallbackWarpsPerTile;
+
+  const auto &props = cuda::device_props();
+  size_t best_cost = std::numeric_limits<size_t>::max();
+#define NVTE_MCT_SCORE(LOAD_SIZE, STORE_VEC)                                   \
+  score_candidate<(LOAD_SIZE), (STORE_VEC), IType, OType>(input_list, props, config, best_cost);
+  NVTE_MCT_CANDIDATE_LIST(NVTE_MCT_SCORE)
+#undef NVTE_MCT_SCORE
+  return config;
+}
+
+template <int nvec_in, int nvec_out, int warps_per_tile, bool aligned, typename IType,
+          typename OType>
+void launch_kernel(const MultiCastTransposeArgs &args, int num_blocks, cudaStream_t stream) {
+  multi_cast_transpose_kernel<nvec_in, nvec_out, warps_per_tile, aligned, fp32, IType, OType>
+      <<<num_blocks, THREADS_PER_WARP * warps_per_tile, 0, stream>>>(args);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
 }  // namespace
+
+/* Turn a runtime KernelConfig into template arguments.
+ *
+ * Candidates are enumerated over load sizes in bytes, so the vector width that
+ * needs instantiating depends on the input dtype and `if constexpr` prunes the
+ * widths no candidate load size can produce. These macros expect `config` and
+ * `stream` from the enclosing scope, plus the `mct_args` and `mct_num_blocks`
+ * bindings that NVTE_MCT_LAUNCH_ALIGNED introduces, and must be expanded
+ * inside a template parameterized on IType and OType.
+ */
+#define NVTE_MCT_LAUNCH_FALLBACK(ALIGNED, ARGS, NUM_BLOCKS)                            \
+  launch_kernel<static_cast<int>(kFallbackLoadSize / sizeof(IType)),                   \
+                static_cast<int>(kFallbackStoreSize / sizeof(OType)),                  \
+                kFallbackWarpsPerTile, ALIGNED, IType, OType>((ARGS), (NUM_BLOCKS), stream);
+
+#define NVTE_MCT_TRY_CANDIDATE(LOAD_SIZE, STORE_VEC)                                    \
+  if constexpr ((LOAD_SIZE) % sizeof(IType) == 0) {                                     \
+    constexpr int kNvecIn = static_cast<int>((LOAD_SIZE) / sizeof(IType));              \
+    if (!launched && config.nvec_in == kNvecIn && config.nvec_out == (STORE_VEC) &&     \
+        config.warps_per_tile == kCandidateWarpsPerTile) {                              \
+      launch_kernel<kNvecIn, (STORE_VEC), kCandidateWarpsPerTile, true, IType, OType>(  \
+          mct_args, mct_num_blocks, stream);                                            \
+      launched = true;                                                                  \
+    }                                                                                   \
+  }
+
+#define NVTE_MCT_LAUNCH_ALIGNED(ARGS, NUM_BLOCKS)                                       \
+  {                                                                                     \
+    const MultiCastTransposeArgs &mct_args = (ARGS);                                    \
+    const int mct_num_blocks = (NUM_BLOCKS);                                            \
+    bool launched = false;                                                              \
+    NVTE_MCT_CANDIDATE_LIST(NVTE_MCT_TRY_CANDIDATE)                                     \
+    if (!launched) {                                                                    \
+      NVTE_MCT_LAUNCH_FALLBACK(true, mct_args, mct_num_blocks)                          \
+    }                                                                                   \
+  }
+
+namespace {
+
+template <typename IType, typename OType>
+void launch_multi_cast_transpose(const std::vector<Tensor *> &input_list,
+                                 std::vector<Tensor *> &output_list, cudaStream_t stream) {
+  const KernelConfig config = select_kernel_config<IType, OType>(input_list);
+
+  // Input matrices are divided into tiles
+  // Note: Each tile is a warp_size x warp_size grid of nvec_out x nvec_in subtiles
+  const int tile_dim_m = THREADS_PER_WARP * config.nvec_out;
+  const int tile_dim_n = THREADS_PER_WARP * config.nvec_in;
+
+  // Add tensors to kernel argument struct
+  MultiCastTransposeArgs kernel_args_aligned, kernel_args_unaligned;
+  kernel_args_aligned.num_tensors = 0;
+  kernel_args_aligned.block_range[0] = 0;
+  kernel_args_unaligned.num_tensors = 0;
+  kernel_args_unaligned.block_range[0] = 0;
+  for (size_t tensor_id = 0; tensor_id < input_list.size(); ++tensor_id) {
+    // Launch kernel if argument struct is full
+    if (kernel_args_aligned.num_tensors == kMaxTensorsPerKernel) {
+      const int n_blocks = kernel_args_aligned.block_range[kernel_args_aligned.num_tensors];
+      NVTE_MCT_LAUNCH_ALIGNED(kernel_args_aligned, n_blocks)
+      kernel_args_aligned.num_tensors = 0;
+    }
+    if (kernel_args_unaligned.num_tensors == kMaxTensorsPerKernel) {
+      const int n_blocks = kernel_args_unaligned.block_range[kernel_args_unaligned.num_tensors];
+      NVTE_MCT_LAUNCH_FALLBACK(false, kernel_args_unaligned, n_blocks)
+      kernel_args_unaligned.num_tensors = 0;
+    }
+
+    // Calculate number of thread blocks needed for tensor
+    const int num_rows = input_list[tensor_id]->data.shape[0];
+    const int row_length = input_list[tensor_id]->data.shape[1];
+    const int num_tiles_m = (num_rows + tile_dim_m - 1) / tile_dim_m;
+    const int num_tiles_n = (row_length + tile_dim_n - 1) / tile_dim_n;
+    const int num_tiles = num_tiles_m * num_tiles_n;
+
+    // Figure out whether to use aligned or unaligned kernel
+    const bool aligned =
+        ((num_tiles_m * tile_dim_m == num_rows) && (num_tiles_n * tile_dim_n == row_length));
+    auto &kernel_args = aligned ? kernel_args_aligned : kernel_args_unaligned;
+
+    // Add tensor to kernel argument struct
+    const int pos = kernel_args.num_tensors;
+    kernel_args.input_list[pos] = const_cast<void *>(input_list[tensor_id]->data.dptr);
+    kernel_args.output_c_list[pos] = output_list[tensor_id]->data.dptr;
+    kernel_args.output_t_list[pos] = output_list[tensor_id]->columnwise_data.dptr;
+    kernel_args.scale_list[pos] = output_list[tensor_id]->scale.dptr;
+    kernel_args.amax_list[pos] = output_list[tensor_id]->amax.dptr;
+    kernel_args.scale_inv_list[pos] = output_list[tensor_id]->scale_inv.dptr;
+    kernel_args.num_rows_list[pos] = num_rows;
+    kernel_args.row_length_list[pos] = row_length;
+    kernel_args.block_range[pos + 1] = kernel_args.block_range[pos] + num_tiles;
+    kernel_args.num_tensors++;
+  }
+
+  // A candidate configuration is only selected after every tensor was verified
+  // to tile exactly with these same tile dimensions, so the unaligned bucket,
+  // which only has a fallback instantiation, must be empty.
+  NVTE_CHECK(config.warps_per_tile == kFallbackWarpsPerTile ||
+                 kernel_args_unaligned.num_tensors == 0,
+             "Internal error: candidate configuration produced unaligned tensors");
+
+  // Launch kernel
+  if (kernel_args_aligned.num_tensors > 0) {
+    const int n_blocks = kernel_args_aligned.block_range[kernel_args_aligned.num_tensors];
+    NVTE_MCT_LAUNCH_ALIGNED(kernel_args_aligned, n_blocks)
+  }
+  if (kernel_args_unaligned.num_tensors > 0) {
+    const int n_blocks = kernel_args_unaligned.block_range[kernel_args_unaligned.num_tensors];
+    NVTE_MCT_LAUNCH_FALLBACK(false, kernel_args_unaligned, n_blocks)
+  }
+}
+
+}  // namespace
+
+#undef NVTE_MCT_TRY_CANDIDATE
+#undef NVTE_MCT_LAUNCH_ALIGNED
+#undef NVTE_MCT_LAUNCH_FALLBACK
 
 void multi_cast_transpose(const std::vector<Tensor*> input_list, std::vector<Tensor*> output_list,
                           cudaStream_t stream) {
@@ -212,7 +475,6 @@ void multi_cast_transpose(const std::vector<Tensor*> input_list, std::vector<Ten
     const auto& output = *output_list[tensor_id];
     CheckInputTensor(input, "multi_cast_transpose_input_" + std::to_string(tensor_id));
     CheckInputTensor(output, "multi_cast_transpose_output_" + std::to_string(tensor_id));
-    //std::cout << *static_cast<char*>(output.data.dptr) << std::endl;
     NVTE_CHECK(output.has_data() && output.has_columnwise_data(),
                "Both rowwise and columnwise output data needs to be allocated.");
 
@@ -235,99 +497,13 @@ void multi_cast_transpose(const std::vector<Tensor*> input_list, std::vector<Ten
                input.data.shape);
   }
 
-  // Input matrices are divided into tiles
-  // Note: Each tile is a warp_size x warp_size grid of nvec_out x nvec_in subtiles
-  const int tile_dim_m = THREADS_PER_WARP * desired_store_size * 8 / typeToNumBits(otype);
-  const int tile_dim_n = THREADS_PER_WARP * desired_load_size * 8 / typeToNumBits(itype);
-
-  // Add tensors to kernel argument struct
-  MultiCastTransposeArgs kernel_args_aligned, kernel_args_unaligned;
-  kernel_args_aligned.num_tensors = 0;
-  kernel_args_aligned.block_range[0] = 0;
-  kernel_args_unaligned.num_tensors = 0;
-  kernel_args_unaligned.block_range[0] = 0;
-  for (size_t tensor_id = 0; tensor_id < input_list.size(); ++tensor_id) {
-    // Launch kernel if argument struct is full
-    if (kernel_args_aligned.num_tensors == kMaxTensorsPerKernel) {
-      TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
-          itype, InputType,
-          TRANSFORMER_ENGINE_TYPE_SWITCH_OUTPUT(
-              otype, OutputType, constexpr int nvec_in = desired_load_size / sizeof(InputType);
-              constexpr int nvec_out = desired_store_size / sizeof(OutputType);
-              const int n_blocks = kernel_args_aligned.block_range[kernel_args_aligned.num_tensors];
-              multi_cast_transpose_kernel<nvec_in, nvec_out, true, fp32, InputType, OutputType>
-              <<<n_blocks, threads_per_block, 0, stream>>>(kernel_args_aligned););  // NOLINT(*)
-      );                                                                            // NOLINT(*)
-      NVTE_CHECK_CUDA(cudaGetLastError());
-      kernel_args_aligned.num_tensors = 0;
-    }
-    if (kernel_args_unaligned.num_tensors == kMaxTensorsPerKernel) {
-      TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
-          itype, InputType,
-          TRANSFORMER_ENGINE_TYPE_SWITCH_OUTPUT(
-              otype, OutputType, constexpr int nvec_in = desired_load_size / sizeof(InputType);
-              constexpr int nvec_out = desired_store_size / sizeof(OutputType);
-              const int n_blocks =
-                  kernel_args_unaligned.block_range[kernel_args_unaligned.num_tensors];
-              multi_cast_transpose_kernel<nvec_in, nvec_out, false, fp32, InputType, OutputType>
-              <<<n_blocks, threads_per_block, 0, stream>>>(kernel_args_unaligned););  // NOLINT(*)
-      );                                                                              // NOLINT(*)
-      NVTE_CHECK_CUDA(cudaGetLastError());
-      kernel_args_unaligned.num_tensors = 0;
-    }
-
-    // Calculate number of thread blocks needed for tensor
-    const int num_rows = input_list[tensor_id]->data.shape[0];
-    const int row_length = input_list[tensor_id]->data.shape[1];
-    const int num_tiles_m = (num_rows + tile_dim_m - 1) / tile_dim_m;
-    const int num_tiles_n = (row_length + tile_dim_n - 1) / tile_dim_n;
-    const int num_tiles = num_tiles_m * num_tiles_n;
-
-    // Figure out whether to use aligned or unaligned kernel
-    const bool aligned =
-        ((num_tiles_m * tile_dim_m == num_rows) && (num_tiles_n * tile_dim_n == row_length));
-    auto& kernel_args = aligned ? kernel_args_aligned : kernel_args_unaligned;
-
-    // Add tensor to kernel argument struct
-    const int pos = kernel_args.num_tensors;
-    kernel_args.input_list[pos] = const_cast<void*>(input_list[tensor_id]->data.dptr);
-    kernel_args.output_c_list[pos] = output_list[tensor_id]->data.dptr;
-    kernel_args.output_t_list[pos] = output_list[tensor_id]->columnwise_data.dptr;
-    kernel_args.scale_list[pos] = output_list[tensor_id]->scale.dptr;
-    kernel_args.amax_list[pos] = output_list[tensor_id]->amax.dptr;
-    kernel_args.scale_inv_list[pos] = output_list[tensor_id]->scale_inv.dptr;
-    kernel_args.num_rows_list[pos] = num_rows;
-    kernel_args.row_length_list[pos] = row_length;
-    kernel_args.block_range[pos + 1] = kernel_args.block_range[pos] + num_tiles;
-    kernel_args.num_tensors++;
-  }
-
-  // Launch kernel
-  if (kernel_args_aligned.num_tensors > 0) {
-    TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
-        itype, InputType,
-        TRANSFORMER_ENGINE_TYPE_SWITCH_OUTPUT(
-            otype, OutputType, constexpr int nvec_in = desired_load_size / sizeof(InputType);
-            constexpr int nvec_out = desired_store_size / sizeof(OutputType);
-            const int n_blocks = kernel_args_aligned.block_range[kernel_args_aligned.num_tensors];
-            multi_cast_transpose_kernel<nvec_in, nvec_out, true, fp32, InputType, OutputType>
-            <<<n_blocks, threads_per_block, 0, stream>>>(kernel_args_aligned););  // NOLINT(*)
-    );                                                                            // NOLINT(*)
-    NVTE_CHECK_CUDA(cudaGetLastError());
-  }
-  if (kernel_args_unaligned.num_tensors > 0) {
-    TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
-        itype, InputType,
-        TRANSFORMER_ENGINE_TYPE_SWITCH_OUTPUT(
-            otype, OutputType, constexpr int nvec_in = desired_load_size / sizeof(InputType);
-            constexpr int nvec_out = desired_store_size / sizeof(OutputType);
-            const int n_blocks =
-                kernel_args_unaligned.block_range[kernel_args_unaligned.num_tensors];
-            multi_cast_transpose_kernel<nvec_in, nvec_out, false, fp32, InputType, OutputType>
-            <<<n_blocks, threads_per_block, 0, stream>>>(kernel_args_unaligned););  // NOLINT(*)
-    );                                                                              // NOLINT(*)
-    NVTE_CHECK_CUDA(cudaGetLastError());
-  }
+  // Select the launch configuration and dispatch. Both the tile dimensions and
+  // the aligned/unaligned split depend on it, so this happens per dtype pair.
+  TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
+      itype, InputType,
+      TRANSFORMER_ENGINE_TYPE_SWITCH_OUTPUT(
+          otype, OutputType,
+          launch_multi_cast_transpose<InputType, OutputType>(input_list, output_list, stream);));
 }
 
 }  // namespace transformer_engine
