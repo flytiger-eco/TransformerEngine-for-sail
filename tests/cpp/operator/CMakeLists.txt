@@ -38,6 +38,7 @@ add_executable(test_operator
                test_unary_launch_shape.cu
                test_gated_launch_shape.cu
                test_softmax.cu
+               test_softmax_scale_precision.cu
                test_causal_softmax.cu
                test_swizzle.cu
                test_multi_swizzle.cu
