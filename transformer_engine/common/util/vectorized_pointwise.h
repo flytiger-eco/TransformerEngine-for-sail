@@ -540,10 +540,10 @@ void VectorizedUnaryGradKernelLauncher(const InputTypeGrad *grad, const InputTyp
   }
 }
 
-template <int nvec, bool aligned, typename ComputeType, typename Param,
+template <int nvec, bool aligned, int kThreads, typename ComputeType, typename Param,
           ComputeType (*Activation)(const ComputeType, const Param &), typename InputType,
           typename OutputType>
-__launch_bounds__(unary_kernel_threads) __global__
+__launch_bounds__(kThreads) __global__
     void gated_act_kernel(const InputType *input, OutputType *output, const ComputeType *scale,
                           ComputeType *amax, ComputeType *scale_inv, const size_t m, const size_t n,
                           const Param p, const size_t num_aligned_elements) {
@@ -589,7 +589,7 @@ __launch_bounds__(unary_kernel_threads) __global__
 
   // Reduce amax over block
   if (requires_amax) {
-    max = reduce_max<unary_kernel_threads / THREADS_PER_WARP>(max, warp_id);
+    max = reduce_max<kThreads / THREADS_PER_WARP>(max, warp_id);
     if (threadIdx.x == 0) {
       static_assert(std::is_same<ComputeType, float>::value);
       atomicMaxFloat(amax, max);
@@ -604,6 +604,42 @@ __launch_bounds__(unary_kernel_threads) __global__
   }
 }
 
+/* \brief Launches one gated_act_kernel instantiation with the measured launch shape.
+          \p num_aligned_elements is what the kernel indexes rows with, \p num_iterations is the
+          bound the grid is sized from; they differ only in the scalar misaligned arm. */
+template <int nvec, bool aligned, typename ComputeType, typename Param,
+          ComputeType (*Activation)(const ComputeType, const Param &), typename InputType,
+          typename OutputType>
+inline void launch_gated_act_kernel(const InputType *input, OutputType *output,
+                                    const ComputeType *scale, ComputeType *amax,
+                                    ComputeType *scale_inv, const size_t m, const size_t n,
+                                    const Param &p, const size_t num_aligned_elements,
+                                    const size_t num_iterations, cudaStream_t stream) {
+  // See launch_unary_kernel: the scalar misaligned arm keeps the shipped shape.
+  constexpr bool kQuantShape = is_fp8<OutputType>::value && (nvec > 1);
+  PointwiseLaunchConfig cfg;
+  if constexpr (kQuantShape) {
+    cfg = make_pointwise_narrow_launch_config(
+        reinterpret_cast<const void *>(
+            &gated_act_kernel<nvec, aligned, pointwise_narrow_kernel_threads, ComputeType, Param,
+                              Activation, InputType, OutputType>),
+        num_iterations);
+  }
+  const size_t num_blocks = pointwise_grid_size(num_iterations, cfg.threads, cfg.vecs_per_thread);
+
+  if constexpr (kQuantShape) {
+    if (cfg.threads == static_cast<size_t>(pointwise_narrow_kernel_threads)) {
+      gated_act_kernel<nvec, aligned, pointwise_narrow_kernel_threads, ComputeType, Param,
+                       Activation, InputType, OutputType><<<num_blocks, cfg.threads, 0, stream>>>(
+          input, output, scale, amax, scale_inv, m, n, p, num_aligned_elements);
+      return;
+    }
+  }
+  gated_act_kernel<nvec, aligned, unary_kernel_threads, ComputeType, Param, Activation, InputType,
+                   OutputType><<<num_blocks, cfg.threads, 0, stream>>>(
+      input, output, scale, amax, scale_inv, m, n, p, num_aligned_elements);
+}
+
 template <int nvec, typename ComputeType, typename Param,
           ComputeType (*Activation)(const ComputeType, const Param &), typename InputType,
           typename OutputType>
@@ -611,27 +647,26 @@ void GatedActivationKernelLauncher(const InputType *input, OutputType *output, c
                                    fp32 *amax, fp32 *scale_inv, const size_t m, const size_t n,
                                    const Param &p, cudaStream_t stream) {
   if (m != 0 && n != 0) {
-    size_t num_aligned_elements = get_num_aligned_elements(input, n, nvec, sizeof(InputType));
-    constexpr size_t threads = unary_kernel_threads;
-    size_t num_blocks = DIVUP(num_aligned_elements * m, threads);
-    constexpr size_t max_blocks = 65535;
-    num_blocks = std::min(num_blocks, max_blocks);
+    const size_t num_aligned_elements = get_num_aligned_elements(input, n, nvec, sizeof(InputType));
+    // Every arm sizes its grid from the vectorized bound, including the scalar one, which then
+    // iterates n * m elements instead. That asymmetry predates the launch-shape change.
+    const size_t num_iterations = num_aligned_elements * m;
 
     switch (auto align = CheckAlignment(n, nvec, input, input + n, output)) {
       case Alignment::SAME_ALIGNED:
-        gated_act_kernel<nvec, true, ComputeType, Param, Activation>
-            <<<num_blocks, threads, 0, stream>>>(input, output, scale, amax, scale_inv, m, n, p,
-                                                 num_aligned_elements);
+        launch_gated_act_kernel<nvec, true, ComputeType, Param, Activation>(
+            input, output, scale, amax, scale_inv, m, n, p, num_aligned_elements, num_iterations,
+            stream);
         break;
       case Alignment::SAME_UNALIGNED:
-        gated_act_kernel<nvec, false, ComputeType, Param, Activation>
-            <<<num_blocks, threads, 0, stream>>>(input, output, scale, amax, scale_inv, m, n, p,
-                                                 num_aligned_elements);
+        launch_gated_act_kernel<nvec, false, ComputeType, Param, Activation>(
+            input, output, scale, amax, scale_inv, m, n, p, num_aligned_elements, num_iterations,
+            stream);
         break;
       case Alignment::DIFFERENT: {
         // If the pointers are aligned differently we cannot vectorize
-        gated_act_kernel<1, true, ComputeType, Param, Activation>
-            <<<num_blocks, threads, 0, stream>>>(input, output, scale, amax, scale_inv, m, n, p, n);
+        launch_gated_act_kernel<1, true, ComputeType, Param, Activation>(
+            input, output, scale, amax, scale_inv, m, n, p, n, num_iterations, stream);
         break;
       }
     }
@@ -639,11 +674,11 @@ void GatedActivationKernelLauncher(const InputType *input, OutputType *output, c
   }
 }
 
-template <int nvec, bool aligned, typename ComputeType, typename Param,
+template <int nvec, bool aligned, int kThreads, typename ComputeType, typename Param,
           ComputeType (*Activation)(const ComputeType, const Param &),
           ComputeType (*Dactivation)(const ComputeType, const Param &), typename InputType,
           typename OutputType>
-__launch_bounds__(unary_kernel_threads) __global__
+__launch_bounds__(kThreads) __global__
     void dgated_act_kernel(const InputType *grad, const InputType *input, OutputType *output,
                            const ComputeType *scale, ComputeType *amax, ComputeType *scale_inv,
                            const size_t m, const size_t n, const Param p,
@@ -705,7 +740,7 @@ __launch_bounds__(unary_kernel_threads) __global__
 
   // Reduce amax over block
   if (requires_amax) {
-    max = reduce_max<unary_kernel_threads / THREADS_PER_WARP>(max, warp_id);
+    max = reduce_max<kThreads / THREADS_PER_WARP>(max, warp_id);
     if (threadIdx.x == 0) {
       static_assert(std::is_same<ComputeType, float>::value);
       atomicMaxFloat(amax, max);
@@ -720,6 +755,45 @@ __launch_bounds__(unary_kernel_threads) __global__
   }
 }
 
+/* \brief Launches one dgated_act_kernel instantiation with the measured launch shape.
+          \p num_aligned_elements and \p num_iterations differ only in the scalar misaligned arm;
+          see launch_gated_act_kernel. */
+template <int nvec, bool aligned, typename ComputeType, typename Param,
+          ComputeType (*Activation)(const ComputeType, const Param &),
+          ComputeType (*Dactivation)(const ComputeType, const Param &), typename InputType,
+          typename OutputType>
+inline void launch_dgated_act_kernel(const InputType *grad, const InputType *input,
+                                     OutputType *output, const ComputeType *scale,
+                                     ComputeType *amax, ComputeType *scale_inv, const size_t m,
+                                     const size_t n, const Param &p,
+                                     const size_t num_aligned_elements,
+                                     const size_t num_iterations, cudaStream_t stream) {
+  // See launch_unary_kernel: the scalar misaligned arm keeps the shipped shape.
+  constexpr bool kQuantShape = is_fp8<OutputType>::value && (nvec > 1);
+  PointwiseLaunchConfig cfg;
+  if constexpr (kQuantShape) {
+    cfg = make_pointwise_narrow_launch_config(
+        reinterpret_cast<const void *>(
+            &dgated_act_kernel<nvec, aligned, pointwise_narrow_kernel_threads, ComputeType, Param,
+                               Activation, Dactivation, InputType, OutputType>),
+        num_iterations);
+  }
+  const size_t num_blocks = pointwise_grid_size(num_iterations, cfg.threads, cfg.vecs_per_thread);
+
+  if constexpr (kQuantShape) {
+    if (cfg.threads == static_cast<size_t>(pointwise_narrow_kernel_threads)) {
+      dgated_act_kernel<nvec, aligned, pointwise_narrow_kernel_threads, ComputeType, Param,
+                        Activation, Dactivation, InputType,
+                        OutputType><<<num_blocks, cfg.threads, 0, stream>>>(
+          grad, input, output, scale, amax, scale_inv, m, n, p, num_aligned_elements);
+      return;
+    }
+  }
+  dgated_act_kernel<nvec, aligned, unary_kernel_threads, ComputeType, Param, Activation,
+                    Dactivation, InputType, OutputType><<<num_blocks, cfg.threads, 0, stream>>>(
+      grad, input, output, scale, amax, scale_inv, m, n, p, num_aligned_elements);
+}
+
 template <int nvec, typename ComputeType, typename Param,
           ComputeType (*Activation)(const ComputeType, const Param &),
           ComputeType (*Dactivation)(const ComputeType, const Param &), typename InputType,
@@ -729,28 +803,25 @@ void DGatedActivationKernelLauncher(const InputType *grad, const InputType *inpu
                                     fp32 *scale_inv, const size_t m, const size_t n, const Param &p,
                                     cudaStream_t stream) {
   if (m != 0 && n != 0) {
-    size_t num_aligned_elements = get_num_aligned_elements(grad, n, nvec, sizeof(InputType));
-    constexpr size_t threads = unary_kernel_threads;
-    size_t num_blocks = DIVUP(num_aligned_elements * m, threads);
-    constexpr size_t max_blocks = 65535;
-    num_blocks = std::min(num_blocks, max_blocks);
+    const size_t num_aligned_elements = get_num_aligned_elements(grad, n, nvec, sizeof(InputType));
+    // See GatedActivationKernelLauncher: every arm sizes its grid from the vectorized bound.
+    const size_t num_iterations = num_aligned_elements * m;
 
     switch (auto align = CheckAlignment(n, nvec, input, input + n, output, output + n)) {
       case Alignment::SAME_ALIGNED:
-        dgated_act_kernel<nvec, true, ComputeType, Param, Activation, Dactivation>
-            <<<num_blocks, threads, 0, stream>>>(grad, input, output, scale, amax, scale_inv, m, n,
-                                                 p, num_aligned_elements);
+        launch_dgated_act_kernel<nvec, true, ComputeType, Param, Activation, Dactivation>(
+            grad, input, output, scale, amax, scale_inv, m, n, p, num_aligned_elements,
+            num_iterations, stream);
         break;
       case Alignment::SAME_UNALIGNED:
-        dgated_act_kernel<nvec, false, ComputeType, Param, Activation, Dactivation>
-            <<<num_blocks, threads, 0, stream>>>(grad, input, output, scale, amax, scale_inv, m, n,
-                                                 p, num_aligned_elements);
+        launch_dgated_act_kernel<nvec, false, ComputeType, Param, Activation, Dactivation>(
+            grad, input, output, scale, amax, scale_inv, m, n, p, num_aligned_elements,
+            num_iterations, stream);
         break;
       case Alignment::DIFFERENT: {
         // If the pointers are aligned differently we cannot vectorize
-        dgated_act_kernel<1, true, ComputeType, Param, Activation, Dactivation>
-            <<<num_blocks, threads, 0, stream>>>(grad, input, output, scale, amax, scale_inv, m, n,
-                                                 p, n);
+        launch_dgated_act_kernel<1, true, ComputeType, Param, Activation, Dactivation>(
+            grad, input, output, scale, amax, scale_inv, m, n, p, n, num_iterations, stream);
         break;
       }
     }

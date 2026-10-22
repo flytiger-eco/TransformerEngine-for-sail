@@ -36,6 +36,7 @@ add_executable(test_operator
                test_multi_padding.cu
                test_multi_unpadding.cu
                test_unary_launch_shape.cu
+               test_gated_launch_shape.cu
                test_softmax.cu
                test_causal_softmax.cu
                test_swizzle.cu
