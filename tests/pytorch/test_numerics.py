@@ -2846,3 +2846,289 @@ def test_noncontiguous():
     out = _run_module(g2, b)
 
     assert_allclose(out, outT, 1e-7)
+
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_grouped_gemm_expert_performance(layout, dtype):
+    """Performance test for grouped GEMM with expert-sized dimensions.
+
+    Typical MoE expert dimensions: M=4096, N=1536, K=4096, num_experts=16.
+    Each expert handles 4096/16=256 tokens on average.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for this test.")
+    if dtype == torch.bfloat16 and not is_bf16_available():
+        pytest.skip("bfloat16 is required for this test.")
+
+    torch.manual_seed(42)
+    torch.cuda.synchronize()
+    
+    z = 16  # num_experts
+    m_total = 4096  * z
+    n = 1536
+    k = 4096
+    m_per_expert = m_total // z  # 256
+    
+    m_splits = [m_per_expert] * z
+    
+    if layout == "TN":
+        # Forward pass: weight @ input.T -> output
+        # A: weight [N, K], B: input [M, K], out: [M, N]
+        A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]
+        B = list(torch.split(torch.randn(m_total, k, dtype=dtype, device="cuda"), m_splits))
+        out = [torch.randn(m_total, n, dtype=dtype, device="cuda")]
+        out_ref = [o.clone() for o in torch.split(out[0], m_splits)]
+        grad = False
+        single_output = True
+    elif layout == "NN":
+        # Dgrad pass: grad_output @ weight.T -> dgrad
+        # A: weight [N, K], B: grad_output [M, N], out: [M, K]
+        A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]
+        B = list(torch.split(torch.randn(m_total, n, dtype=dtype, device="cuda"), m_splits))
+        out = [torch.randn(m_total, k, dtype=dtype, device="cuda")]
+        out_ref = [o.clone() for o in torch.split(out[0], m_splits)]
+        grad = True
+        single_output = True
+    else:  # layout == "NT"
+        # Wgrad pass: grad_output.T @ input -> wgrad
+        # A: input [M, K], B: grad_output [M, N], out: [N, K]
+        A = list(torch.split(torch.randn(m_total, k, dtype=dtype, device="cuda"), m_splits))
+        B = list(torch.split(torch.randn(m_total, n, dtype=dtype, device="cuda"), m_splits))
+        out = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]
+        out_ref = [o.clone() for o in out]
+        grad = True
+        single_output = False
+        
+    os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"]="1"
+    for _ in range(1):
+        general_grouped_gemm(
+            A,
+            B,
+            [o.clone() for o in out],
+            dtype,
+            # get_multi_stream_cublas_workspace(),
+            m_splits=m_splits,
+            grad=grad,
+            accumulate=False,
+            layout=layout,
+            single_output=single_output,
+        )
+    torch.cuda.synchronize()
+    
+    os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"]="0"
+    for _ in range(1):
+        general_grouped_gemm(
+            A,
+            B,
+            [o.clone() for o in out],
+            dtype,
+            # get_multi_stream_cublas_workspace(),
+            m_splits=m_splits,
+            grad=grad,
+            accumulate=False,
+            layout=layout,
+            single_output=single_output,
+        )
+    torch.cuda.synchronize()
+
+
+# ----------------------------------------------------------------------------
+# Grouped GEMM precision / performance tests
+#
+# These exercise the CUTLASS/RTC grouped GEMM path (NVTE_USE_CUTLASS_GROUPED_GEMM=1)
+# against both a torch reference and the cuBLAS path (=0), across the three
+# layouts used by MoE expert linears:
+#   TN -> forward   (out = input @ weight.T)
+#   NN -> dgrad     (out = grad_output @ weight)
+#   NT -> wgrad     (out = grad_output.T @ input)
+# ----------------------------------------------------------------------------
+
+
+def _grouped_gemm_operands(layout, dtype, z, m_per_expert, n, k, seed=42):
+    """Build (A, B, out, m_splits, grad, single_output) for a grouped GEMM layout."""
+    torch.manual_seed(seed)
+    m_total = m_per_expert * z
+    m_splits = [m_per_expert] * z
+    if layout == "TN":
+        # A: weight [N, K], B: input [M, K], out: [M, N]
+        A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]
+        B = list(torch.split(torch.randn(m_total, k, dtype=dtype, device="cuda"), m_splits))
+        out = [torch.zeros(m_total, n, dtype=dtype, device="cuda")]
+        grad, single_output = False, True
+    elif layout == "NN":
+        # A: weight [N, K], B: grad_output [M, N], out: [M, K]
+        A = [torch.randn(n, k, dtype=dtype, device="cuda") for _ in range(z)]
+        B = list(torch.split(torch.randn(m_total, n, dtype=dtype, device="cuda"), m_splits))
+        out = [torch.zeros(m_total, k, dtype=dtype, device="cuda")]
+        grad, single_output = True, True
+    else:  # NT
+        # A: input [M, K], B: grad_output [M, N], out: [N, K] per expert
+        A = list(torch.split(torch.randn(m_total, k, dtype=dtype, device="cuda"), m_splits))
+        B = list(torch.split(torch.randn(m_total, n, dtype=dtype, device="cuda"), m_splits))
+        out = [torch.zeros(n, k, dtype=dtype, device="cuda") for _ in range(z)]
+        grad, single_output = True, False
+    return A, B, out, m_splits, grad, single_output
+
+
+def _grouped_gemm_torch_reference(A, B, layout, out_dtype):
+    """Per-expert reference computed with fp32 accumulation, cast back to out_dtype."""
+    ref = []
+    for a, b in zip(A, B):
+        af, bf = a.float(), b.float()
+        if layout == "TN":
+            r = bf @ af.t()
+        elif layout == "NN":
+            r = bf @ af
+        else:  # NT
+            r = bf.t() @ af
+        ref.append(r.to(out_dtype))
+    return ref
+
+
+def _run_grouped_gemm(A, B, out_template, layout, m_splits, grad, single_output, dtype, use_cutlass):
+    """Run one grouped GEMM on the requested backend, returning per-expert outputs."""
+    z = len(A)
+    out = [o.clone() for o in out_template]
+    prev = os.environ.get("NVTE_USE_CUTLASS_GROUPED_GEMM")
+    os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"] = "1" if use_cutlass else "0"
+    try:
+        general_grouped_gemm(
+            A,
+            B,
+            out,
+            [None] * z,
+            dtype,
+            layout=layout,
+            m_splits=m_splits,
+            grad=grad,
+            accumulate=False,
+            single_output=single_output,
+        )
+        torch.cuda.synchronize()
+    finally:
+        if prev is None:
+            os.environ.pop("NVTE_USE_CUTLASS_GROUPED_GEMM", None)
+        else:
+            os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"] = prev
+    if single_output:
+        return list(torch.split(out[0], m_splits))
+    return out
+
+
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape",  # (num_experts, tokens_per_expert, N, K)
+    [
+        (4, 256, 256, 512),
+        (8, 128, 512, 1024),
+        (16, 256, 1536, 2048),
+    ],
+)
+def test_grouped_gemm_accuracy(shape, layout, dtype):
+    """CUTLASS/RTC grouped GEMM matches both a torch reference and the cuBLAS path."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for this test.")
+    if dtype == torch.bfloat16 and not is_bf16_available():
+        pytest.skip("bfloat16 is required for this test.")
+
+    z, m_per_expert, n, k = shape
+    A, B, out_template, m_splits, grad, single_output = _grouped_gemm_operands(
+        layout, dtype, z, m_per_expert, n, k
+    )
+
+    ref = _grouped_gemm_torch_reference(A, B, layout, dtype)
+    cublas_out = _run_grouped_gemm(
+        A, B, out_template, layout, m_splits, grad, single_output, dtype, use_cutlass=False
+    )
+    cutlass_out = _run_grouped_gemm(
+        A, B, out_template, layout, m_splits, grad, single_output, dtype, use_cutlass=True
+    )
+
+    # cuBLAS baseline agrees with the torch reference ...
+    # A small absolute tolerance absorbs near-zero cancellation elements: their
+    # true value is ~0 so the relative tolerance is meaningless, while the diff
+    # (fp32-accumulation order + bf16 rounding) is negligible vs the O(sqrt(K))
+    # signal magnitude. Real layout/logic bugs still trip the bf16 rtol.
+    assert_allclose(cublas_out, ref, atol=5e-2)
+    # ... and the CUTLASS/RTC path agrees with the cuBLAS baseline.
+    assert_allclose(cutlass_out, cublas_out, atol=5e-2)
+
+
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_grouped_gemm_performance(layout, dtype):
+    """Benchmark the CUTLASS/RTC grouped GEMM vs cuBLAS on MoE expert dimensions.
+
+    Typical MoE expert dimensions: tokens_per_expert=256, N=1536, K=4096,
+    num_experts=16. Reports latency/throughput for both backends and checks that
+    the two backends stay numerically consistent.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for this test.")
+    if dtype == torch.bfloat16 and not is_bf16_available():
+        pytest.skip("bfloat16 is required for this test.")
+
+    z, m_per_expert, n, k = 16, 256, 1536, 4096
+    A, B, out_template, m_splits, grad, single_output = _grouped_gemm_operands(
+        layout, dtype, z, m_per_expert, n, k
+    )
+    m_total = m_per_expert * z
+    total_flops = 2.0 * m_total * n * k  # sum_i 2 * M_i * N * K, sum_i M_i = m_total
+
+    warmup, iters = 5, 20
+
+    def _bench(use_cutlass):
+        prev = os.environ.get("NVTE_USE_CUTLASS_GROUPED_GEMM")
+        os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"] = "1" if use_cutlass else "0"
+        out = [o.clone() for o in out_template]
+        try:
+            for _ in range(warmup):
+                general_grouped_gemm(
+                    A, B, out, [None] * z, dtype,
+                    layout=layout, m_splits=m_splits, grad=grad,
+                    accumulate=False, single_output=single_output,
+                )
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                general_grouped_gemm(
+                    A, B, out, [None] * z, dtype,
+                    layout=layout, m_splits=m_splits, grad=grad,
+                    accumulate=False, single_output=single_output,
+                )
+            end.record()
+            torch.cuda.synchronize()
+            elapsed_ms = start.elapsed_time(end) / iters
+        finally:
+            if prev is None:
+                os.environ.pop("NVTE_USE_CUTLASS_GROUPED_GEMM", None)
+            else:
+                os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"] = prev
+        result = list(torch.split(out[0], m_splits)) if single_output else out
+        return elapsed_ms, result
+
+    cublas_ms, cublas_out = _bench(use_cutlass=False)
+    cutlass_ms, cutlass_out = _bench(use_cutlass=True)
+
+    cublas_tflops = total_flops / (cublas_ms * 1e-3) / 1e12
+    cutlass_tflops = total_flops / (cutlass_ms * 1e-3) / 1e12
+    speedup = cublas_ms / cutlass_ms
+
+    print(
+        f"\n[grouped_gemm perf] layout={layout} z={z} m/expert={m_per_expert} "
+        f"N={n} K={k}\n"
+        f"    cuBLAS : {cublas_ms:8.3f} ms  {cublas_tflops:7.1f} TFLOP/s\n"
+        f"    CUTLASS: {cutlass_ms:8.3f} ms  {cutlass_tflops:7.1f} TFLOP/s\n"
+        f"    speedup (cuBLAS/CUTLASS): {speedup:5.2f}x"
+    )
+
+    # Sanity: timings are valid and both backends stay numerically consistent.
+    # Use a small absolute tolerance in addition to the bf16 relative tolerance:
+    # with K=4096 the fp32-accumulation order differs between cuBLAS and CUTLASS,
+    # so near-zero output elements can differ by a few bf16 ULPs (~1e-3), which
+    # is negligible relative to the ~O(sqrt(K)) signal magnitude.
+    assert cublas_ms > 0.0 and cutlass_ms > 0.0
+    assert_allclose(cutlass_out, cublas_out, atol=5e-2)
