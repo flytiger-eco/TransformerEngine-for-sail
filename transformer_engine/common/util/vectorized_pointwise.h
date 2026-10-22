@@ -11,6 +11,7 @@
 
 #include "../common.h"
 #include "../utils.cuh"
+#include "cuda_runtime.h"
 #include "math.h"
 namespace transformer_engine {
 
@@ -171,9 +172,75 @@ class VectorizedStorer : public VectorizedAccessor<DType, nvec, aligned> {
 
 constexpr int unary_kernel_threads = 512;
 
-template <int nvec, bool aligned, typename ComputeType, typename Param,
+/* \brief Launch shape for a grid-stride pointwise kernel, shared by the unary and gated quantize
+          kernels below and by the scaled gated activation forward.
+   At a fixed grid, a 128-thread block is resident up to four times more often than a 512-thread
+   one, so the same work is issued in a quarter as many waves and the tail of each wave is finer
+   grained. Raising the vectors per thread alongside it holds the grid, and so any per-block
+   prologue, reduction or atomic, at the shipped count while putting more independent loads in
+   flight per scheduler. These values are used only when the resulting grid still fills the device;
+   narrowing a block that already covers it adds no parallelism, and on the quantize path it would
+   multiply the amax atomics.
+   Three independent config sweeps selected the same pair: one over unary_kernel /
+   unary_grad_kernel, one over gated_act_kernel / dgated_act_kernel, and one over
+   scaled_gated_forward_kernel. */
+constexpr int pointwise_narrow_kernel_threads = 128;
+constexpr int pointwise_narrow_max_vecs_per_thread = 4;
+
+/* \brief Block size and vectors-per-thread for a pointwise kernel launch. The default is the
+          shipped shape: 512 threads, one vector per thread.
+
+   \p num_iterations is the bound of the kernel's grid-stride loop: the vector count for the unary
+   kernels, and the vector count times the row count for the gated ones.
+
+   Vectors per thread is raised only while the resulting grid still covers at least half of the
+   blocks the device can hold concurrently. Tensors too small to reach that keep the shipped
+   shape, because narrowing the block on its own does not add parallelism. */
+struct PointwiseLaunchConfig {
+  size_t threads = unary_kernel_threads;
+  size_t vecs_per_thread = 1;
+
+  PointwiseLaunchConfig() = default;
+
+  PointwiseLaunchConfig(const size_t num_iterations, const int sm_count,
+                        const int narrow_blocks_per_sm) {
+    if (narrow_blocks_per_sm <= 0) return;  // narrow block would spill
+    const size_t target =
+        static_cast<size_t>(sm_count) * static_cast<size_t>(narrow_blocks_per_sm) / 2;
+    constexpr size_t narrow_threads = pointwise_narrow_kernel_threads;
+    if (target == 0 || DIVUP(num_iterations, narrow_threads) < target) return;
+    threads = narrow_threads;
+    while (vecs_per_thread * 2 <= pointwise_narrow_max_vecs_per_thread &&
+           DIVUP(num_iterations, threads * vecs_per_thread * 2) >= target) {
+      vecs_per_thread *= 2;
+    }
+  }
+};
+
+/* \brief Chooses the launch shape for a grid-stride pointwise kernel. \p narrow_kernel_func is the
+          narrow instantiation, used only to ask the occupancy API how many of its blocks fit per
+          SM. */
+inline PointwiseLaunchConfig make_pointwise_narrow_launch_config(
+    const void *narrow_kernel_func, const size_t num_iterations) {
+  const int device_id = cuda::current_device();
+  const cuda::DeviceProps &props = cuda::device_props(device_id);
+  // Upper bound on the fill target. Testing it first keeps the occupancy query, and with it the
+  // second device lookup, off the path of tensors that cannot fill the device anyway.
+  const size_t target_upper_bound =
+      static_cast<size_t>(props.sm_count) *
+      (props.max_threads_per_sm / pointwise_narrow_kernel_threads) / 2;
+  if (DIVUP(num_iterations, static_cast<size_t>(pointwise_narrow_kernel_threads)) <
+      target_upper_bound) {
+    return PointwiseLaunchConfig();
+  }
+  return PointwiseLaunchConfig(
+      num_iterations, props.sm_count,
+      cuda::kernel_blocks_per_sm(narrow_kernel_func, pointwise_narrow_kernel_threads, device_id));
+}
+
+template <int nvec, bool aligned, int kThreads, typename ComputeType, typename Param,
           ComputeType (*OP)(ComputeType, const Param &), typename InputType, typename OutputType>
-__launch_bounds__(unary_kernel_threads) __global__
+__launch_bounds__(kThreads) __global__
     void unary_kernel(const InputType *input, const ComputeType *noop, OutputType *output,
                       const ComputeType *scale, ComputeType *amax, ComputeType *scale_inv, Param p,
                       const size_t N, const size_t num_aligned_elements) {
@@ -211,7 +278,7 @@ __launch_bounds__(unary_kernel_threads) __global__
 
   // Reduce amax over block
   if (requires_amax) {
-    max = reduce_max<unary_kernel_threads / THREADS_PER_WARP>(max, warp_id);
+    max = reduce_max<kThreads / THREADS_PER_WARP>(max, warp_id);
     if (threadIdx.x == 0) {
       static_assert(std::is_same<ComputeType, float>::value);
       atomicMaxFloat(amax, max);
@@ -226,10 +293,10 @@ __launch_bounds__(unary_kernel_threads) __global__
   }
 }
 
-template <int nvec, bool aligned, typename ComputeType, typename Param,
+template <int nvec, bool aligned, int kThreads, typename ComputeType, typename Param,
           ComputeType (*OP)(ComputeType, const Param &), typename InputType, typename InputTypeGrad,
           typename OutputType>
-__launch_bounds__(unary_kernel_threads) __global__
+__launch_bounds__(kThreads) __global__
     void unary_grad_kernel(const InputTypeGrad *grad, const InputType *input, OutputType *output,
                            const ComputeType *scale, ComputeType *amax, ComputeType *scale_inv,
                            Param p, const size_t N, const size_t num_aligned_elements) {
@@ -269,7 +336,7 @@ __launch_bounds__(unary_kernel_threads) __global__
 
   // Reduce amax over block
   if (requires_amax) {
-    max = reduce_max<unary_kernel_threads / THREADS_PER_WARP>(max, warp_id);
+    max = reduce_max<kThreads / THREADS_PER_WARP>(max, warp_id);
     if (threadIdx.x == 0) {
       static_assert(std::is_same<ComputeType, float>::value);
       atomicMaxFloat(amax, max);
@@ -334,6 +401,84 @@ Alignment CheckAlignment(const size_t lead_dim, const int nvec, const T... ptrs)
 
 }  // namespace
 
+/* \brief Grid size for a pointwise launch, capped at the historical block limit. */
+inline size_t pointwise_grid_size(const size_t num_iterations, const size_t threads,
+                                  const size_t vecs_per_thread) {
+  constexpr size_t max_blocks = 65535;
+  return std::min(DIVUP(num_iterations, threads * vecs_per_thread), max_blocks);
+}
+
+/* \brief Launches one unary_kernel instantiation with the measured launch shape. The narrow
+          quantize shape is only instantiated when the output is fp8. */
+template <int nvec, bool aligned, typename ComputeType, typename Param,
+          ComputeType (*OP)(ComputeType, const Param &), typename InputType, typename OutputType>
+inline void launch_unary_kernel(const InputType *input, const ComputeType *noop, OutputType *output,
+                                const ComputeType *scale, ComputeType *amax, ComputeType *scale_inv,
+                                const Param &params, const size_t N,
+                                const size_t num_aligned_elements, cudaStream_t stream) {
+  // The scalar arm taken when the pointers disagree on alignment has no vector load to amortize,
+  // so it keeps the shipped shape and needs no second instantiation.
+  constexpr bool kQuantShape = is_fp8<OutputType>::value && (nvec > 1);
+  PointwiseLaunchConfig cfg;
+  if constexpr (kQuantShape) {
+    cfg = make_pointwise_narrow_launch_config(
+        reinterpret_cast<const void *>(
+            &unary_kernel<nvec, aligned, pointwise_narrow_kernel_threads, ComputeType, Param, OP,
+                          InputType, OutputType>),
+        num_aligned_elements);
+  }
+  const size_t num_blocks =
+      pointwise_grid_size(num_aligned_elements, cfg.threads, cfg.vecs_per_thread);
+
+  if constexpr (kQuantShape) {
+    if (cfg.threads == static_cast<size_t>(pointwise_narrow_kernel_threads)) {
+      unary_kernel<nvec, aligned, pointwise_narrow_kernel_threads, ComputeType, Param, OP,
+                   InputType, OutputType><<<num_blocks, cfg.threads, 0, stream>>>(
+          input, noop, output, scale, amax, scale_inv, params, N, num_aligned_elements);
+      return;
+    }
+  }
+  unary_kernel<nvec, aligned, unary_kernel_threads, ComputeType, Param, OP, InputType, OutputType>
+      <<<num_blocks, cfg.threads, 0, stream>>>(input, noop, output, scale, amax, scale_inv, params,
+                                               N, num_aligned_elements);
+}
+
+/* \brief Launches one unary_grad_kernel instantiation with the measured launch shape. */
+template <int nvec, bool aligned, typename ComputeType, typename Param,
+          ComputeType (*OP)(ComputeType, const Param &), typename InputType, typename InputTypeGrad,
+          typename OutputType>
+inline void launch_unary_grad_kernel(const InputTypeGrad *grad, const InputType *input,
+                                     OutputType *output, const ComputeType *scale,
+                                     ComputeType *amax, ComputeType *scale_inv, const Param &params,
+                                     const size_t N, const size_t num_aligned_elements,
+                                     cudaStream_t stream) {
+  // See launch_unary_kernel: the scalar misaligned arm keeps the shipped shape.
+  constexpr bool kQuantShape = is_fp8<OutputType>::value && (nvec > 1);
+  PointwiseLaunchConfig cfg;
+  if constexpr (kQuantShape) {
+    cfg = make_pointwise_narrow_launch_config(
+        reinterpret_cast<const void *>(
+            &unary_grad_kernel<nvec, aligned, pointwise_narrow_kernel_threads, ComputeType, Param,
+                               OP, InputType, InputTypeGrad, OutputType>),
+        num_aligned_elements);
+  }
+  const size_t num_blocks =
+      pointwise_grid_size(num_aligned_elements, cfg.threads, cfg.vecs_per_thread);
+
+  if constexpr (kQuantShape) {
+    if (cfg.threads == static_cast<size_t>(pointwise_narrow_kernel_threads)) {
+      unary_grad_kernel<nvec, aligned, pointwise_narrow_kernel_threads, ComputeType, Param, OP,
+                        InputType, InputTypeGrad,
+                        OutputType><<<num_blocks, cfg.threads, 0, stream>>>(
+          grad, input, output, scale, amax, scale_inv, params, N, num_aligned_elements);
+      return;
+    }
+  }
+  unary_grad_kernel<nvec, aligned, unary_kernel_threads, ComputeType, Param, OP, InputType,
+                    InputTypeGrad, OutputType><<<num_blocks, cfg.threads, 0, stream>>>(
+      grad, input, output, scale, amax, scale_inv, params, N, num_aligned_elements);
+}
+
 template <int nvec, typename Param, fp32 (*OP)(const fp32, const Param &), typename InputType,
           typename OutputType>
 void VectorizedUnaryKernelLauncher(const InputType *input, const fp32 *noop, OutputType *output,
@@ -343,24 +488,20 @@ void VectorizedUnaryKernelLauncher(const InputType *input, const fp32 *noop, Out
     auto align = CheckAlignment(N, nvec, input, output);
 
     size_t num_aligned_elements = get_num_aligned_elements(input, N, nvec, sizeof(InputType));
-    constexpr size_t threads = unary_kernel_threads;
-    size_t num_blocks = DIVUP(num_aligned_elements, threads);
-    constexpr size_t max_blocks = 65535;
-    num_blocks = std::min(num_blocks, max_blocks);
 
     switch (align) {
       case Alignment::SAME_ALIGNED:
-        unary_kernel<nvec, true, fp32, Param, OP><<<num_blocks, threads, 0, stream>>>(
-            input, noop, output, scale, amax, scale_inv, params, N, num_aligned_elements);
+        launch_unary_kernel<nvec, true, fp32, Param, OP>(
+            input, noop, output, scale, amax, scale_inv, params, N, num_aligned_elements, stream);
         break;
       case Alignment::SAME_UNALIGNED:
-        unary_kernel<nvec, false, fp32, Param, OP><<<num_blocks, threads, 0, stream>>>(
-            input, noop, output, scale, amax, scale_inv, params, N, num_aligned_elements);
+        launch_unary_kernel<nvec, false, fp32, Param, OP>(
+            input, noop, output, scale, amax, scale_inv, params, N, num_aligned_elements, stream);
         break;
       case Alignment::DIFFERENT: {
         // If the pointers are aligned differently we cannot vectorize
-        unary_kernel<1, true, fp32, Param, OP><<<num_blocks, threads, 0, stream>>>(
-            input, noop, output, scale, amax, scale_inv, params, N, N);
+        launch_unary_kernel<1, true, fp32, Param, OP>(input, noop, output, scale, amax, scale_inv,
+                                                      params, N, N, stream);
         break;
       }
     }
@@ -378,24 +519,20 @@ void VectorizedUnaryGradKernelLauncher(const InputTypeGrad *grad, const InputTyp
     auto align = CheckAlignment(N, nvec, input, grad, output);
 
     size_t num_aligned_elements = get_num_aligned_elements(input, N, nvec, sizeof(InputType));
-    constexpr size_t threads = unary_kernel_threads;
-    size_t num_blocks = DIVUP(num_aligned_elements, threads);
-    constexpr size_t max_blocks = 65535;
-    num_blocks = std::min(num_blocks, max_blocks);
 
     switch (align) {
       case Alignment::SAME_ALIGNED:
-        unary_grad_kernel<nvec, true, fp32, Param, OP><<<num_blocks, threads, 0, stream>>>(
-            grad, input, output, scale, amax, scale_inv, params, N, num_aligned_elements);
+        launch_unary_grad_kernel<nvec, true, fp32, Param, OP>(
+            grad, input, output, scale, amax, scale_inv, params, N, num_aligned_elements, stream);
         break;
       case Alignment::SAME_UNALIGNED:
-        unary_grad_kernel<nvec, false, fp32, Param, OP><<<num_blocks, threads, 0, stream>>>(
-            grad, input, output, scale, amax, scale_inv, params, N, num_aligned_elements);
+        launch_unary_grad_kernel<nvec, false, fp32, Param, OP>(
+            grad, input, output, scale, amax, scale_inv, params, N, num_aligned_elements, stream);
         break;
       case Alignment::DIFFERENT: {
         // If the pointers are aligned differently we cannot vectorize
-        unary_grad_kernel<1, true, fp32, Param, OP><<<num_blocks, threads, 0, stream>>>(
-            grad, input, output, scale, amax, scale_inv, params, N, N);
+        launch_unary_grad_kernel<1, true, fp32, Param, OP>(grad, input, output, scale, amax,
+                                                           scale_inv, params, N, N, stream);
         break;
       }
     }
