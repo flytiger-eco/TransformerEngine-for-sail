@@ -832,3 +832,15 @@ install(DIRECTORY "${CUTLASS3_INCLUDE_DIR}/cutlass"
         DESTINATION include/cutlass3
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp" PATTERN "*.inl"
                        PATTERN "*.cuh")
+# The PPU headers also live at the root of the include dir: the RTC source
+# includes "ppu_include.hpp" directly (which in turn includes
+# "accutlass.hpp"), and resolve_cutlass_include_dir() validates the installed
+# tree by requiring cutlass/cutlass.h *and* ppu_include.hpp next to each
+# other. Without them the installed package cannot resolve the include dir
+# and the RTC arm is disabled at runtime.
+foreach(_ppu_root_header ppu_include.hpp accutlass.hpp)
+  if(EXISTS "${CUTLASS3_INCLUDE_DIR}/${_ppu_root_header}")
+    install(FILES "${CUTLASS3_INCLUDE_DIR}/${_ppu_root_header}"
+            DESTINATION include/cutlass3)
+  endif()
+endforeach()
