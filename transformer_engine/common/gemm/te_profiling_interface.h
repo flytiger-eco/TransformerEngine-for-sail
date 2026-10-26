@@ -59,6 +59,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -295,9 +296,13 @@ class TeProfilingInterface {
  private:
   // Dense bf16/fp16 tensor-core peak in TFLOPS: 810E is SM80, 890M is SM89.
   // Devices outside the table report peak 0 and the utilization is printed
-  // as n/a. Profiling runs are single-threaded, so the cache is unsynchronized.
+  // as n/a. The grouped-GEMM binding releases the GIL around the call, so
+  // concurrent TFLOPS profiling can reach this cache from several host
+  // threads -- protect it.
   static double peak_tflops(int device) {
+    static std::mutex cache_mutex;
     static std::unordered_map<int, double> cache;
+    std::lock_guard<std::mutex> lock(cache_mutex);
     const auto it = cache.find(device);
     if (it != cache.end()) return it->second;
     int major = 0, minor = 0;
@@ -354,10 +359,19 @@ class TeProfilingInterface {
   TeProfilingInterface() {
 #ifdef NVTE_ENABLE_HGTX
     domain_ = hgtxDomainCreateA("tengine");
-#endif
     use_hgtx_ = env_flag("PPU_LIB_PERF_INSTRUMENT");
-    show_params_ = env_flag("PPU_LIB_SHOW_PARAMS");
     tflops_ = env_flag("PPU_LIB_TFLOPS");
+#else
+    // Without the HGTX SDK there is no range to emit, and the TFLOPS path
+    // would still add a CUDA event pair plus a per-launch synchronize to
+    // every grouped GEMM -- keep the documented compile-time no-op gate.
+    use_hgtx_ = false;
+    tflops_ = false;
+#endif
+    // Tag construction and the '[TE] --format=' stdout line are plain text and
+    // stay available even without HGTX, so PPU_LIB_SHOW_PARAMS is honoured in
+    // both builds (it costs one line of stdout per launch).
+    show_params_ = env_flag("PPU_LIB_SHOW_PARAMS");
   }
 
   ~TeProfilingInterface() {
