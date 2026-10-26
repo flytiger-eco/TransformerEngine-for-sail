@@ -101,3 +101,10 @@ jobs:
           command: |
             ${{ env.ENV_SETUP }}
             ${{ env.BUILD_COMMAND }}
+      - name: "上传 wheel"
+        uses: actions/upload-artifact@v4
+        with:
+          name: transformer-engine-wheel
+          path: /wl_nas/te-ci/${{ github.run_id }}-${{ github.run_attempt }}/*.whl
+          if-no-files-found: error
+          compression-level: 0
