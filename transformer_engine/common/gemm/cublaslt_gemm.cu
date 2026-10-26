@@ -1110,10 +1110,24 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
         te_k[i] = transa ? te_wt->data.shape[1] : te_wt->data.shape[0];
         te_n[i] = transa ? te_wt->data.shape[0] : te_wt->data.shape[1];
       }
+      // Report the real operand dtype. The cuBLAS fallback also serves fp32 and
+      // fp8 inputs, so a blanket "fp16" label for every non-bf16 call would
+      // misdescribe those tags (and let a replay tool treat unsupported inputs
+      // as fp16 workloads).
       const auto te_dtype =
-          get_cuda_dtype(transformer_engine::convertNVTETensorCheck(A[0])->data.dtype);
+          transformer_engine::convertNVTETensorCheck(A[0])->data.dtype;
+      const char *te_dtype_str = [te_dtype] {
+        switch (te_dtype) {
+          case transformer_engine::DType::kBFloat16: return "bf16";
+          case transformer_engine::DType::kFloat16: return "fp16";
+          case transformer_engine::DType::kFloat32: return "fp32";
+          case transformer_engine::DType::kFloat8E4M3: return "fp8_e4m3";
+          case transformer_engine::DType::kFloat8E5M2: return "fp8_e5m2";
+          default: return "other";
+        }
+      }();
       te_prof.set_grouped_gemm(
-          "GroupedGemmCublas", te_dtype == CUDA_R_16BF ? "bf16" : "fp16",
+          "GroupedGemmCublas", te_dtype_str,
           num_gemms, transa ? (transb ? "TT" : "TN") : (transb ? "NT" : "NN"),
           accumulate, te_m.data(), te_n.data(), te_k.data(), nullptr,
           current_device, stream);

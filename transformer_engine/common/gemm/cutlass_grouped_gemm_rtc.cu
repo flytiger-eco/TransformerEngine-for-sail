@@ -1006,8 +1006,23 @@ std::mutex& cache_mutex() {
   return m;
 }
 
-std::map<std::string, CompiledKernel>& kernel_cache() {
-  static std::map<std::string, CompiledKernel> c;
+// Ordinal of the device current on this thread. Launches run on the caller's
+// current device, and both structures below are context-bound: a CUmodule/
+// CUfunction only exists inside the context it was loaded into, and a
+// cudaEvent_t can only be recorded on a stream of the device that created it.
+// Keying by ordinal keeps a multi-GPU process (one thread per device sharing
+// this process-wide cache) from handing device B a device A handle.
+int current_device_ordinal() {
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) {
+    (void)cudaGetLastError();  // clear the sticky error
+    dev = 0;
+  }
+  return dev;
+}
+
+std::map<std::pair<int, std::string>, CompiledKernel>& kernel_cache() {
+  static std::map<std::pair<int, std::string>, CompiledKernel> c;
   return c;
 }
 
@@ -1482,12 +1497,18 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
       concat_strings(kernel_label, "|src=", get_rtc_source_digest(),
                      "|opts=", opts_str);
 
+  // The in-process cache holds driver handles, so it is keyed by device as
+  // well; the on-disk cubin path stays device-independent (the cubin is
+  // selected by sm_arch, not by ordinal).
+  const int device = current_device_ordinal();
+  const auto mem_key = std::make_pair(device, cache_key);
+
   std::lock_guard<std::mutex> lk(cache_mutex());
   auto& cache = kernel_cache();
 
   const bool disable_cache = getenv<bool>("NVTE_GG_DISABLE_RTC_CACHE", false);
   if (!disable_cache) {
-    auto it = cache.find(cache_key);
+    auto it = cache.find(mem_key);
     if (it != cache.end()) return it->second;
   }
 
@@ -1556,7 +1577,7 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
     save_cached_cubin(cache_key, cubin);
   }
 
-  auto [iter, _] = cache.emplace(cache_key, ck);
+  auto [iter, _] = cache.emplace(mem_key, ck);
   return iter->second;
 }
 
@@ -1602,35 +1623,43 @@ struct HostWsRing {
   std::mutex mutex;
 };
 
-HostWsRing& host_ws_ring() {
-  static HostWsRing* ring = [] {
-    auto* r = new HostWsRing();
-    void* p = nullptr;
-    if (cudaHostAlloc(&p, kCPUWorkSpaceSize, cudaHostAllocDefault) ==
-        cudaSuccess) {
-      r->base = reinterpret_cast<char*>(p);
-      for (int i = 0; i < kHostWsSlots; ++i) {
-        if (cudaEventCreateWithFlags(&r->events[i],
-                                     cudaEventDisableTiming) != cudaSuccess) {
-          (void)cudaGetLastError();  // clear the sticky error
-          for (int j = 0; j < i; ++j) {
-            (void)cudaEventDestroy(r->events[j]);
-            r->events[j] = nullptr;
-          }
-          (void)cudaFreeHost(r->base);
-          r->base = nullptr;
-          break;
+HostWsRing& host_ws_ring(int device) {
+  // One ring per device. The slots' reuse events are context-bound (an event
+  // can only be recorded on, and synchronized against, streams of the device
+  // that created it), so a single process-wide ring breaks the first launch
+  // that runs on a second GPU. The pinned buffer is kept per device too so
+  // each device's slot lifecycle is self-contained (4 MiB per device).
+  static std::mutex rings_mutex;
+  static std::map<int, HostWsRing*>* rings = new std::map<int, HostWsRing*>();
+  std::lock_guard<std::mutex> lock(rings_mutex);
+  if (auto it = rings->find(device); it != rings->end()) return *it->second;
+
+  auto* r = new HostWsRing();
+  void* p = nullptr;
+  if (cudaHostAlloc(&p, kCPUWorkSpaceSize, cudaHostAllocDefault) ==
+      cudaSuccess) {
+    r->base = reinterpret_cast<char*>(p);
+    for (int i = 0; i < kHostWsSlots; ++i) {
+      if (cudaEventCreateWithFlags(&r->events[i],
+                                   cudaEventDisableTiming) != cudaSuccess) {
+        (void)cudaGetLastError();  // clear the sticky error
+        for (int j = 0; j < i; ++j) {
+          (void)cudaEventDestroy(r->events[j]);
+          r->events[j] = nullptr;
         }
+        (void)cudaFreeHost(r->base);
+        r->base = nullptr;
+        break;
       }
-    } else {
-      // Fall back to per-call pageable staging if pinning is unavailable
-      // (e.g. limited locked-memory quota); correctness is unaffected, only
-      // latency.
-      (void)cudaGetLastError();  // clear the sticky error
     }
-    return r;
-  }();
-  return *ring;
+  } else {
+    // Fall back to per-call pageable staging if pinning is unavailable
+    // (e.g. limited locked-memory quota); correctness is unaffected, only
+    // latency.
+    (void)cudaGetLastError();  // clear the sticky error
+  }
+  (*rings)[device] = r;
+  return *r;
 }
 }  // namespace
 
@@ -1694,15 +1723,28 @@ void launch_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
   NVTE_CHECK(wspace != nullptr, "RTC grouped GEMM requires workspace[0].");
   char* dev_ws = reinterpret_cast<char*>(wspace->data.dptr);
 
+  // The staging ring reuses pinned slots guarded by host-side events, and the
+  // launch path issues driver-API calls (function attributes, module loads).
+  // Capturing that into a CUDA graph would replay a slot whose contents the
+  // next host-side launch already overwrote (and the driver calls would fail),
+  // so reject capture explicitly instead of producing a silently wrong graph.
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  NVTE_CHECK_CUDA(cudaStreamIsCapturing(stream, &capture_status));
+  NVTE_CHECK(capture_status == cudaStreamCaptureStatusNone,
+             "CUTLASS RTC grouped GEMM does not support CUDA graph capture; "
+             "disable the RTC arm (NVTE_USE_CUTLASS_GROUPED_GEMM_RTC=0) when "
+             "capturing.");
+
   // Acquire a staging slot from the pinned ring. The pageable heap fallback
-  // covers machines without the ring: the driver captures pageable sources
-  // synchronously before cudaMemcpyAsync returns, so a per-call buffer is
-  // race-free even though it dies at function exit.
+  // covers machines without the ring and call shapes whose parameter block
+  // does not fit a slot (huge num_gemms): the driver captures pageable
+  // sources synchronously before cudaMemcpyAsync returns, so a per-call
+  // buffer is race-free even though it dies at function exit.
   std::vector<char> host_ws_heap;
   char* host_ws = nullptr;
   int ws_slot = -1;
-  HostWsRing& ws_ring = host_ws_ring();
-  if (ws_ring.base != nullptr) {
+  HostWsRing& ws_ring = host_ws_ring(current_device_ordinal());
+  if (ws_ring.base != nullptr && param_workspace_size <= kHostWsSlotSize) {
     cudaEvent_t slot_event = nullptr;
     {
       std::lock_guard<std::mutex> lock(ws_ring.mutex);
@@ -1720,16 +1762,31 @@ void launch_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
     host_ws = host_ws_heap.data();
   }
 
-  // Host-side arrays
-  ProblemShapeType* h_shapes = reinterpret_cast<ProblemShapeType*>(host_ws);
-  ElementA** h_ptr_A = reinterpret_cast<ElementA**>(host_ws + gemm_coord_size);
-  ElementB** h_ptr_B = reinterpret_cast<ElementB**>(host_ws + gemm_coord_size + 1 * ptr_bytes);
-  ElementC** h_ptr_C = reinterpret_cast<ElementC**>(host_ws + gemm_coord_size + 2 * ptr_bytes);
-  ElementD** h_ptr_D = reinterpret_cast<ElementD**>(host_ws + gemm_coord_size + 3 * ptr_bytes);
-  int64_t* h_lda = reinterpret_cast<int64_t*>(host_ws + gemm_coord_size + 4 * ptr_bytes + 0 * ldd_bytes);
-  int64_t* h_ldb = reinterpret_cast<int64_t*>(host_ws + gemm_coord_size + 4 * ptr_bytes + 1 * ldd_bytes);
-  int64_t* h_ldc = reinterpret_cast<int64_t*>(host_ws + gemm_coord_size + 4 * ptr_bytes + 2 * ldd_bytes);
-  int64_t* h_ldd = reinterpret_cast<int64_t*>(host_ws + gemm_coord_size + 4 * ptr_bytes + 3 * ldd_bytes);
+  // Host-side arrays. Every view into the staging buffer is (re)bound through
+  // this lambda: the buffer may be reallocated below once the total workspace
+  // size is known, and stale views into the old allocation would feed the
+  // kernel freelist/garbage shapes.
+  ProblemShapeType* h_shapes = nullptr;
+  ElementA** h_ptr_A = nullptr;
+  ElementB** h_ptr_B = nullptr;
+  ElementC** h_ptr_C = nullptr;
+  ElementD** h_ptr_D = nullptr;
+  int64_t* h_lda = nullptr;
+  int64_t* h_ldb = nullptr;
+  int64_t* h_ldc = nullptr;
+  int64_t* h_ldd = nullptr;
+  auto bind_host_arrays = [&](char* base) {
+    h_shapes = reinterpret_cast<ProblemShapeType*>(base);
+    h_ptr_A = reinterpret_cast<ElementA**>(base + gemm_coord_size);
+    h_ptr_B = reinterpret_cast<ElementB**>(base + gemm_coord_size + 1 * ptr_bytes);
+    h_ptr_C = reinterpret_cast<ElementC**>(base + gemm_coord_size + 2 * ptr_bytes);
+    h_ptr_D = reinterpret_cast<ElementD**>(base + gemm_coord_size + 3 * ptr_bytes);
+    h_lda = reinterpret_cast<int64_t*>(base + gemm_coord_size + 4 * ptr_bytes + 0 * ldd_bytes);
+    h_ldb = reinterpret_cast<int64_t*>(base + gemm_coord_size + 4 * ptr_bytes + 1 * ldd_bytes);
+    h_ldc = reinterpret_cast<int64_t*>(base + gemm_coord_size + 4 * ptr_bytes + 2 * ldd_bytes);
+    h_ldd = reinterpret_cast<int64_t*>(base + gemm_coord_size + 4 * ptr_bytes + 3 * ldd_bytes);
+  };
+  bind_host_arrays(host_ws);
 
   for (int i = 0; i < num_gemms; ++i) {
     const Tensor* inputA = convertNVTETensorCheck(A[i]);
@@ -1852,9 +1909,14 @@ void launch_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
     // Pageable staging (no pinned ring, or oversized blob): the driver
     // captures pageable sources synchronously before cudaMemcpyAsync
     // returns, so the per-call buffer is race-free. resize() preserves the
-    // parameter bytes already staged in it.
+    // parameter bytes already staged in it, but it may move the allocation:
+    // rebind every view (and the args copy the kernel's workspace helpers
+    // read host shapes from) so nothing points into the freed buffer.
     host_ws_heap.resize(total_workspace_size);
     host_ws = host_ws_heap.data();
+    bind_host_arrays(host_ws);
+    problem_shape.host_problem_shapes = h_shapes;
+    args.problem_shape.host_problem_shapes = h_shapes;
   }
   std::memset(host_ws + param_workspace_size, 0, kernel_workspace_size);
   NVTE_CHECK_CUDA(cudaMemcpyAsync(dev_ws, host_ws, total_workspace_size,

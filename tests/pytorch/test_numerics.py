@@ -46,7 +46,7 @@ from transformer_engine.pytorch import (
     is_nvfp4_available,
 )
 from transformer_engine.pytorch import checkpoint as te_checkpoint
-from transformer_engine.pytorch.cpp_extensions import general_gemm
+from transformer_engine.pytorch.cpp_extensions import general_gemm, general_grouped_gemm
 from transformer_engine.common import recipe
 from transformer_engine.pytorch import DType
 import transformer_engine_torch as tex
@@ -2905,6 +2905,7 @@ def test_grouped_gemm_expert_performance(layout, dtype):
             A,
             B,
             [o.clone() for o in out],
+            [None] * z,
             dtype,
             # get_multi_stream_cublas_workspace(),
             m_splits=m_splits,
@@ -2921,6 +2922,7 @@ def test_grouped_gemm_expert_performance(layout, dtype):
             A,
             B,
             [o.clone() for o in out],
+            [None] * z,
             dtype,
             # get_multi_stream_cublas_workspace(),
             m_splits=m_splits,
@@ -2985,12 +2987,24 @@ def _grouped_gemm_torch_reference(A, B, layout, out_dtype):
     return ref
 
 
-def _run_grouped_gemm(A, B, out_template, layout, m_splits, grad, single_output, dtype, use_cutlass):
+def _run_grouped_gemm(
+    A, B, out_template, layout, m_splits, grad, single_output, dtype, use_cutlass, force_rtc=False
+):
     """Run one grouped GEMM on the requested backend, returning per-expert outputs."""
     z = len(A)
     out = [o.clone() for o in out_template]
     prev = os.environ.get("NVTE_USE_CUTLASS_GROUPED_GEMM")
+    prev_rtc = os.environ.get("NVTE_USE_CUTLASS_GROUPED_GEMM_RTC")
+    prev_no_fallback = os.environ.get("NVTE_FORCE_RTC_NO_FALLBACK")
     os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"] = "1" if use_cutlass else "0"
+    if use_cutlass and force_rtc:
+        # Pin the RTC backend explicitly. NVTE_USE_CUTLASS_GROUPED_GEMM alone
+        # still reaches the static CUTLASS arm when an inherited
+        # NVTE_USE_CUTLASS_GROUPED_GEMM_RTC=0 is present, and the dispatcher
+        # silently falls back to cuBLAS on an RTC compile/launch error -- both
+        # would let these checks pass with a broken RTC backend.
+        os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM_RTC"] = "1"
+        os.environ["NVTE_FORCE_RTC_NO_FALLBACK"] = "1"
     try:
         general_grouped_gemm(
             A,
@@ -3006,10 +3020,15 @@ def _run_grouped_gemm(A, B, out_template, layout, m_splits, grad, single_output,
         )
         torch.cuda.synchronize()
     finally:
-        if prev is None:
-            os.environ.pop("NVTE_USE_CUTLASS_GROUPED_GEMM", None)
-        else:
-            os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"] = prev
+        for key, value in (
+            ("NVTE_USE_CUTLASS_GROUPED_GEMM", prev),
+            ("NVTE_USE_CUTLASS_GROUPED_GEMM_RTC", prev_rtc),
+            ("NVTE_FORCE_RTC_NO_FALLBACK", prev_no_fallback),
+        ):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     if single_output:
         return list(torch.split(out[0], m_splits))
     return out
@@ -3041,8 +3060,21 @@ def test_grouped_gemm_accuracy(shape, layout, dtype):
     cublas_out = _run_grouped_gemm(
         A, B, out_template, layout, m_splits, grad, single_output, dtype, use_cutlass=False
     )
+    # RTC only exists for SM80/SM89; on those devices pin it (no fallback) so
+    # this check actually exercises the new backend instead of cuBLAS.
+    cap_major, cap_minor = torch.cuda.get_device_capability()
+    rtc_supported = cap_major == 8 and cap_minor in (0, 9)
     cutlass_out = _run_grouped_gemm(
-        A, B, out_template, layout, m_splits, grad, single_output, dtype, use_cutlass=True
+        A,
+        B,
+        out_template,
+        layout,
+        m_splits,
+        grad,
+        single_output,
+        dtype,
+        use_cutlass=True,
+        force_rtc=rtc_supported,
     )
 
     # cuBLAS baseline agrees with the torch reference ...
