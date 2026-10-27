@@ -3,7 +3,7 @@ name: ppu-890-build
 on:
   pull_request:
     branches:
-      - 'v2.16-SAIL'
+      - 'v2.18-SAIL'
   schedule:
     - cron: '0 2 * * 1'
   workflow_dispatch:
