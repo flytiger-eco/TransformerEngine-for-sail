@@ -59,6 +59,10 @@ jobs:
 
       - name: "Build PPU wheel (standard CPU runner)"
         id: build
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: ${{ github.workspace }}
         run: |
           mkdir -p "${ARTIFACT_DIR}"
           git rev-parse HEAD > "${ARTIFACT_DIR}/commit"
