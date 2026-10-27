@@ -49,7 +49,8 @@ env:
     git checkout -q FETCH_HEAD
     git submodule update --init --recursive
 
-    pip3 install -U packaging==24.2 pybind11==3.1.0 nvidia-cudnn-frontend
+    pip3 install -U packaging==24.2 pybind11==3.1.0 
+    pip3 install nvidia-cudnn-frontend
 
     export NVTE_FRAMEWORK=pytorch
     export NVTE_WITH_NCCL_EP=0
