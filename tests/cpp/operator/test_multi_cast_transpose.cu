@@ -53,19 +53,11 @@ void compute_ref(const std::vector<std::vector<InputType>>& input_list,
 }
 
 template <typename InputType, typename OutputType>
-void performTest() {
+void performTest(const std::vector<std::pair<size_t, size_t>>& tensor_dims) {
   using namespace test;
 
   const DType itype = TypeInfo<InputType>::dtype;
   const DType otype = TypeInfo<OutputType>::dtype;
-  const std::vector<std::pair<size_t, size_t>> tensor_dims = {{1,1},
-                                                              {1,768},
-                                                              {768,1},
-                                                              {768,768},
-                                                              {43,43},
-                                                              {43,256},
-                                                              {256,43},
-                                                              {256,256}};
   const size_t num_tensors = tensor_dims.size();
 
   // Buffers for Transformer Engine implementation
@@ -166,9 +158,43 @@ TEST_P(MultiCastTransposeTestSuite, TestMultiCastTranspose) {
   const DType input_type = std::get<0>(GetParam());
   const DType output_type = std::get<1>(GetParam());
 
+  // Degenerate and ragged shapes. None of them is tiled exactly by a candidate
+  // launch configuration, so these run the bounds-checked kernel with the
+  // fallback configuration.
   TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(input_type, InputType,
     TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(output_type, OutputType,
-      performTest<InputType, OutputType>();
+      performTest<InputType, OutputType>({{1,1},
+                                         {1,768},
+                                         {768,1},
+                                         {768,768},
+                                         {43,43},
+                                         {43,256},
+                                         {256,43},
+                                         {256,256}});
+    );
+  );
+}
+
+TEST_P(MultiCastTransposeTestSuite, TestMultiCastTransposeAligned) {
+  using namespace transformer_engine;
+  using namespace test;
+
+  const DType input_type = std::get<0>(GetParam());
+  const DType output_type = std::get<1>(GetParam());
+
+  // Shapes tiled exactly by every candidate launch configuration, so the
+  // selected configuration runs rather than the fallback. Heights are multiples
+  // of 128, the largest candidate tile height (32 * 4 transposed store
+  // vectors), and widths are multiples of 256, the largest candidate tile width
+  // (32 * 8 input elements for a 2-byte input type).
+  TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(input_type, InputType,
+    TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(output_type, OutputType,
+      performTest<InputType, OutputType>({{128,256},
+                                         {256,512},
+                                         {512,1024},
+                                         {1024,256},
+                                         {128,2048},
+                                         {256,256}});
     );
   );
 }

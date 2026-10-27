@@ -100,7 +100,11 @@ struct TypeInfo {
     struct Helper {
         constexpr static DType getType() {
             constexpr int i = static_cast<int>(current);
-            if (std::is_same<U, typename std::tuple_element<i, types>::type>::value) {
+            // Stop when the DType enum runs past the types tuple (e.g. DType
+            // values whose C++ type is unavailable on this CUDA version).
+            if constexpr (i >= static_cast<int>(std::tuple_size<types>::value)) {
+                return DType::kNumTypes;
+            } else if (std::is_same<U, typename std::tuple_element<i, types>::type>::value) {
                 return current;
             } else {
                 return Helper<U, static_cast<DType>(i + 1)>::getType();

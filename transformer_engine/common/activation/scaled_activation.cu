@@ -401,16 +401,24 @@ void launch_scaled_gated_forward(const NVTETensor nvte_input, const NVTETensor n
         const size_t num_vectors =
             use_vector ? get_num_aligned_elements(input_ptr, segment_size, nvec, sizeof(InputT))
                        : segment_size;
-        const int blocks = static_cast<int>(std::min<size_t>(
-            DIVUP(rows * num_segments * num_vectors, static_cast<size_t>(kThreads)), 65535));
+        const size_t total_vectors = rows * num_segments * num_vectors;
+        // The scalar arm has no vector load to amortize, so it keeps the shipped shape.
+        PointwiseLaunchConfig cfg;
+        if (use_vector) {
+          cfg = make_pointwise_narrow_launch_config(
+              reinterpret_cast<const void *>(
+                  &scaled_gated_forward_kernel<nvec, InputT, ScaleT, OutputT, ParamOP, ActOP>),
+              total_vectors);
+        }
+        const size_t blocks = pointwise_grid_size(total_vectors, cfg.threads, cfg.vecs_per_thread);
         if (use_vector) {
           scaled_gated_forward_kernel<nvec, InputT, ScaleT, OutputT, ParamOP, ActOP>
-              <<<blocks, kThreads, 0, stream>>>(input_ptr, scale_ptr, output_ptr, rows, hidden,
-                                                segment_size, num_segments, num_vectors, param);
+              <<<blocks, cfg.threads, 0, stream>>>(input_ptr, scale_ptr, output_ptr, rows, hidden,
+                                                   segment_size, num_segments, num_vectors, param);
         } else {
           scaled_gated_forward_kernel<1, InputT, ScaleT, OutputT, ParamOP, ActOP>
-              <<<blocks, kThreads, 0, stream>>>(input_ptr, scale_ptr, output_ptr, rows, hidden,
-                                                segment_size, num_segments, segment_size, param);
+              <<<blocks, cfg.threads, 0, stream>>>(input_ptr, scale_ptr, output_ptr, rows, hidden,
+                                                   segment_size, num_segments, segment_size, param);
         }
       });
     });
