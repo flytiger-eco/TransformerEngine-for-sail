@@ -1,0 +1,124 @@
+name: nightly-build
+
+on:
+  pull_request:
+    branches:
+      - 'v2.18-SAIL'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ARTIFACT_DIR: "dist"
+  NVTE_FRAMEWORK: "pytorch"
+  NVTE_WITH_NCCL_EP: "0"
+  NVTE_CUDA_ARCHS: "80;89"
+  NVTE_BUILD_THREADS_PER_JOB: "1"
+  MAX_JOBS: "1"
+  PCCL_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
+
+  ENV_SETUP: |
+    set -euo pipefail
+
+    # PPU SDK
+    SDK_INSTALL_DIR="${SDK_INSTALL_DIR:-/usr/local}"
+    if [[ -f "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh" ]]; then
+      set +u; source "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh"; set -u
+    fi
+
+    # PCCL (NCCL wrapper)
+    PCCL_TARBALL="/tmp/$(basename "${PCCL_URL}")"
+    wget -q -O "${PCCL_TARBALL}" "${PCCL_URL}"
+    tar zxf "${PCCL_TARBALL}" -C /usr/local
+    set +u; source /usr/local/pccl/envsetup.sh; set -u
+    export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001
+      options: --user root
+    steps:
+      - name: "Check out source code and submodules"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: "Build PPU wheel (standard CPU runner)"
+        id: build
+        run: |
+          mkdir -p "${ARTIFACT_DIR}"
+          git rev-parse HEAD > "${ARTIFACT_DIR}/commit"
+          {
+            ${{ env.ENV_SETUP }}
+            pip3 install -U packaging==24.2 pybind11==3.1.0
+            pip3 install "nvidia-cudnn-frontend>=1.25.0"
+            pip3 wheel -v --no-build-isolation --no-deps . -w "${ARTIFACT_DIR}"
+          } 2>&1 | tee "${ARTIFACT_DIR}/ppu_build.log"
+          if ! compgen -G "${ARTIFACT_DIR}/*.whl" > /dev/null; then
+            echo "Error: No wheel found in the build directory; aborting upload." >&2
+            exit 1
+          fi
+          ls -lh "${ARTIFACT_DIR}"
+
+      - name: "Upload wheels and source revision"
+        uses: actions/upload-artifact@v4
+        with:
+          name: transformer_engine_nightly
+          path: |
+            dist/*.whl
+            dist/commit
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: "Publish wheels to the latest release"
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: ${{ github.workflow }}-latest-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: "Download wheels and source revision from this build"
+        uses: actions/download-artifact@v4
+        with:
+          name: transformer_engine_nightly
+          path: dist
+
+      - name: "Upload assets to the latest release"
+        run: |
+          set -euo pipefail
+          if ! compgen -G "dist/*.whl" > /dev/null; then
+            echo "Error: No wheel found in the downloaded artifact; aborting release upload." >&2
+            exit 1
+          fi
+          if ! release_tag="$(gh api "repos/${GH_REPO}/releases/latest" --jq '.tag_name')"; then
+            echo "Error: Unable to retrieve the latest release. Ensure the repository has a published release and the token has access." >&2
+            exit 1
+          fi
+          if [[ -z "${release_tag}" || "${release_tag}" == "null" ]]; then
+            echo "Error: The latest release tag is empty; aborting release upload." >&2
+            exit 1
+          fi
+          echo "Target release: ${release_tag}"
+          gh release upload "${release_tag}" dist/*.whl dist/commit --clobber
