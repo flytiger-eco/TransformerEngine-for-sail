@@ -414,6 +414,37 @@ set_property(
 set_property(
   SOURCE gemm/cutlass_grouped_gemm_rtc.cu
   APPEND PROPERTY COMPILE_DEFINITIONS USE_SAIL=1)
+
+# HGTX (PPU's NVTX equivalent) per-launch tag instrumentation for the grouped
+# GEMM backends (RTC / static PPU CUTLASS / cuBLAS fallback), a port of
+# DeepGemm's profiling_interface.cuh (see DeepGemm/nvtx_tag_replay_guide.md).
+# The tag headers are header-only via the PPU SDK's hgtx3/hgToolsExt.h;
+# when that header is absent (non-PPU hosts) the instrumentation compiles to
+# a no-op and these sources build unchanged. Runtime switches (export before
+# process start, same contract as DeepGemm):
+#   PPU_LIB_PERF_INSTRUMENT=1  HGTX range push/pop around every launch
+#   PPU_LIB_SHOW_PARAMS=1      print the full [TE] --format= tag to stdout
+#   acu --hgtx --hgtx-include 'tengine@<range_name>/' filters by tag.
+set(NVTE_HGTX_SDK_INCLUDE
+    "/usr/local/PPU_SDK/targets/x86_64-linux/include"
+    CACHE PATH "Directory providing hgtx3/hgToolsExt.h for grouped GEMM HGTX tags")
+if(EXISTS "${NVTE_HGTX_SDK_INCLUDE}/hgtx3/hgToolsExt.h")
+  message(STATUS "HGTX grouped GEMM tag instrumentation enabled (${NVTE_HGTX_SDK_INCLUDE})")
+  set(NVTE_HGTX_SOURCES
+      gemm/cublaslt_gemm.cu
+      gemm/cutlass_grouped_gemm_ppu.cu
+      gemm/cutlass_grouped_gemm_rtc.cu)
+  # Include path points at the hgtx3 directory itself, NOT .../include: that
+  # tree shadows same-named CUDA SDK headers (vector_types.h, host_defines.h,
+  # driver_types.h, cub/, ...) and breaks the CUDA host compile of these TUs.
+  set_property(SOURCE ${NVTE_HGTX_SOURCES} APPEND PROPERTY
+               INCLUDE_DIRECTORIES "${NVTE_HGTX_SDK_INCLUDE}/hgtx3")
+  set_property(SOURCE ${NVTE_HGTX_SOURCES} APPEND PROPERTY
+               COMPILE_DEFINITIONS NVTE_ENABLE_HGTX=1)
+else()
+  message(STATUS "HGTX grouped GEMM tag instrumentation disabled (no hgtx3/hgToolsExt.h under ${NVTE_HGTX_SDK_INCLUDE})")
+endif()
+
 add_library(transformer_engine SHARED ${transformer_engine_SOURCES})
 # Disable CMake's automatic architecture flag injection.
 # All architectures are handled explicitly via per-source COMPILE_OPTIONS

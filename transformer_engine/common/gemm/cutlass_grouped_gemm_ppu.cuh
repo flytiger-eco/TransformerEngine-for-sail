@@ -30,6 +30,7 @@
 
 #include "../common.h"
 #include "../util/logging.h"
+#include "te_profiling_interface.h"
 #include "common/util/system.h"
 #include "cute/tensor.hpp"
 #include "cutlass/bfloat16.h"
@@ -341,9 +342,32 @@ void CutlassGroupedGemmImpl(const NVTETensor* A, const NVTETensor* B, NVTETensor
     NVTE_ERROR("Failed to initialize CUTLASS Grouped GEMM with ", num_gemms, " GEMMs");
   }
 
-  // Execute the kernel in the current stream.
-  if (gemm.run(stream) != cutlass::Status::kSuccess) {
-    NVTE_ERROR("Failed to run CUTLASS Grouped GEMM with ", num_gemms, " GEMMs");
+  // HGTX per-launch tag around gemm.run (same three-piece contract as the
+  // RTC path). Group extents are host-side shapes, so the tag carries the
+  // real per-group distribution with no D2H sync.
+  te_profiling::TeProfParam te_prof;
+  if (te_profiling::TeProfilingInterface::Instance().enabled()) {
+    std::vector<int> te_m(num_gemms), te_n(num_gemms), te_k(num_gemms);
+    for (size_t i = 0; i < num_gemms; i++) {
+      te_m[i] = cute::get<0>(problem_sizes_host[i]);
+      te_n[i] = cute::get<1>(problem_sizes_host[i]);
+      te_k[i] = cute::get<2>(problem_sizes_host[i]);
+    }
+    te_prof.set_grouped_gemm(
+        "GroupedGemmPpu",
+        std::is_same<Element, cutlass::half_t>::value ? "fp16" : "bf16",
+        static_cast<int>(num_gemms),
+        trans_a ? (trans_b ? "TT" : "TN") : (trans_b ? "NT" : "NN"),
+        beta != 0.0f, te_m.data(), te_n.data(), te_k.data(), nullptr, device,
+        stream);
+  }
+
+  {
+    te_profiling::TeHgtxGuard te_prof_guard(te_prof);
+    // Execute the kernel in the current stream.
+    if (gemm.run(stream) != cutlass::Status::kSuccess) {
+      NVTE_ERROR("Failed to run CUTLASS Grouped GEMM with ", num_gemms, " GEMMs");
+    }
   }
 }
 
