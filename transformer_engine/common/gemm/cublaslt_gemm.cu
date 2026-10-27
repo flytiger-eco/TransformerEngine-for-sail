@@ -24,6 +24,7 @@
 #include "../util/multi_stream.h"
 #include "../util/system.h"
 #include "./config.h"
+#include "./te_profiling_interface.h"
 
 // Grouped GEMM entry points, defined in cutlass_grouped_gemm.cu (SM90/TMA),
 // cutlass_grouped_gemm_ppu.cu (SM80/SM89), and cutlass_grouped_gemm_rtc.cu
@@ -1092,9 +1093,38 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
                              workspace, accumulate, use_split_accumulator, math_sm_count, stream);
   };
 
+  // HGTX tag around the whole cuBLAS fallback call: one range covering every
+  // per-group cublasLt launch, so ACU can filter a cuBLAS arm by case instead
+  // of kernel-name regex + launch counting. m/n/k use the caller-facing
+  // (tokens, out, in) order -- same as the RTC arm's CUTLASS problem shapes --
+  // so both arms of an A/B comparison tag identically; the layout field keeps
+  // each backend's real op(A)op(B) convention (TN here vs NT for RTC).
+  auto cublas_path_tagged = [&]() {
+    transformer_engine::te_profiling::TeProfParam te_prof;
+    if (transformer_engine::te_profiling::TeProfilingInterface::Instance().enabled()) {
+      std::vector<int> te_m(num_gemms), te_n(num_gemms), te_k(num_gemms);
+      for (int i = 0; i < num_gemms; ++i) {
+        const auto *te_in = transformer_engine::convertNVTETensorCheck(B[i]);  // input role: M = tokens
+        const auto *te_wt = transformer_engine::convertNVTETensorCheck(A[i]);  // weight role: N = out, K = in
+        te_m[i] = transb ? te_in->data.shape[1] : te_in->data.shape[0];
+        te_k[i] = transa ? te_wt->data.shape[1] : te_wt->data.shape[0];
+        te_n[i] = transa ? te_wt->data.shape[0] : te_wt->data.shape[1];
+      }
+      const auto te_dtype =
+          get_cuda_dtype(transformer_engine::convertNVTETensorCheck(A[0])->data.dtype);
+      te_prof.set_grouped_gemm(
+          "GroupedGemmCublas", te_dtype == CUDA_R_16BF ? "bf16" : "fp16",
+          num_gemms, transa ? (transb ? "TT" : "TN") : (transb ? "NT" : "NN"),
+          accumulate, te_m.data(), te_n.data(), te_k.data(), nullptr,
+          current_device, stream);
+    }
+    transformer_engine::te_profiling::TeHgtxGuard te_prof_guard(te_prof);
+    cublas_path();
+  };
+
   // Currently only support cutlass group gemm on Hopper Arch
   if (!((is_sm80 || is_sm89 || is_hopper) && use_cutlass)) {
-    cublas_path();
+    cublas_path_tagged();
     return;
   }
 
@@ -1103,7 +1133,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   // empty arrays. The CUTLASS gate below dereferences A[0]/B[0]/D[0], so hand
   // the no-op back to the cuBLAS path.
   if (num_gemms == 0) {
-    cublas_path();
+    cublas_path_tagged();
     return;
   }
 
@@ -1202,7 +1232,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
       if (warn_fallback) {
         NVTE_WARN("CUTLASS RTC grouped GEMM unavailable, falling back to cuBLAS.");
       }
-      cublas_path();
+      cublas_path_tagged();
       return;
     }
 
@@ -1219,6 +1249,6 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
     if (warn_fallback) {
       NVTE_WARN("Fallback to cuBLAS grouped GEMM.");
     }
-    cublas_path();
+    cublas_path_tagged();
   }
 }
