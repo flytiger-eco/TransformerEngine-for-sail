@@ -1,16 +1,15 @@
 name: nightly-build
 
 on:
-  pull_request:
-    branches:
-      - 'v2.18-SAIL'
+  schedule:
+    - cron: '0 22 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -55,14 +54,14 @@ jobs:
       - name: "Resolve dated artifact name"
         id: meta
         run: |
-          artifact_name="transformer_engine-v2.18-$(date -u +%Y%m%d)"
+          artifact_name="transformer_engine-v2.18-$(date -u -d '+8 hours' +%Y%m%d)"
           echo "artifact_name=${artifact_name}" >> "${GITHUB_OUTPUT}"
           echo "Artifact name: ${artifact_name}"
 
       - name: "Check out source code and submodules"
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           submodules: recursive
           persist-credentials: false
 
@@ -118,12 +117,24 @@ jobs:
           path: dist
 
       - name: "Upload assets to the latest release"
+        env:
+          ARTIFACT_NAME: ${{ needs.build.outputs.artifact_name }}
         run: |
           set -euo pipefail
-          if ! compgen -G "dist/*.whl" > /dev/null; then
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if (( ${#wheels[@]} == 0 )); then
             echo "Error: No wheel found in the downloaded artifact; aborting release upload." >&2
             exit 1
           fi
+          if (( ${#wheels[@]} > 1 )); then
+            echo "Error: Expected a single wheel, found ${#wheels[@]}: ${wheels[*]}" >&2
+            exit 1
+          fi
+          # Publish the wheel under the dated artifact name instead of the build-time name.
+          wheel_asset="dist/${ARTIFACT_NAME}.whl"
+          mv "${wheels[0]}" "${wheel_asset}"
+          echo "Release asset: ${ARTIFACT_NAME}.whl (built as $(basename "${wheels[0]}"))"
           if ! release_tag="$(gh api "repos/${GH_REPO}/releases/latest" --jq '.tag_name')"; then
             echo "Error: Unable to retrieve the latest release. Ensure the repository has a published release and the token has access." >&2
             exit 1
@@ -133,4 +144,4 @@ jobs:
             exit 1
           fi
           echo "Target release: ${release_tag}"
-          gh release upload "${release_tag}" dist/*.whl dist/commit --clobber
+          gh release upload "${release_tag}" "${wheel_asset}" dist/commit --clobber
