@@ -106,7 +106,3 @@ jobs:
             ${{ env.ENV_SETUP }}
             ${{ env.TEST_SETUP }}
             ${{ env.SMOKE_TEST }}
-
-      - name: "清理 NAS 产物"
-        if: always()
-        run: rm -rf "/wl_nas/${{ env.ARTIFACT_SUBDIR }}"
