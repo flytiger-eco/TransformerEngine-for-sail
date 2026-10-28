@@ -45,7 +45,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 360
     container:
       image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001
       options: --user root
