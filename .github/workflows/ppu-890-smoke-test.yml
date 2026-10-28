@@ -93,7 +93,7 @@ jobs:
     steps:
       - name: "Smoke Test (890P, 1 PPU)"
         if: ${{ !cancelled() }}
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           image: ${{ env.IMAGE }}
           namespace: ${{ env.NAMESPACE }}

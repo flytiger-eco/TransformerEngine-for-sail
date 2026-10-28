@@ -17,7 +17,7 @@ defaults:
 env:
   IMAGE: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001"
   NAMESPACE: "ppu-sched"
-  NODE_SELECTOR: "board-type=OAM-810E"
+  NODE_SELECTOR: "board-type=ZW-810E"
   HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
   ARTIFACT_SUBDIR: "te-ci/${{ github.run_id }}-${{ github.run_attempt }}"
   ARTIFACT_DIR: "/mnt/wl_nas/te-ci/${{ github.run_id }}-${{ github.run_attempt }}"
@@ -89,7 +89,7 @@ jobs:
     steps:
       - name: "编译 wheel (810E, 1 PPU)"
         id: build
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           image: ${{ env.IMAGE }}
           namespace: ${{ env.NAMESPACE }}
