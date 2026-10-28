@@ -49,7 +49,16 @@ jobs:
     container:
       image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001
       options: --user root
+    outputs:
+      artifact_name: ${{ steps.meta.outputs.artifact_name }}
     steps:
+      - name: "Resolve dated artifact name"
+        id: meta
+        run: |
+          artifact_name="transformer_engine-v2.18-$(date -u +%Y%m%d)"
+          echo "artifact_name=${artifact_name}" >> "${GITHUB_OUTPUT}"
+          echo "Artifact name: ${artifact_name}"
+
       - name: "Check out source code and submodules"
         uses: actions/checkout@v4
         with:
@@ -81,7 +90,7 @@ jobs:
       - name: "Upload wheels and source revision"
         uses: actions/upload-artifact@v4
         with:
-          name: transformer_engine_nightly
+          name: ${{ steps.meta.outputs.artifact_name }}
           path: |
             dist/*.whl
             dist/commit
@@ -91,7 +100,6 @@ jobs:
   publish:
     name: "Publish wheels to the latest release"
     needs: build
-    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -106,7 +114,7 @@ jobs:
       - name: "Download wheels and source revision from this build"
         uses: actions/download-artifact@v4
         with:
-          name: transformer_engine_nightly
+          name: ${{ needs.build.outputs.artifact_name }}
           path: dist
 
       - name: "Upload assets to the latest release"
