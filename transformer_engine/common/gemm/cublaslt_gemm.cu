@@ -22,8 +22,24 @@
 #include "../util/handle_manager.h"
 #include "../util/logging.h"
 #include "../util/multi_stream.h"
+#include "../util/system.h"
 #include "./config.h"
-#include "./cutlass_grouped_gemm.cuh"
+#include "./te_profiling_interface.h"
+
+// Grouped GEMM entry points, defined in cutlass_grouped_gemm.cu (SM90/TMA),
+// cutlass_grouped_gemm_ppu.cu (SM80/SM89), and cutlass_grouped_gemm_rtc.cu
+// (NVRTC-JIT fast path for SM80/SM89).
+void cutlass_grouped_gemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D, int num_gemms,
+                          bool transa, bool transb, bool grad, NVTETensor* workspace,
+                          bool accumulate, int device, int math_sm_count, cudaStream_t stream);
+void cutlass_grouped_gemm_ppu(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                              int num_gemms, bool transa, bool transb, bool grad,
+                              NVTETensor* workspace, bool accumulate, int device,
+                              int math_sm_count, cudaStream_t stream);
+bool cutlass_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                              int num_gemms, bool transa, bool transb, bool grad,
+                              NVTETensor* workspace, bool accumulate, int device,
+                              int math_sm_count, cudaStream_t stream);
 
 namespace {
 
@@ -330,16 +346,16 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
   const int n = transb == CUBLAS_OP_T ? B1 : B0;
   const int k = transa == CUBLAS_OP_T ? A1 : A0;
   NVTE_CHECK((transb == CUBLAS_OP_T ? B0 : B1) == k,
-             "GEMM inputs have incompatible dimensions (A is ", A0, "x", A1, ", B is ", B0, "x", B1,
-             ")");
+  "GEMM inputs have incompatible dimensions (A is ", A0, "x", A1, ", B is ", B0, "x", B1,
+  ")");
   const int ldd = m;
-
+  
   // Return immediately if GEMM is trivial
   if (m <= 0 || n <= 0) {
     return;
   }
   NVTE_CHECK(k > 0);
-
+  
   const GemmParam param = CanonicalizeGemmInput(*inputA, transa, *inputB, transb, m, n, k);
 
   void *C = outputD->data.dptr;
@@ -356,7 +372,7 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
   const bool gelu = pre_gelu_out != nullptr;
   const bool use_fp8 = is_fp8_dtype(param.Atype) || is_fp8_dtype(param.Btype);
   const bool use_fp4 = is_fp4_dtype(param.Atype) || is_fp4_dtype(param.Btype);
-
+  
   // Update scaling factors with NVFP4 tensor scales
   // TODO: Check whether scales are on CPU/GPU or add API to control.
   // Currently scales are assumed to be on CPU when amax is provided
@@ -614,9 +630,9 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
       NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
                                                        CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
                                                        &scaling_mode_b, sizeof(scaling_mode_b)));
-    }
+          }
 #endif  // CUBLAS_VERSION >= 120800
-    if (is_fp8_dtype(outputD->data.dtype)) {
+  if (is_fp8_dtype(outputD->data.dtype)) {
       // Accumulation mode not supported for FP8 output
       C = nullptr;
       NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
@@ -765,22 +781,22 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
 
   const auto status =
       cublasLtMatmulAlgoGetHeuristic(handle, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, preference,
-                                     1, &heuristicResult, &returnedResults);
+                                      1, &heuristicResult, &returnedResults);
   NVTE_CHECK(status != CUBLAS_STATUS_NOT_SUPPORTED,
-             "Unable to find suitable cuBLAS GEMM algorithm");
+              "Unable to find suitable cuBLAS GEMM algorithm");
   NVTE_CHECK_CUBLAS(status);
   if (returnedResults == 0) NVTE_ERROR("Unable to find any suitable algorithms");
 
   // D = alpha * (A * B) + beta * C
   NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, operationDesc, alpha, /* alpha */
-                                   param.A,                      /* A */
-                                   Adesc, param.B,               /* B */
-                                   Bdesc, beta,                  /* beta */
-                                   C,                            /* C */
-                                   Cdesc, D,                     /* D */
-                                   Ddesc, &heuristicResult.algo, /* algo */
-                                   aligned_workspace_ptr,        /* workspace */
-                                   workspaceSize, stream));      /* stream */
+                                    param.A,                      /* A */
+                                    Adesc, param.B,               /* B */
+                                    Bdesc, beta,                  /* beta */
+                                    C,                            /* C */
+                                    Cdesc, D,                     /* D */
+                                    Ddesc, &heuristicResult.algo, /* algo */
+                                    aligned_workspace_ptr,        /* workspace */
+                                    workspaceSize, stream));      /* stream */
 
   // Update FP8 scale-inv in output tensor
   // Note: This is a WAR for the case when we have fp8 output but D->scale_inv is not allocated.
@@ -1062,7 +1078,13 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
 
   const int current_device = transformer_engine::cuda::current_device();
   const bool is_hopper = (transformer_engine::cuda::sm_arch(current_device) == 90);
+  const bool is_sm80 = (transformer_engine::cuda::sm_arch(current_device) == 80);
+  const bool is_sm89 = (transformer_engine::cuda::sm_arch(current_device) == 89);
   const bool use_cutlass = transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", false);
+  const bool use_cutlass_rtc =
+      transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM_RTC", true);
+  const bool sm80_disable_alignment_check =
+      (is_sm80 || is_sm89) && transformer_engine::getenv<bool>("NVTE_DISABLE_ALIGNMENT_CHECK", true);
   const bool warn_fallback =
       transformer_engine::getenv<bool>("NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", false);
 
@@ -1071,9 +1093,61 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
                              workspace, accumulate, use_split_accumulator, math_sm_count, stream);
   };
 
-  // Currently only support cutlass group gemm on Hopper Arch
-  if (!(is_hopper && use_cutlass)) {
+  // HGTX tag around the whole cuBLAS fallback call: one range covering every
+  // per-group cublasLt launch, so ACU can filter a cuBLAS arm by case instead
+  // of kernel-name regex + launch counting. m/n/k use the caller-facing
+  // (tokens, out, in) order -- same as the RTC arm's CUTLASS problem shapes --
+  // so both arms of an A/B comparison tag identically; the layout field keeps
+  // each backend's real op(A)op(B) convention (TN here vs NT for RTC).
+  auto cublas_path_tagged = [&]() {
+    transformer_engine::te_profiling::TeProfParam te_prof;
+    if (transformer_engine::te_profiling::TeProfilingInterface::Instance().enabled()) {
+      std::vector<int> te_m(num_gemms), te_n(num_gemms), te_k(num_gemms);
+      for (int i = 0; i < num_gemms; ++i) {
+        const auto *te_in = transformer_engine::convertNVTETensorCheck(B[i]);  // input role: M = tokens
+        const auto *te_wt = transformer_engine::convertNVTETensorCheck(A[i]);  // weight role: N = out, K = in
+        te_m[i] = transb ? te_in->data.shape[1] : te_in->data.shape[0];
+        te_k[i] = transa ? te_wt->data.shape[1] : te_wt->data.shape[0];
+        te_n[i] = transa ? te_wt->data.shape[0] : te_wt->data.shape[1];
+      }
+      // Report the real operand dtype. The cuBLAS fallback also serves fp32 and
+      // fp8 inputs, so a blanket "fp16" label for every non-bf16 call would
+      // misdescribe those tags (and let a replay tool treat unsupported inputs
+      // as fp16 workloads).
+      const auto te_dtype =
+          transformer_engine::convertNVTETensorCheck(A[0])->data.dtype;
+      const char *te_dtype_str = [te_dtype] {
+        switch (te_dtype) {
+          case transformer_engine::DType::kBFloat16: return "bf16";
+          case transformer_engine::DType::kFloat16: return "fp16";
+          case transformer_engine::DType::kFloat32: return "fp32";
+          case transformer_engine::DType::kFloat8E4M3: return "fp8_e4m3";
+          case transformer_engine::DType::kFloat8E5M2: return "fp8_e5m2";
+          default: return "other";
+        }
+      }();
+      te_prof.set_grouped_gemm(
+          "GroupedGemmCublas", te_dtype_str,
+          num_gemms, transa ? (transb ? "TT" : "TN") : (transb ? "NT" : "NN"),
+          accumulate, te_m.data(), te_n.data(), te_k.data(), nullptr,
+          current_device, stream);
+    }
+    transformer_engine::te_profiling::TeHgtxGuard te_prof_guard(te_prof);
     cublas_path();
+  };
+
+  // Currently only support cutlass group gemm on Hopper Arch
+  if (!((is_sm80 || is_sm89 || is_hopper) && use_cutlass)) {
+    cublas_path_tagged();
+    return;
+  }
+
+  // Every group may be empty (e.g. GroupedLinear with all-zero m_splits): the
+  // framework drops zero-numel groups, so num_gemms == 0 with A/B/D pointing at
+  // empty arrays. The CUTLASS gate below dereferences A[0]/B[0]/D[0], so hand
+  // the no-op back to the cuBLAS path.
+  if (num_gemms == 0) {
+    cublas_path_tagged();
     return;
   }
 
@@ -1102,6 +1176,28 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
     return true;
   };
 
+  // The CUTLASS kernels are instantiated with an 8-element alignment for A/B/D
+  // (16B vector accesses for FP16/BF16). NVTE_DISABLE_ALIGNMENT_CHECK only
+  // relaxes the uniform-K / K%128 requirement of the TMA path; it does not make
+  // the kernels handle arbitrary extents. Shapes whose contiguous dimension is
+  // not a multiple of 8 (e.g. hidden_size = 69 in the sanity tests) make the
+  // kernel issue misaligned accesses and abort the context with an
+  // "unspecified launch failure", so they must always go to cuBLAS.
+  auto all_groups_min_aligned = [&]() -> bool {
+    auto contiguous_extent_ok = [](const NVTETensor t) -> bool {
+      const auto *tensor = transformer_engine::convertNVTETensorCheck(t);
+      const auto &shape = tensor->data.shape;
+      return !shape.empty() && (shape.back() % 8 == 0);
+    };
+    for (int i = 0; i < num_gemms; ++i) {
+      if (!contiguous_extent_ok(A[i]) || !contiguous_extent_ok(B[i]) ||
+          !contiguous_extent_ok(D[i])) {
+        return false;
+      }
+    }
+    return true;
+  };
+
   auto is_supported_dtype = [&]() -> bool {
     auto *inputA = transformer_engine::convertNVTETensorCheck(A[0]);
     auto *inputB = transformer_engine::convertNVTETensorCheck(B[0]);
@@ -1123,14 +1219,50 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   //  - grad is irrelevant when bias/pre_gelu_out are empty.
   //
   // Otherwise, fall back to cuBLAS.
+
+  // CUTLASS Grouped GEMM fast path (SM80/non-TMA)
+  // Conditions:
+  //  - No fused epilogue: both bias and pre_gelu_out are empty.
+  //  - Supported dtypes only: FP16/BF16 (FP32 accumulate).
+  //  - *** non-TMA does not requires 128B alignment ***
+  //  - use_split_accumulator is ignored for FP16/BF16.
+  //  - grad is irrelevant when bias/pre_gelu_out are empty.
+  //
+  // Otherwise, fall back to cuBLAS.
   if (is_empty_arr(bias) && is_empty_arr(pre_gelu_out) && is_supported_dtype() &&
-      all_groups_uniform_k128(B, transb)) {
-    cutlass_grouped_gemm(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
-                         current_device, math_sm_count, stream);
+      all_groups_min_aligned() &&
+      (sm80_disable_alignment_check || all_groups_uniform_k128(B, transb))) {
+    // Optional NVRTC-JIT fast path for SM80/SM89.
+    if (use_cutlass_rtc && (is_sm80 || is_sm89)) {
+      const bool ok = cutlass_grouped_gemm_rtc(
+          A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
+          current_device, math_sm_count, stream);
+      if (ok) return;
+      // Diagnostic: when set, a failed RTC call hard-errors instead of
+      // silently falling back to cuBLAS. Useful to prove the RTC path is what
+      // produced the result.
+      NVTE_CHECK(!transformer_engine::getenv<bool>("NVTE_FORCE_RTC_NO_FALLBACK", false),
+                 "CUTLASS RTC grouped GEMM failed and NVTE_FORCE_RTC_NO_FALLBACK=1.");
+      if (warn_fallback) {
+        NVTE_WARN("CUTLASS RTC grouped GEMM unavailable, falling back to cuBLAS.");
+      }
+      cublas_path_tagged();
+      return;
+    }
+
+    if (is_hopper) {
+      // SM90: CUTLASS grouped GEMM with TMA (cutlass_grouped_gemm.cu)
+      cutlass_grouped_gemm(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
+                           current_device, math_sm_count, stream);
+    } else {
+      // SM80/SM89: PPU grouped GEMM without TMA (cutlass_grouped_gemm_ppu.cu)
+      cutlass_grouped_gemm_ppu(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
+                               current_device, math_sm_count, stream);
+    }
   } else {
     if (warn_fallback) {
       NVTE_WARN("Fallback to cuBLAS grouped GEMM.");
     }
-    cublas_path();
+    cublas_path_tagged();
   }
 }
