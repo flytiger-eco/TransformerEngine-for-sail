@@ -97,18 +97,19 @@ jobs:
           retention-days: 7
 
   publish:
-    name: "Publish wheels to the latest release"
+    name: "Publish wheels to the nightly-build release"
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
     concurrency:
-      group: ${{ github.workflow }}-latest-release
+      group: ${{ github.workflow }}-nightly-release
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: "nightly-build"
     steps:
       - name: "Download wheels and source revision from this build"
         uses: actions/download-artifact@v4
@@ -116,7 +117,7 @@ jobs:
           name: ${{ needs.build.outputs.artifact_name }}
           path: dist
 
-      - name: "Upload assets to the latest release"
+      - name: "Upload assets to the nightly-build release"
         env:
           ARTIFACT_NAME: ${{ needs.build.outputs.artifact_name }}
         run: |
@@ -135,13 +136,13 @@ jobs:
           wheel_asset="dist/${ARTIFACT_NAME}.whl"
           mv "${wheels[0]}" "${wheel_asset}"
           echo "Release asset: ${ARTIFACT_NAME}.whl (built as $(basename "${wheels[0]}"))"
-          if ! release_tag="$(gh api "repos/${GH_REPO}/releases/latest" --jq '.tag_name')"; then
-            echo "Error: Unable to retrieve the latest release. Ensure the repository has a published release and the token has access." >&2
-            exit 1
+          if ! gh release view "${RELEASE_TAG}" > /dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} not found; creating it."
+            gh release create "${RELEASE_TAG}" \
+              --target "${GITHUB_SHA}" \
+              --title "Nightly Build" \
+              --notes "Rolling release holding the latest nightly PPU wheels." \
+              --prerelease
           fi
-          if [[ -z "${release_tag}" || "${release_tag}" == "null" ]]; then
-            echo "Error: The latest release tag is empty; aborting release upload." >&2
-            exit 1
-          fi
-          echo "Target release: ${release_tag}"
-          gh release upload "${release_tag}" "${wheel_asset}" dist/commit --clobber
+          echo "Target release: ${RELEASE_TAG}"
+          gh release upload "${RELEASE_TAG}" "${wheel_asset}" --clobber
