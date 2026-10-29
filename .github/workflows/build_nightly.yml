@@ -3,6 +3,9 @@ name: nightly-build
 on:
   schedule:
     - cron: '0 22 * * *'
+  pull_request:
+    branches:
+      - v2.18-SAIL
   workflow_dispatch:
 
 permissions:
