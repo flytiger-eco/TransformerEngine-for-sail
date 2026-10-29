@@ -1,0 +1,148 @@
+name: nightly-build
+
+on:
+  schedule:
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ARTIFACT_DIR: "dist"
+  NVTE_FRAMEWORK: "pytorch"
+  NVTE_WITH_NCCL_EP: "0"
+  NVTE_CUDA_ARCHS: "80;89"
+  NVTE_BUILD_THREADS_PER_JOB: "1"
+  MAX_JOBS: "1"
+  PCCL_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
+
+  ENV_SETUP: |
+    set -euo pipefail
+
+    # PPU SDK
+    SDK_INSTALL_DIR="${SDK_INSTALL_DIR:-/usr/local}"
+    if [[ -f "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh" ]]; then
+      set +u; source "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh"; set -u
+    fi
+
+    # PCCL (NCCL wrapper)
+    PCCL_TARBALL="/tmp/$(basename "${PCCL_URL}")"
+    wget -q -O "${PCCL_TARBALL}" "${PCCL_URL}"
+    tar zxf "${PCCL_TARBALL}" -C /usr/local
+    set +u; source /usr/local/pccl/envsetup.sh; set -u
+    export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    container:
+      image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001
+      options: --user root
+    outputs:
+      artifact_name: ${{ steps.meta.outputs.artifact_name }}
+    steps:
+      - name: "Resolve dated artifact name"
+        id: meta
+        run: |
+          artifact_name="transformer_engine-v2.18-$(date -u -d '+8 hours' +%Y%m%d)"
+          echo "artifact_name=${artifact_name}" >> "${GITHUB_OUTPUT}"
+          echo "Artifact name: ${artifact_name}"
+
+      - name: "Check out source code and submodules"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: "Build PPU wheel (standard CPU runner)"
+        id: build
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+        run: |
+          mkdir -p "${ARTIFACT_DIR}"
+          git rev-parse HEAD > "${ARTIFACT_DIR}/commit"
+          {
+            ${{ env.ENV_SETUP }}
+            pip3 install -U packaging==24.2 pybind11==3.1.0
+            pip3 install "nvidia-cudnn-frontend>=1.25.0"
+            pip3 wheel -v --no-build-isolation --no-deps . -w "${ARTIFACT_DIR}"
+          } 2>&1 | tee "${ARTIFACT_DIR}/ppu_build.log"
+          if ! compgen -G "${ARTIFACT_DIR}/*.whl" > /dev/null; then
+            echo "Error: No wheel found in the build directory; aborting upload." >&2
+            exit 1
+          fi
+          ls -lh "${ARTIFACT_DIR}"
+
+      - name: "Upload wheels and source revision"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: |
+            dist/*.whl
+            dist/commit
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: "Publish wheels to the nightly-build release"
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: ${{ github.workflow }}-nightly-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: "nightly-build"
+    steps:
+      - name: "Download wheels and source revision from this build"
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: dist
+
+      - name: "Upload assets to the nightly-build release"
+        env:
+          ARTIFACT_NAME: ${{ needs.build.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if (( ${#wheels[@]} == 0 )); then
+            echo "Error: No wheel found in the downloaded artifact; aborting release upload." >&2
+            exit 1
+          fi
+          if (( ${#wheels[@]} > 1 )); then
+            echo "Error: Expected a single wheel, found ${#wheels[@]}: ${wheels[*]}" >&2
+            exit 1
+          fi
+          # Publish the wheel under the dated artifact name instead of the build-time name.
+          wheel_asset="dist/${ARTIFACT_NAME}.whl"
+          mv "${wheels[0]}" "${wheel_asset}"
+          echo "Release asset: ${ARTIFACT_NAME}.whl (built as $(basename "${wheels[0]}"))"
+          if ! gh release view "${RELEASE_TAG}" > /dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} not found; creating it."
+            gh release create "${RELEASE_TAG}" \
+              --target "${GITHUB_SHA}" \
+              --title "Nightly Build" \
+              --notes "Rolling release holding the latest nightly PPU wheels." \
+              --prerelease
+          fi
+          echo "Target release: ${RELEASE_TAG}"
+          gh release upload "${RELEASE_TAG}" "${wheel_asset}" --clobber
