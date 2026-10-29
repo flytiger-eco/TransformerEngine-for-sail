@@ -9,6 +9,9 @@
 #include <transformer_engine/transpose.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <optional>
+#include <string>
 
 #include "../common.h"
 #include "../util/cuda_runtime.h"
@@ -315,6 +318,152 @@ __global__ void __launch_bounds__(block_size)
   }
 }
 
+/* NVTX instrumentation of the dispatch decision.
+ *
+ * Same RAII idiom as NVTE_API_CALL, which the (grouped) GEMM entry points use
+ * to open one range per API call: nvte_transpose already opens the API-level
+ * range, and DispatchTracer opens a nested range that names the kernel path
+ * actually selected, its launch geometry and the global traffic volume.
+ *
+ * NVTE_TRANSPOSE_NVTX=0 (default) no tracer is constructed; the dispatch only
+ *                                 reads a cached int.
+ * NVTE_TRANSPOSE_NVTX=1           the range label carries the traffic volume.
+ *                                 A host-side range around an asynchronous
+ *                                 launch spans host time, so the achieved
+ *                                 bandwidth is volume / duration of the
+ *                                 correlated kernel on the GPU row of the same
+ *                                 timeline.
+ * NVTE_TRANSPOSE_NVTX=2           additionally times the launch with CUDA
+ *                                 events and emits the achieved GB/s as an NVTX
+ *                                 mark labelled with the same text as the range.
+ *                                 The stop event is polled with cudaEventQuery
+ *                                 from a later call, so no synchronization is
+ *                                 ever inserted into the stream; the mark for
+ *                                 one call therefore shows up at the start of a
+ *                                 following one. Measurements that have not
+ *                                 landed yet are kept in a small ring (8 per
+ *                                 thread) and reported in order. Streams that
+ *                                 are capturing a CUDA graph are not measured.
+ */
+int nvtx_level() {
+  static const int level = std::clamp(getenv<int>("NVTE_TRANSPOSE_NVTX", 0), 0, 2);
+  return level;
+}
+
+/*! \brief Human-readable traffic volume, e.g. "134.2MB" */
+std::string traffic_label(double bytes) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.1fMB", bytes / 1e6);
+  return buf;
+}
+
+/*! \brief Deferred bandwidth measurements of one host thread
+ *
+ * A measurement is reported once its stop event has landed, which is checked
+ * with cudaEventQuery from a later call -- never by waiting. Back-to-back
+ * calls would otherwise overwrite the one pending record, so a small ring
+ * keeps the measurements that have not landed yet.
+ */
+struct BandwidthProbe {
+  static constexpr size_t kSlots = 8;
+
+  struct Slot {
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    std::string label;
+    double bytes = 0.0;
+    bool armed = false;
+    bool pending = false;
+  };
+
+  BandwidthProbe() {
+    for (auto &slot : slots) {
+      NVTE_CHECK_CUDA(cudaEventCreate(&slot.start));
+      NVTE_CHECK_CUDA(cudaEventCreate(&slot.stop));
+    }
+  }
+
+  ~BandwidthProbe() {
+    // Best effort: thread exit can follow CUDA context teardown.
+    for (auto &slot : slots) {
+      cudaEventDestroy(slot.start);
+      cudaEventDestroy(slot.stop);
+    }
+  }
+
+  BandwidthProbe(const BandwidthProbe &) = delete;
+  BandwidthProbe &operator=(const BandwidthProbe &) = delete;
+
+  /*! \brief Emit a mark for every measurement that has landed */
+  void flush() {
+    for (auto &slot : slots) {
+      if (!slot.pending || cudaEventQuery(slot.stop) != cudaSuccess) continue;
+      slot.pending = false;
+      float ms = 0.f;
+      if (cudaEventElapsedTime(&ms, slot.start, slot.stop) != cudaSuccess || ms <= 0.f) continue;
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "%s -> %.1f GB/s (%.2f us)", slot.label.c_str(),
+                    slot.bytes / (static_cast<double>(ms) * 1e-3) / 1e9, ms * 1e3f);
+      nvtxMarkA(buf);
+    }
+  }
+
+  /*! \brief Take the next slot (round robin) and start its measurement */
+  Slot &arm(const std::string &label, double bytes, cudaStream_t stream) {
+    Slot &slot = slots[next];
+    next = (next + 1) % kSlots;
+    slot.label = label;
+    slot.bytes = bytes;
+    slot.pending = false;
+    slot.armed = (cudaEventRecord(slot.start, stream) == cudaSuccess);
+    return slot;
+  }
+
+  Slot slots[kSlots];
+  size_t next = 0;
+};
+
+BandwidthProbe &bandwidth_probe() {
+  static thread_local BandwidthProbe probe;
+  return probe;
+}
+
+/*! \brief NVTX range (and optional bandwidth probe) around one dispatch
+ *
+ * Only constructed when nvtx_level() > 0, so that the label is never
+ * formatted on the default path.
+ */
+class DispatchTracer {
+ public:
+  DispatchTracer(const std::string &label, double bytes, cudaStream_t stream) : stream_(stream) {
+    range_.emplace(label);
+    if (nvtx_level() < 2) return;
+    // cudaEventQuery/cudaEventElapsedTime are illegal while the stream is
+    // capturing a CUDA graph, so measure only on ordinary streams.
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+      return;
+    }
+    auto &probe = bandwidth_probe();
+    probe.flush();
+    slot_ = &probe.arm(label, bytes, stream);
+  }
+
+  ~DispatchTracer() {
+    if (slot_ == nullptr || !slot_->armed) return;
+    slot_->pending = (cudaEventRecord(slot_->stop, stream_) == cudaSuccess);
+  }
+
+  DispatchTracer(const DispatchTracer &) = delete;
+  DispatchTracer &operator=(const DispatchTracer &) = delete;
+
+ private:
+  cudaStream_t stream_;
+  BandwidthProbe::Slot *slot_ = nullptr;
+  std::optional<nvtx::NVTXWrapper> range_;
+};
+
 }  // namespace
 
 void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStream_t stream) {
@@ -344,6 +493,16 @@ void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStr
 
       // Choose between runtime-compiled or statically-compiled kernel
       const bool aligned = (row_length % THREADS_PER_WARP == 0 && num_rows % THREADS_PER_WARP == 0);
+
+      // NVTX: one nested range per dispatch decision, labelled with the
+      // selected kernel path, its launch geometry and the traffic volume
+      // (read + write). The label is only formatted when instrumentation is
+      // requested; see DispatchTracer for NVTE_TRANSPOSE_NVTX.
+      const bool tracing = nvtx_level() > 0;
+      const double traffic_bytes =
+          2.0 * static_cast<double>(num_rows) * static_cast<double>(row_length) * type_size;
+      std::optional<DispatchTracer> tracer;
+
       if (aligned && rtc::is_enabled()) {  // Runtime-compiled tuned kernel
         auto &rtc_manager = rtc::KernelManager::instance();
         const auto &props = cuda::device_props();
@@ -407,6 +566,13 @@ void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStr
             rtc_manager.compile(sync2_label, "transpose_sync2_kernel", code,
                                 "transformer_engine/common/transpose/rtc/transpose_sync2.cu");
           }
+          if (tracing) {
+            tracer.emplace(concat_strings("transpose[sync2 L", load_size, "S", store_size, "W",
+                                          cfg_warps_per_tile, "] ", num_rows, "x", row_length, " ",
+                                          type_name, " ", traffic_label(traffic_bytes), " grid=",
+                                          num_blocks, " block=", cfg_block_size),
+                           traffic_bytes, stream);
+          }
           rtc_manager.launch(sync2_label, num_blocks, cfg_block_size, 0, stream,
                              static_cast<const Type *>(input.data.dptr),
                              static_cast<const fp32 *>(noop.data.dptr),
@@ -451,6 +617,15 @@ void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStr
                 total_tiles, static_cast<size_t>(props.sm_count) * blocks_per_sm);
             const unsigned row_length_u = static_cast<unsigned>(row_length);
             const unsigned num_rows_u = static_cast<unsigned>(num_rows);
+            if (tracing) {
+              tracer.emplace(
+                  concat_strings("transpose[pipeline L", pipe_load_size, "S", pipe_store_size, "W",
+                                 pipe_warps, " stages=", pipe_stages, "] ", num_rows, "x",
+                                 row_length, " ", type_name, " ", traffic_label(traffic_bytes),
+                                 " grid=", num_pipe_blocks, " block=", pipe_block_size, " smem=",
+                                 dyn_smem, "B"),
+                  traffic_bytes, stream);
+            }
             rtc_manager.launch(pipe_label, num_pipe_blocks, pipe_block_size,
                                static_cast<unsigned>(dyn_smem), stream,
                                static_cast<const Type *>(input.data.dptr),
@@ -478,6 +653,13 @@ void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStr
             rtc_manager.compile(kernel_label, "transpose_optimized_kernel", code,
                                 "transformer_engine/common/transpose/rtc/transpose.cu");
           }
+          if (tracing) {
+            tracer.emplace(concat_strings("transpose[optimized L", load_size, "S", store_size, "W",
+                                          cfg_warps_per_tile, "] ", num_rows, "x", row_length, " ",
+                                          type_name, " ", traffic_label(traffic_bytes), " grid=",
+                                          num_blocks, " block=", cfg_block_size),
+                           traffic_bytes, stream);
+          }
           rtc_manager.launch(kernel_label, num_blocks, cfg_block_size, 0, stream,
                              static_cast<const Type *>(input.data.dptr),
                              static_cast<const fp32 *>(noop.data.dptr),
@@ -489,6 +671,13 @@ void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStr
         constexpr size_t row_tile_size = load_size / type_size * THREADS_PER_WARP;
         constexpr size_t col_tile_size = store_size / type_size * THREADS_PER_WARP;
         const int num_blocks = (DIVUP(row_length, row_tile_size) * DIVUP(num_rows, col_tile_size));
+        if (tracing) {
+          tracer.emplace(concat_strings("transpose[general L", load_size, "S", store_size, "] ",
+                                        num_rows, "x", row_length, " ", type_name, " ",
+                                        traffic_label(traffic_bytes), " grid=", num_blocks,
+                                        " block=", block_size),
+                         traffic_bytes, stream);
+        }
         transpose_general_kernel<load_size, store_size, Type>
             <<<num_blocks, block_size, 0, stream>>>(static_cast<const Type *>(input.data.dptr),
                                                     static_cast<const fp32 *>(noop.data.dptr),
