@@ -14,6 +14,7 @@
 #include "../util/cuda_runtime.h"
 #include "../util/rtc.h"
 #include "../util/string.h"
+#include "../util/system.h"
 #include "../utils.cuh"
 #include "./transpose.h"
 
@@ -24,10 +25,60 @@ namespace {
 
 // String with RTC kernel implementation
 #include "string_code_transpose_rtc_transpose_cu.h"
+#include "string_code_transpose_rtc_transpose_pipeline_cu.h"
+#include "string_code_transpose_rtc_transpose_sync2_cu.h"
 
 // Hard-coded kernel parameters
 constexpr size_t warps_per_tile = 4;
 constexpr size_t block_size = THREADS_PER_WARP * warps_per_tile;
+
+/* Pipelined persistent kernel parameters (see
+ * docs/transpose_cpasync_persistent.md). L4 S4 W8 with a 2-stage cp.async
+ * ring was the winner of the measured variant matrix: it keeps 8 blocks/SM
+ * (same occupancy as the baseline) while hiding global-load latency behind
+ * the previous tile's processing.
+ */
+constexpr size_t pipe_load_size = 4;
+constexpr size_t pipe_store_size = 4;
+constexpr size_t pipe_warps = 8;
+constexpr size_t pipe_stages = 2;
+constexpr size_t pipe_block_size = THREADS_PER_WARP * pipe_warps;
+
+/* Whether the pipelined kernel is preferred for a given shape.
+ *
+ * Calibration data (ZW-M890P, bf16, harness A/B with cudaGraph replay,
+ * docs/transpose_cpasync_persistent.md §4): the pipeline kernel wins
+ * 1.04-1.19x on cache-resident and wave-quantized shapes and 1.01-1.07x on
+ * large streaming shapes, except very large near-square tensors where the
+ * baseline's L8S8 geometry is already at/above the d2d-copy roofline.
+ */
+inline bool pipeline_preferred(size_t row_length, size_t num_rows, size_t type_size,
+                               const cuda::DeviceProps &props) {
+  // Runtime A/B switch: NVTE_TRANSPOSE_PIPELINE=0 forces the baseline
+  // one-tile-per-block dispatch (bit-identical to the ab6bccd0 behavior).
+  if (getenv<int>("NVTE_TRANSPOSE_PIPELINE", 1) == 0) return false;
+  // Measured for 2-byte types only; fp32/fp8 keep the baseline dispatch.
+  if (type_size != 2) return false;
+  constexpr size_t nvec = pipe_load_size / 2;  // elements per vector (2)
+  const size_t tile_m = THREADS_PER_WARP * nvec;
+  const size_t tile_n = THREADS_PER_WARP * nvec;
+  if (row_length % tile_n != 0 || num_rows % tile_m != 0) return false;
+  // 32-bit addressing guard inside the kernel.
+  if (num_rows * row_length >= (size_t{1} << 31)) return false;
+  // Large near-square exception (calibrated on ZW-M890P, 12/12 shapes of the
+  // delivery matrix): when num_rows >= 6144 && row_length >= 8192 the
+  // baseline L8S8 kernel reaches 2030-2100 GB/s (at/above the same-round
+  // d2d-copy roofline) and beats the pipeline by 1.5-3.5% -- its 128x128
+  // tile write pattern (128 output rows x 256 B) interacts better with
+  // DRAM/LLC residency on those shapes. The pipeline still wins everywhere
+  // else, incl. 6144x6144 (1.03x) and 16384x4096 (1.07x).
+  if (num_rows >= 6144 && row_length >= 8192) return false;
+  // Note: the fixed config's dynamic smem (22656 B for 2-byte types) is well
+  // under the 48 KB default; the launch path additionally falls back to the
+  // baseline when the occupancy query returns 0 blocks/SM.
+  (void)props;
+  return true;
+}
 
 /* Performance heuristics for optimized kernel parameters
  *
@@ -124,6 +175,48 @@ struct KernelConfig {
     }
   }
 };
+
+/* Whether the sync-reduced variant (per-j2 staging buffers, 2 barriers per
+ * tile instead of 2*nvec_in) is preferred for the selected config.
+ *
+ * The nvec_in-fold staging array only pays off when it costs no occupancy:
+ * measured 1.175x at 1024x1024 (L4S4W8: split staging 8448 B, blocks/SM
+ * unchanged at 8), but 0.97-0.98x on large shapes with L8S8 (split staging
+ * 33792 B drops blocks/SM from 8 to 7). Same occupancy estimator as
+ * KernelConfig. NVTE_TRANSPOSE_SYNC2=0 forces the baseline kernel.
+ */
+inline bool sync2_preferred(const KernelConfig &cfg, size_t type_size,
+                            const cuda::DeviceProps &props) {
+  if (getenv<int>("NVTE_TRANSPOSE_SYNC2", 1) == 0) return false;
+  // Measured for 2-byte types only; fp32/fp8 keep the baseline dispatch.
+  if (type_size != 2 || !cfg.valid) return false;
+  const size_t nvec_in = cfg.load_size / type_size;
+  const size_t nvec_out = cfg.store_size / type_size;
+  const size_t single_smem = THREADS_PER_WARP * (THREADS_PER_WARP + 1) * nvec_out * type_size;
+  const size_t split_smem = nvec_in * single_smem;
+  const size_t num_iterations = THREADS_PER_WARP / cfg.warps_per_tile;
+  // base_regs=32 is calibrated against ACU-measured register counts of the
+  // compiled kernels (L8S8W8 bf16: 64 regs = 16 staging vecs x 2 + 32;
+  // L4S4W8 bf16: 40 regs = 8 x 1 + 32). The KernelConfig cost model uses a
+  // different constant (40) calibrated for config ranking; using it here
+  // would mispredict L8S8W8 as occupancy-neutral and enable sync2 where it
+  // measurably regresses (0.98x at 8192x4096).
+  constexpr size_t base_regs = 32;
+  constexpr size_t max_blocks_per_sm = 32;
+  const size_t staging_vec_regs = std::max<size_t>(1, nvec_out * type_size / 4);
+  const size_t est_regs = nvec_in * num_iterations * staging_vec_regs + base_regs;
+  const size_t reg_limit =
+      static_cast<size_t>(props.regs_per_sm) / (est_regs * cfg.block_size);
+  const size_t thread_limit =
+      static_cast<size_t>(props.max_threads_per_sm) / cfg.block_size;
+  const size_t bps_single = std::max<size_t>(
+      1, std::min({reg_limit, props.shared_mem_per_sm / single_smem, thread_limit,
+                   max_blocks_per_sm}));
+  const size_t bps_split = std::max<size_t>(
+      1, std::min({reg_limit, props.shared_mem_per_sm / split_smem, thread_limit,
+                   max_blocks_per_sm}));
+  return bps_split >= bps_single;
+}
 
 template <size_t load_size, size_t store_size, typename Type>
 __global__ void __launch_bounds__(block_size)
@@ -252,12 +345,14 @@ void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStr
       // Choose between runtime-compiled or statically-compiled kernel
       const bool aligned = (row_length % THREADS_PER_WARP == 0 && num_rows % THREADS_PER_WARP == 0);
       if (aligned && rtc::is_enabled()) {  // Runtime-compiled tuned kernel
+        auto &rtc_manager = rtc::KernelManager::instance();
+        const auto &props = cuda::device_props();
+
         // Pick kernel config
         // Note: Configs are ordered by preference for tie-breaking
         // (larger vector accesses first, more warps per tile first).
         std::vector<KernelConfig> kernel_configs;
         kernel_configs.reserve(32);
-        const auto &props = cuda::device_props();
         auto add_config = [&](size_t load_size, size_t store_size, size_t warps) {
           kernel_configs.emplace_back(row_length, num_rows, type_size, load_size, store_size, warps,
                                       props);
@@ -288,27 +383,106 @@ void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStr
         const size_t cfg_warps_per_tile = kernel_config.warps_per_tile;
         const size_t cfg_block_size = kernel_config.block_size;
 
-        // Compile NVRTC kernel if needed and launch
-        auto &rtc_manager = rtc::KernelManager::instance();
-        const std::string kernel_label = concat_strings(
-            "transpose"
-            ",type=",
-            type_name, ",load_size=", load_size, ",store_size=", store_size,
-            ",warps_per_tile=", cfg_warps_per_tile);
-        if (!rtc_manager.is_compiled(kernel_label)) {
-          std::string code = string_code_transpose_rtc_transpose_cu;
-          code = regex_replace(code, "__TYPE__", type_name);
-          code = regex_replace(code, "__LOAD_SIZE__", load_size);
-          code = regex_replace(code, "__STORE_SIZE__", store_size);
-          code = regex_replace(code, "__WARPS_PER_TILE__", cfg_warps_per_tile);
-          code = regex_replace(code, "__BLOCK_SIZE__", cfg_block_size);
-          rtc_manager.compile(kernel_label, "transpose_optimized_kernel", code,
-                              "transformer_engine/common/transpose/rtc/transpose.cu");
+        // Three-way dispatch (see docs/transpose_cpasync_persistent.md):
+        //  1. sync2: baseline kernel with per-j2 staging (2 barriers/tile),
+        //     only when the extra staging smem costs no occupancy -- wins on
+        //     latency-bound small shapes (1.17x at 1024x1024).
+        //  2. pipeline: persistent cp.async multistage kernel -- wins on
+        //     small-to-large streaming shapes (1.01-1.16x) except large
+        //     near-square tensors where the baseline is at/above the d2d
+        //     roofline.
+        //  3. baseline one-tile-per-block kernel.
+        bool launched = false;
+        if (sync2_preferred(kernel_config, type_size, props)) {
+          const std::string sync2_label =
+              concat_strings("transpose_sync2", ",type=", type_name, ",load_size=", load_size,
+                             ",store_size=", store_size, ",warps_per_tile=", cfg_warps_per_tile);
+          if (!rtc_manager.is_compiled(sync2_label)) {
+            std::string code = string_code_transpose_rtc_transpose_sync2_cu;
+            code = regex_replace(code, "__TYPE__", type_name);
+            code = regex_replace(code, "__LOAD_SIZE__", load_size);
+            code = regex_replace(code, "__STORE_SIZE__", store_size);
+            code = regex_replace(code, "__WARPS_PER_TILE__", cfg_warps_per_tile);
+            code = regex_replace(code, "__BLOCK_SIZE__", cfg_block_size);
+            rtc_manager.compile(sync2_label, "transpose_sync2_kernel", code,
+                                "transformer_engine/common/transpose/rtc/transpose_sync2.cu");
+          }
+          rtc_manager.launch(sync2_label, num_blocks, cfg_block_size, 0, stream,
+                             static_cast<const Type *>(input.data.dptr),
+                             static_cast<const fp32 *>(noop.data.dptr),
+                             static_cast<Type *>(output.data.dptr), row_length, num_rows);
+          launched = true;
         }
-        rtc_manager.launch(kernel_label, num_blocks, cfg_block_size, 0, stream,
-                           static_cast<const Type *>(input.data.dptr),
-                           static_cast<const fp32 *>(noop.data.dptr),
-                           static_cast<Type *>(output.data.dptr), row_length, num_rows);
+
+        if (!launched && pipeline_preferred(row_length, num_rows, type_size, props)) {
+          const size_t tile_m = THREADS_PER_WARP * (pipe_store_size / type_size);
+          const size_t tile_n = THREADS_PER_WARP * (pipe_load_size / type_size);
+          const size_t stage_bytes = tile_m * (tile_n + 8) * type_size;
+          const size_t staging_bytes =
+              THREADS_PER_WARP * (THREADS_PER_WARP + 1) * pipe_store_size;
+          const size_t dyn_smem = pipe_stages * stage_bytes + staging_bytes;
+          const unsigned num_tiles_m = static_cast<unsigned>(num_rows / tile_m);
+          const unsigned total_tiles =
+              static_cast<unsigned>(num_tiles_m * (row_length / tile_n));
+          const std::string pipe_label =
+              concat_strings("transpose_pipeline", ",type=", type_name, ",load_size=",
+                             pipe_load_size, ",store_size=", pipe_store_size,
+                             ",warps_per_tile=", pipe_warps, ",stages=", pipe_stages);
+          if (!rtc_manager.is_compiled(pipe_label)) {
+            std::string code = string_code_transpose_rtc_transpose_pipeline_cu;
+            code = regex_replace(code, "__TYPE__", type_name);
+            code = regex_replace(code, "__LOAD_SIZE__", pipe_load_size);
+            code = regex_replace(code, "__STORE_SIZE__", pipe_store_size);
+            code = regex_replace(code, "__WARPS_PER_TILE__", pipe_warps);
+            code = regex_replace(code, "__BLOCK_SIZE__", pipe_block_size);
+            code = regex_replace(code, "__STAGES__", pipe_stages);
+            rtc_manager.compile(pipe_label, "transpose_pipeline_kernel", code,
+                                "transformer_engine/common/transpose/rtc/transpose_pipeline.cu");
+          }
+          const int blocks_per_sm = rtc_manager.occupancy_max_active_blocks_per_sm(
+              pipe_label, static_cast<int>(pipe_block_size), dyn_smem);
+          if (blocks_per_sm >= 1) {
+            if (dyn_smem >= 48 * 1024) {
+              rtc_manager.set_function_attribute(
+                  pipe_label, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                  static_cast<int>(dyn_smem));
+            }
+            const size_t num_pipe_blocks = std::min<size_t>(
+                total_tiles, static_cast<size_t>(props.sm_count) * blocks_per_sm);
+            const unsigned row_length_u = static_cast<unsigned>(row_length);
+            const unsigned num_rows_u = static_cast<unsigned>(num_rows);
+            rtc_manager.launch(pipe_label, num_pipe_blocks, pipe_block_size,
+                               static_cast<unsigned>(dyn_smem), stream,
+                               static_cast<const Type *>(input.data.dptr),
+                               static_cast<const fp32 *>(noop.data.dptr),
+                               static_cast<Type *>(output.data.dptr), row_length_u, num_rows_u,
+                               num_tiles_m, total_tiles);
+            launched = true;
+          }
+        }
+
+        if (!launched) {
+          // Compile NVRTC kernel if needed and launch
+          const std::string kernel_label = concat_strings(
+              "transpose"
+              ",type=",
+              type_name, ",load_size=", load_size, ",store_size=", store_size,
+              ",warps_per_tile=", cfg_warps_per_tile);
+          if (!rtc_manager.is_compiled(kernel_label)) {
+            std::string code = string_code_transpose_rtc_transpose_cu;
+            code = regex_replace(code, "__TYPE__", type_name);
+            code = regex_replace(code, "__LOAD_SIZE__", load_size);
+            code = regex_replace(code, "__STORE_SIZE__", store_size);
+            code = regex_replace(code, "__WARPS_PER_TILE__", cfg_warps_per_tile);
+            code = regex_replace(code, "__BLOCK_SIZE__", cfg_block_size);
+            rtc_manager.compile(kernel_label, "transpose_optimized_kernel", code,
+                                "transformer_engine/common/transpose/rtc/transpose.cu");
+          }
+          rtc_manager.launch(kernel_label, num_blocks, cfg_block_size, 0, stream,
+                             static_cast<const Type *>(input.data.dptr),
+                             static_cast<const fp32 *>(noop.data.dptr),
+                             static_cast<Type *>(output.data.dptr), row_length, num_rows);
+        }
       } else {  // Statically-compiled general kernel
         constexpr size_t load_size = 4;
         constexpr size_t store_size = 4;
