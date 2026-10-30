@@ -1,0 +1,41 @@
+FROM pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001
+
+SHELL ["/bin/bash", "-e", "-u", "-o", "pipefail", "-c"]
+
+ARG PCCL_URL=https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz
+
+RUN wget -q -O /tmp/pccl.tar.gz "${PCCL_URL}" && \
+    tar zxf /tmp/pccl.tar.gz -C /usr/local && \
+    rm /tmp/pccl.tar.gz
+
+# docker build -f build_tools/wheel_utils/Dockerfile.x86_ppu -t transformer-engine-ppu .
+WORKDIR /workspace/TransformerEngine-for-sail
+COPY . .
+
+ARG NVTE_CUDA_ARCHS="80;89"
+ARG NVTE_BUILD_THREADS_PER_JOB=4
+ARG MAX_JOBS=60
+ENV NVTE_FRAMEWORK=pytorch \
+    NVTE_WITH_NCCL_EP=0 \
+    NVTE_CUDA_ARCHS=${NVTE_CUDA_ARCHS} \
+    NVTE_BUILD_THREADS_PER_JOB=${NVTE_BUILD_THREADS_PER_JOB} \
+    MAX_JOBS=${MAX_JOBS}
+
+RUN SDK_INSTALL_DIR="${SDK_INSTALL_DIR:-/usr/local}"; \
+    if [[ -f "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh" ]]; then \
+        set +u; source "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh"; set -u; \
+    fi; \
+    set +u; source /usr/local/pccl/envsetup.sh; set -u; \
+    export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"; \
+    pip3 install --no-cache-dir -U packaging==24.2 pybind11==3.1.0; \
+    pip3 install --no-cache-dir nvidia-cudnn-frontend; \
+    mkdir -p /artifacts; \
+    SECONDS=0; \
+    rc=0; \
+    pip3 wheel -v --no-build-isolation --no-deps . -w /artifacts \
+        2>&1 | tee /artifacts/ppu_build.log || rc=$?; \
+    echo "[build] 编译耗时 ${SECONDS}s，退出码 ${rc}"; \
+    [[ "${rc}" -eq 0 ]] || exit "${rc}"; \
+    git rev-parse HEAD > /artifacts/commit; \
+    ls -lh /artifacts; \
+    pip3 install --no-cache-dir /artifacts/*.whl
