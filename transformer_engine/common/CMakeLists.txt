@@ -700,6 +700,10 @@ make_string_header_from_file(transpose/rtc/cast_transpose.cu
                              string_code_transpose_rtc_cast_transpose_cu)
 make_string_header_from_file(transpose/rtc/transpose.cu
                              string_code_transpose_rtc_transpose_cu)
+make_string_header_from_file(transpose/rtc/transpose_pipeline.cu
+                             string_code_transpose_rtc_transpose_pipeline_cu)
+make_string_header_from_file(transpose/rtc/transpose_sync2.cu
+                             string_code_transpose_rtc_transpose_sync2_cu)
 make_string_header_from_file(transpose/rtc/swap_first_dims.cu
                              string_code_transpose_rtc_swap_first_dims_cu)
 make_string_header_from_file(fused_softmax/scaled_masked_softmax.cu
