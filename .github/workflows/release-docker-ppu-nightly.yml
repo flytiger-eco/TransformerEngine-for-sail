@@ -1,0 +1,95 @@
+name: Release Docker Images Nightly (PPU)
+
+# Build the PPU image daily using the repository root as the context and publish to GHCR.
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: 'Push images to GHCR; disable for a build-only run'
+        required: false
+        type: boolean
+        default: true
+  schedule:
+    # Every day at 00:00 Beijing Time (16:00 UTC).
+    - cron: '0 16 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # The Dockerfile copies .git; keep checkout credentials out of the image.
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          # GHCR image paths must be lowercase.
+          owner_lc=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          date_tag=$(date -u +%Y%m%d)
+          short_sha="${GITHUB_SHA::7}"
+          # Sanitize the branch name and reserve space for the tag suffix.
+          branch=$(printf '%s' "$GITHUB_REF_NAME" | sed 's|/|-|g; s/[^A-Za-z0-9._-]/-/g')
+          echo "image=ghcr.io/${owner_lc}/transformer-engine-ppu-nightly" >> "$GITHUB_OUTPUT"
+          echo "tag=${branch:0:80}-${date_tag}-cuda13.0.0-sdk2.2.0-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "rolling=nightly" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push || github.event_name != 'workflow_dispatch' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and optionally push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build_tools/wheel_utils/Dockerfile.x86_ppu
+          platforms: linux/amd64
+          push: ${{ inputs.push || github.event_name != 'workflow_dispatch' }}
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.rolling }}
+          # Limit compilation parallelism on GitHub-hosted runners instead of the default 60 jobs.
+          build-args: |
+            MAX_JOBS=2
+            NVTE_BUILD_THREADS_PER_JOB=1
+
+      - name: Write image address to job summary
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ROLLING: ${{ steps.meta.outputs.rolling }}
+          PUSH_IMAGE: ${{ inputs.push || github.event_name != 'workflow_dispatch' }}
+        run: |
+          if [[ "$PUSH_IMAGE" == "true" ]]; then
+            status="pushed"
+          else
+            status="built only, not pushed"
+          fi
+          printf 'PPU image (%s): `%s:%s` (rolling tag: `%s:%s`)\n' \
+            "$status" "$IMAGE" "$TAG" "$IMAGE" "$ROLLING" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
