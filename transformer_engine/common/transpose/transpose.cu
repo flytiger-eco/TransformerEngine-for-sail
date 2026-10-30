@@ -76,6 +76,13 @@ inline bool pipeline_preferred(size_t row_length, size_t num_rows, size_t type_s
   // DRAM/LLC residency on those shapes. The pipeline still wins everywhere
   // else, incl. 6144x6144 (1.03x) and 16384x4096 (1.07x).
   if (num_rows >= 6144 && row_length >= 8192) return false;
+  // Very wide rows with a working set beyond the LLC. A 64x64 tile reads only
+  // 128 B per input row, and once the row stride is >= 32 KB those reads land
+  // in different DRAM pages, so the baseline's 128x128 tile (256 B per row)
+  // wins. Measured against the baseline dispatch on ZW-M890P: 4096x16384
+  // 0.974x, 2048x32768 0.970x, 4096x32768 0.947x, while the 64 MB 1024x32768
+  // still favours the pipeline (1.012x) -- hence the 128 MB working-set floor.
+  if (row_length >= 16384 && num_rows * row_length >= (size_t{64} << 20)) return false;
   // Note: the fixed config's dynamic smem (22656 B for 2-byte types) is well
   // under the 48 KB default; the launch path additionally falls back to the
   // baseline when the occupancy query returns 0 blocks/SM.
