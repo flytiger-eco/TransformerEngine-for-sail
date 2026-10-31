@@ -1,6 +1,9 @@
 name: nightly-build
 
 on:
+  pull_request:
+    branches:
+      - v2.18-SAIL
   schedule:
     - cron: '0 22 * * *'
   workflow_dispatch:
@@ -18,6 +21,8 @@ defaults:
 
 env:
   ARTIFACT_DIR: "dist"
+  WHEEL_NAME: "transformer_engine-2.18.0-cp312-cp312-linux_x86_64.whl"
+  NVTE_NO_LOCAL_VERSION: "1"
   NVTE_FRAMEWORK: "pytorch"
   NVTE_WITH_NCCL_EP: "0"
   NVTE_CUDA_ARCHS: "80;89"
@@ -48,16 +53,7 @@ jobs:
     container:
       image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001
       options: --user root
-    outputs:
-      artifact_name: ${{ steps.meta.outputs.artifact_name }}
     steps:
-      - name: "Resolve dated artifact name"
-        id: meta
-        run: |
-          artifact_name="transformer_engine-v2.18-$(date -u -d '+8 hours' +%Y%m%d)"
-          echo "artifact_name=${artifact_name}" >> "${GITHUB_OUTPUT}"
-          echo "Artifact name: ${artifact_name}"
-
       - name: "Check out source code and submodules"
         uses: actions/checkout@v4
         with:
@@ -80,8 +76,8 @@ jobs:
             pip3 install "nvidia-cudnn-frontend>=1.25.0"
             pip3 wheel -v --no-build-isolation --no-deps . -w "${ARTIFACT_DIR}"
           } 2>&1 | tee "${ARTIFACT_DIR}/ppu_build.log"
-          if ! compgen -G "${ARTIFACT_DIR}/*.whl" > /dev/null; then
-            echo "Error: No wheel found in the build directory; aborting upload." >&2
+          if [[ ! -f "${ARTIFACT_DIR}/${WHEEL_NAME}" ]]; then
+            echo "Error: Expected wheel ${WHEEL_NAME} not found; aborting upload." >&2
             exit 1
           fi
           ls -lh "${ARTIFACT_DIR}"
@@ -89,9 +85,9 @@ jobs:
       - name: "Upload wheels and source revision"
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.meta.outputs.artifact_name }}
+          name: ${{ env.WHEEL_NAME }}
           path: |
-            dist/*.whl
+            dist/${{ env.WHEEL_NAME }}
             dist/commit
           if-no-files-found: error
           retention-days: 7
@@ -114,28 +110,18 @@ jobs:
       - name: "Download wheels and source revision from this build"
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.build.outputs.artifact_name }}
+          name: ${{ env.WHEEL_NAME }}
           path: dist
 
       - name: "Upload assets to the nightly-build release"
-        env:
-          ARTIFACT_NAME: ${{ needs.build.outputs.artifact_name }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          wheels=(dist/*.whl)
-          if (( ${#wheels[@]} == 0 )); then
-            echo "Error: No wheel found in the downloaded artifact; aborting release upload." >&2
+          wheel_asset="${ARTIFACT_DIR}/${WHEEL_NAME}"
+          if [[ ! -f "${wheel_asset}" ]]; then
+            echo "Error: Expected wheel ${WHEEL_NAME} not found; aborting release upload." >&2
             exit 1
           fi
-          if (( ${#wheels[@]} > 1 )); then
-            echo "Error: Expected a single wheel, found ${#wheels[@]}: ${wheels[*]}" >&2
-            exit 1
-          fi
-          # Publish the wheel under the dated artifact name instead of the build-time name.
-          wheel_asset="dist/${ARTIFACT_NAME}.whl"
-          mv "${wheels[0]}" "${wheel_asset}"
-          echo "Release asset: ${ARTIFACT_NAME}.whl (built as $(basename "${wheels[0]}"))"
+          echo "Release asset: ${WHEEL_NAME}"
           if ! gh release view "${RELEASE_TAG}" > /dev/null 2>&1; then
             echo "Release ${RELEASE_TAG} not found; creating it."
             gh release create "${RELEASE_TAG}" \
