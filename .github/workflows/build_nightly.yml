@@ -1,9 +1,6 @@
 name: nightly-build
 
 on:
-  pull_request:
-    branches:
-      - v2.18-SAIL
   schedule:
     - cron: '0 22 * * *'
   workflow_dispatch:
