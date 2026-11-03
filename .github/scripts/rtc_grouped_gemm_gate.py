@@ -166,6 +166,8 @@ def compare(cases, measurements, tolerance):
 
 def report(args):
     out = Path(args.output)
+    # NAS 由 pod 写入；runner 只读测量，将报告写到自己的可写目录。
+    source = Path(getattr(args, "input", None) or args.output)
     out.mkdir(parents=True, exist_ok=True)
     cases = load_cases(args.cases)
     rows, error = [], None
@@ -174,7 +176,7 @@ def report(args):
         for sweep in range(args.sweeps):
             pair = []
             for arm in ("base", "head"):
-                path = out / arm / f"sweep-{sweep}" / "results.json"
+                path = source / arm / f"sweep-{sweep}" / "results.json"
                 pair.append(json.loads(path.read_text(encoding="utf-8")))
             measurements.append(pair)
         rows = compare(cases, measurements, args.tolerance)
@@ -250,7 +252,8 @@ def main():
     run.add_argument("--timeout", type=int, default=600)
     run.add_argument("--only-case", type=int, help="本地诊断时仅运行指定 case（从 1 开始）")
     summary = commands.add_parser("report")
-    summary.add_argument("--output", required=True)
+    summary.add_argument("--output", required=True, help="gate.json/gate.md 的输出目录")
+    summary.add_argument("--input", help="测量结果输入目录；省略时与 --output 相同")
     summary.add_argument("--cases", default=str(DEFAULT_CASES))
     summary.add_argument("--base-sha", required=True)
     summary.add_argument("--head-sha", required=True)

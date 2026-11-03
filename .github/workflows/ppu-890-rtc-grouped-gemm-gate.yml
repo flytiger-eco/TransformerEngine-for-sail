@@ -138,14 +138,15 @@ jobs:
           BASE_SHA: ${{ steps.scope.outputs.base_sha }}
           HEAD_SHA: ${{ steps.scope.outputs.head_sha }}
           POLICY: ${{ steps.scope.outputs.policy }}
+          REPORT_OUT: ${{ runner.temp }}/rtc-grouped-gemm-report
         run: |
           set -euo pipefail
-          mkdir -p "$NAS_OUT"
+          echo "REPORT_OUT=$REPORT_OUT" >> "$GITHUB_ENV"
           rc=0
-          python3 .github/scripts/rtc_grouped_gemm_gate.py report --output "$NAS_OUT" \
+          python3 .github/scripts/rtc_grouped_gemm_gate.py report --input "$NAS_OUT" --output "$REPORT_OUT" \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --policy "$POLICY" \
             --sweeps 4 --tolerance 0.05 || rc=$?
-          cat "$NAS_OUT/gate.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$REPORT_OUT/gate.md" >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
       - name: 发布或更新 PR 报告
@@ -155,7 +156,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const path = process.env.NAS_OUT + '/gate.md';
+            const path = process.env.REPORT_OUT + '/gate.md';
             if (!fs.existsSync(path)) {
               core.warning('没有生成 RTC 报告，请查看调度或构建日志');
               return;
@@ -179,7 +180,7 @@ jobs:
         with:
           name: te-rtc-grouped-gemm-890P-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ env.NAS_OUT }}/gate.*
+            ${{ env.REPORT_OUT }}/gate.*
             ${{ env.NAS_OUT }}/*.log
             ${{ env.NAS_OUT }}/base/**/*.json
             ${{ env.NAS_OUT }}/base/**/*.log

@@ -27,7 +27,32 @@ build_arm() {
     git -C "$tree" submodule update --init --recursive
     python3 -m venv --system-site-packages "$SCRATCH/$arm-venv"
     local py="$SCRATCH/$arm-venv/bin/python"
-    "$py" -m pip install packaging==24.2 pybind11==3.1.0 wheel nvidia-cudnn-frontend
+    # 先完成纯 wheel 的工具安装；后续依赖生成 metadata 时必须已能使用新 packaging。
+    "$py" -m pip install --upgrade --only-binary=:all: \
+        packaging==24.2 setuptools==75.8.0 wheel==0.45.1 pybind11==3.1.0
+    "$py" - <<'PY'
+import packaging
+import setuptools
+from packaging.utils import canonicalize_version
+from setuptools import _core_metadata
+
+assert canonicalize_version("1.0.0", strip_trailing_zero=False) == "1.0.0"
+assert _core_metadata._distribution_fullname("rtc-ci", "1.0.0") == "rtc_ci-1.0.0"
+print(f"[RTC CI] packaging={packaging.__version__} ({packaging.__file__})")
+print(f"[RTC CI] setuptools={setuptools.__version__} ({setuptools.__file__})")
+PY
+    # TE 只从包 metadata 定位 C++ 头文件，不使用 frontend Python/DSL 运行时。
+    # 固定到项目要求的版本，避免安装额外 CUDA bindings 或替换 SDK 的系统依赖。
+    "$py" -m pip install --upgrade --no-deps --only-binary=:all: nvidia-cudnn-frontend==1.25.0
+    "$py" - <<'PY'
+from importlib.metadata import distribution
+from pathlib import Path
+
+frontend = distribution("nvidia-cudnn-frontend")
+header = Path(frontend.locate_file("include/cudnn_frontend.h"))
+assert header.is_file(), f"cuDNN frontend 缺少构建头文件：{header}"
+print(f"[RTC CI] cuDNN frontend={frontend.version}, header={header}")
+PY
     mkdir -p "$SCRATCH/$arm-wheel"
     (
         cd "$tree"

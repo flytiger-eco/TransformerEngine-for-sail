@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -189,6 +190,173 @@ def test_report_exit_codes(tmp_path, policy, expected):
     # 即使非性能变更，缺失或错误测量也不能显示成成功。
     args.sweeps = 2
     assert GATE.report(args) == 3
+
+
+@pytest.mark.parametrize(
+    "head_time,missing,expected,verdict",
+    [(100.0, False, 0, "PASS"), (106.0, False, 2, "REGRESSION"), (100.0, True, 3, "ERROR")],
+)
+def test_report_readonly_input(tmp_path, monkeypatch, head_time, missing, expected, verdict):
+    measurements = tmp_path / "nas"
+    output = tmp_path / "runner" / "report"
+    for arm, time in (("base", 100.0), ("head", head_time)):
+        directory = measurements / arm / "sweep-0"
+        directory.mkdir(parents=True)
+        if not (missing and arm == "head"):
+            (directory / "results.json").write_text(json.dumps(payload([time] * 27)))
+    before = {p: p.read_bytes() for p in measurements.rglob("*.json")}
+    original_open, original_mkdir = Path.open, Path.mkdir
+
+    # root 也必须受到写入限制，避免 chmod 在本地测试中失效。
+    def readonly_open(path, mode="r", *args, **kwargs):
+        if path.is_relative_to(measurements) and any(flag in mode for flag in "wax+"):
+            raise PermissionError(f"只读 NAS：{path}")
+        return original_open(path, mode, *args, **kwargs)
+
+    def readonly_mkdir(path, *args, **kwargs):
+        if path.is_relative_to(measurements):
+            raise PermissionError(f"只读 NAS：{path}")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", readonly_open)
+    monkeypatch.setattr(Path, "mkdir", readonly_mkdir)
+    args = argparse.Namespace(
+        input=str(measurements),
+        output=str(output),
+        cases=GATE.DEFAULT_CASES,
+        sweeps=1,
+        tolerance=0.05,
+        policy="enforced",
+        base_sha="base",
+        head_sha="head",
+    )
+    assert GATE.report(args) == expected
+    assert json.loads((output / "gate.json").read_text())["verdict"] == verdict
+    assert verdict in (output / "gate.md").read_text()
+    assert {p: p.read_bytes() for p in measurements.rglob("*.json")} == before
+    assert not (measurements / "gate.json").exists()
+
+
+@pytest.mark.parametrize("separate_input", [False, True])
+def test_report_cli_input_compatibility(tmp_path, separate_input):
+    output = tmp_path / "report"
+    measurements = tmp_path / "nas" if separate_input else output
+    for arm in ("base", "head"):
+        directory = measurements / arm / "sweep-0"
+        directory.mkdir(parents=True)
+        (directory / "results.json").write_text(json.dumps(payload([100.0] * 27)))
+    command = [
+        sys.executable,
+        str(ROOT / ".github/scripts/rtc_grouped_gemm_gate.py"),
+        "report",
+        "--output",
+        str(output),
+        "--base-sha",
+        "base",
+        "--head-sha",
+        "head",
+        "--sweeps",
+        "1",
+    ]
+    if separate_input:
+        command += ["--input", str(measurements)]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    assert json.loads((output / "gate.json").read_text())["verdict"] == "PASS"
+
+
+@pytest.mark.parametrize("failure", ["", "packaging==24.2", "nvidia-cudnn-frontend==1.25.0"])
+def test_build_bootstrap_before_frontend(tmp_path, failure):
+    script = (ROOT / "qa/L0_pytorch_grouped_gemm_rtc/test.sh").read_text()
+    function = re.search(r"(?ms)^build_arm\(\) \{.*?^\}", script).group()
+    calls = tmp_path / "calls.jsonl"
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "code = sys.stdin.read() if args == ['-'] else ''\n"
+        "with open(os.environ['CALLS'], 'a') as stream:\n"
+        "    stream.write(json.dumps({'args': args, 'code': code}) + '\\n')\n"
+        "if os.environ['FAILURE'] and os.environ['FAILURE'] in args:\n"
+        "    sys.exit(17)\n"
+        "if args[:3] == ['-m', 'pip', 'wheel']:\n"
+        "    (Path(args[args.index('-w') + 1]) / 'transformer_engine-test.whl').touch()\n"
+    )
+    fake_python.chmod(0o755)
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    shell = (
+        "set -euo pipefail\n"
+        "git() { :; }\n"
+        "python3() {\n"
+        '  [[ "$*" == "-m venv --system-site-packages $SCRATCH/base-venv" ]]\n'
+        '  mkdir -p "$SCRATCH/base-venv/bin"\n'
+        '  ln -s "$FAKE_PYTHON" "$SCRATCH/base-venv/bin/python"\n'
+        "}\n" + function + '\nbuild_arm base "$TREE"\n'
+    )
+    result = subprocess.run(
+        ["bash"],
+        input=shell,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "SCRATCH": str(tmp_path),
+            "TREE": str(tree),
+            "FAKE_PYTHON": str(fake_python),
+            "CALLS": str(calls),
+            "FAILURE": failure,
+        },
+    )
+    recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert result.returncode == (17 if failure else 0), result.stderr
+    bootstrap = recorded[0]["args"]
+    assert bootstrap[:3] == ["-m", "pip", "install"]
+    assert "--upgrade" in bootstrap and "--only-binary=:all:" in bootstrap
+    assert "packaging==24.2" in bootstrap and "setuptools==75.8.0" in bootstrap
+    assert not any("cudnn" in arg for arg in bootstrap)
+    if failure == "packaging==24.2":
+        assert len(recorded) == 1
+        return
+    assert recorded[1]["args"] == ["-"]
+    assert "strip_trailing_zero=False" in recorded[1]["code"]
+    compile(recorded[1]["code"], str(ROOT / "qa/L0_pytorch_grouped_gemm_rtc/test.sh"), "exec")
+    frontend = recorded[2]["args"]
+    assert frontend[:3] == ["-m", "pip", "install"]
+    assert "--no-deps" in frontend and "--only-binary=:all:" in frontend
+    assert "nvidia-cudnn-frontend==1.25.0" in frontend
+    if failure:
+        assert len(recorded) == 3
+        return
+    assert "cudnn_frontend.h" in recorded[3]["code"]
+    compile(recorded[3]["code"], str(ROOT / "qa/L0_pytorch_grouped_gemm_rtc/test.sh"), "exec")
+    assert recorded[4]["args"][:3] == ["-m", "pip", "wheel"]
+    assert "--no-build-isolation" in recorded[4]["args"]
+
+
+def test_workflow_report_paths():
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/ppu-890-rtc-grouped-gemm-gate.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    steps = workflow["jobs"]["gate"]["steps"]
+    report = next(step for step in steps if "--tolerance" in step.get("run", ""))
+    assert report["env"]["REPORT_OUT"] == "${{ runner.temp }}/rtc-grouped-gemm-report"
+    assert 'echo "REPORT_OUT=$REPORT_OUT" >> "$GITHUB_ENV"' in report["run"]
+    assert '--input "$NAS_OUT" --output "$REPORT_OUT"' in report["run"]
+    assert 'mkdir -p "$NAS_OUT"' not in report["run"]
+    assert 'cat "$REPORT_OUT/gate.md"' in report["run"]
+    assert 'exit "$rc"' in report["run"]
+    comment = next(step for step in steps if step.get("uses") == "actions/github-script@v7")
+    assert "process.env.REPORT_OUT + '/gate.md'" in comment["with"]["script"]
+    artifact = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
+    paths = artifact["with"]["path"].splitlines()
+    assert "${{ env.REPORT_OUT }}/gate.*" in paths
+    assert "${{ env.NAS_OUT }}/*.log" in paths
+    assert "${{ env.NAS_OUT }}/base/**/*.json" in paths
+    assert "${{ env.NAS_OUT }}/head/**/*.json" in paths
 
 
 def test_worker_failure_is_recorded(tmp_path):
