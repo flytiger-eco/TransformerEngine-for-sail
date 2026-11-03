@@ -64,7 +64,7 @@ jobs:
     steps:
       - name: "L1 PyTorch 分布式单测 (890P, 4 PPU)"
         if: ${{ !cancelled() }}
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           image: ${{ env.IMAGE }}
           namespace: ${{ env.NAMESPACE }}
