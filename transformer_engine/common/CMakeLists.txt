@@ -601,6 +601,8 @@ make_string_header_from_file(transpose/rtc/cast_transpose_fusion.cu
                              string_code_transpose_rtc_cast_transpose_fusion_cu)
 make_string_header_from_file(transpose/rtc/cast_transpose.cu
                              string_code_transpose_rtc_cast_transpose_cu)
+make_string_header_from_file(transpose/rtc/cast_transpose_pipeline.cu
+                             string_code_transpose_rtc_cast_transpose_pipeline_cu)
 make_string_header_from_file(transpose/rtc/transpose.cu
                              string_code_transpose_rtc_transpose_cu)
 make_string_header_from_file(transpose/rtc/transpose_pipeline.cu
