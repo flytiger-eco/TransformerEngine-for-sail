@@ -1,0 +1,178 @@
+name: ppu-890-rtc-grouped-gemm-gate
+
+# 对所有相关 PR 运行 27 个 case；perf/refactor 和手动运行阻断超过 5% 的退化。
+# 数值错误、RTC 回退、tile 不匹配和基础设施失败始终阻断。
+# 不使用 workflow_run，确保 PR 自身有可用作 required check 的门禁。
+on:
+  pull_request:
+    branches: ['v2.18-SAIL']
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: '性能比较基线分支（使用与当前 head 的 merge-base）'
+        type: string
+        default: 'v2.18-SAIL'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rtc-grouped-gemm-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001'
+  PCCL_URL: 'https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz'
+  NAS_OUT: /wl_nas/te-ci/rtc-grouped-gemm/${{ github.run_id }}-${{ github.run_attempt }}
+  POD_OUT: /mnt/wl_nas/te-ci/rtc-grouped-gemm/${{ github.run_id }}-${{ github.run_attempt }}
+  TE_REPO: ${{ github.server_url }}/${{ github.repository }}.git
+
+jobs:
+  gate:
+    name: RTC GroupGemm gate (890P)
+    # fork 不得自动在有 NAS 写权限的私有 PPU 上执行；维护者可转到仓库内分支验证。
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: k8s-runner-group-cpu-flytiger
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      pull-requests: write
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 验证 case 映射和门禁判定逻辑（CPU）
+        shell: bash
+        run: |
+          python3 -m pip install --target "$RUNNER_TEMP/rtc-gate-deps" pytest==8.2.1 pyyaml==6.0.2
+          PYTHONPATH="$RUNNER_TEMP/rtc-gate-deps" python3 -m pytest -q tests/pytorch/test_rtc_grouped_gemm_ci.py
+
+      - name: 确定改动范围和门禁策略
+        id: scope
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || inputs.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          git check-ref-format --branch "$BASE_REF"
+          git fetch --no-tags origin "$BASE_REF"
+          BASE_SHA=$(git merge-base HEAD FETCH_HEAD)
+          export BASE_SHA
+          python3 - <<'PY'
+          import importlib.util, json, os, subprocess
+          spec = importlib.util.spec_from_file_location('gate', '.github/scripts/rtc_grouped_gemm_gate.py')
+          gate = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(gate)
+          base = os.environ['BASE_SHA']
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          changed = subprocess.check_output(['git', 'diff', '--name-only', '--no-renames', base, head], text=True).splitlines()
+          subjects = subprocess.check_output(['git', 'log', '--format=%s', base + '..' + head], text=True)
+          subjects += '\n' + os.environ.get('PR_TITLE', '')
+          manual = os.environ['EVENT_NAME'] == 'workflow_dispatch'
+          labels = json.loads(os.environ.get('PR_LABELS') or '[]') or []
+          policy = gate.policy_for(subjects, labels, manual)
+          run = manual or any(gate.SCOPE.search(path) for path in changed)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'base_sha={base}\nhead_sha={head}\npolicy={policy}\nrun={str(run).lower()}\n')
+          print(f'::notice::RTC GroupGemm: run={run}, policy={policy}, base={base}, head={head}')
+          PY
+
+      - name: 同一 890P 上构建和配对测试 base/head
+        if: steps.scope.outputs.run == 'true'
+        # 发布步骤根据实际测量强制判定；调度/构建失败不能丢失报告。
+        continue-on-error: true
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.IMAGE }}
+          namespace: ppu-sched
+          node_selector: board-type=ZW-M890P
+          host_volumes: /nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas
+          nnodes: 0
+          nproc_per_node: 1
+          timeout_minutes: 240
+          command: |
+            set -euo pipefail
+            SDK_INSTALL_DIR="${SDK_INSTALL_DIR:-/usr/local}"
+            if [[ -f "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh" ]]; then
+              set +u; source "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh"; set -u
+            fi
+            export PCCL_URL='${{ env.PCCL_URL }}'
+            python3 -c 'import os, urllib.request; urllib.request.urlretrieve(os.environ["PCCL_URL"], "/tmp/pccl.tar.gz")'
+            tar zxf /tmp/pccl.tar.gz -C /usr/local
+            set +u; source /usr/local/pccl/envsetup.sh; set -u
+            export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
+            OUT='${{ env.POD_OUT }}'
+            mkdir -p "$OUT"
+            SRC=$(mktemp -d /tmp/te-rtc-source.XXXXXX)
+            git -C "$SRC" init -q
+            git -C "$SRC" remote add origin '${{ env.TE_REPO }}'
+            git -C "$SRC" fetch --no-tags origin '${{ steps.scope.outputs.head_sha }}' '${{ steps.scope.outputs.base_sha }}'
+            git -C "$SRC" checkout --detach '${{ steps.scope.outputs.head_sha }}'
+            bash "$SRC/qa/L0_pytorch_grouped_gemm_rtc/test.sh" "$SRC" \
+              '${{ steps.scope.outputs.base_sha }}' "$OUT" 2>&1 | tee "$OUT/campaign.log"
+
+      - name: 判定并生成报告
+        if: always() && steps.scope.outputs.run == 'true'
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.scope.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.scope.outputs.head_sha }}
+          POLICY: ${{ steps.scope.outputs.policy }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$NAS_OUT"
+          rc=0
+          python3 .github/scripts/rtc_grouped_gemm_gate.py report --output "$NAS_OUT" \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --policy "$POLICY" \
+            --sweeps 4 --tolerance 0.05 || rc=$?
+          cat "$NAS_OUT/gate.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: 发布或更新 PR 报告
+        if: always() && steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = process.env.NAS_OUT + '/gate.md';
+            if (!fs.existsSync(path)) {
+              core.warning('没有生成 RTC 报告，请查看调度或构建日志');
+              return;
+            }
+            const marker = '<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->';
+            const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = marker + '\n' + fs.readFileSync(path, 'utf8') + '\n运行记录：' + url;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: context.issue.number, per_page: 100
+            });
+            const existing = comments.find(c => c.user.login === 'github-actions[bot]' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({...context.repo, comment_id: existing.id, body});
+            } else {
+              await github.rest.issues.createComment({...context.repo, issue_number: context.issue.number, body});
+            }
+
+      - name: 上传逐 case 结果和构建日志
+        if: always() && steps.scope.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: te-rtc-grouped-gemm-890P-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.NAS_OUT }}/gate.*
+            ${{ env.NAS_OUT }}/*.log
+            ${{ env.NAS_OUT }}/base/**/*.json
+            ${{ env.NAS_OUT }}/base/**/*.log
+            ${{ env.NAS_OUT }}/head/**/*.json
+            ${{ env.NAS_OUT }}/head/**/*.log
+          if-no-files-found: error
