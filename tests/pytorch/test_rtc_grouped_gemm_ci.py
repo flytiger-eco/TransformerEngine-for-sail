@@ -209,6 +209,33 @@ def test_worker_failure_is_recorded(tmp_path):
     assert not result["results"]
 
 
+def test_workflow_bootstraps_cpu_python():
+    yaml = pytest.importorskip("yaml")
+    path = ROOT / ".github/workflows/ppu-890-rtc-grouped-gemm-gate.yml"
+    workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"]["gate"]["steps"]
+    setups = [i for i, step in enumerate(steps) if step.get("uses") == "actions/setup-python@v5"]
+    assert len(setups) == 1, "精简 runner 必须显式准备包含 pip 的 Python"
+    setup_index = setups[0]
+    setup = steps[setup_index]
+    assert setup["with"]["python-version"] == "3.12"
+    assert setup["with"]["update-environment"] == "true"
+    assert setup["env"]["AGENT_TOOLSDIRECTORY"] == "${{ runner.temp }}/rtc-python"
+    assert not setup.get("if")
+    assert setup.get("continue-on-error", "false") == "false"
+    # 仅检查 runner 的 run 步骤；PPU pod 的 command 使用 SDK 镜像自己的 Python。
+    consumers = [(i, step) for i, step in enumerate(steps) if "python3" in step.get("run", "")]
+    assert len(consumers) >= 3
+    for index, step in consumers:
+        assert index > setup_index, "安装依赖、范围判定和报告都必须在 Python 准备之后"
+        assert step["shell"] == "bash"
+    install = next(step["run"] for _, step in consumers if "python3 -m pip install" in step["run"])
+    assert "python3 -m pip --version" in install
+    assert install.index("python3 -m pip --version") < install.index("python3 -m pip install")
+    assert '--target "$RUNNER_TEMP/rtc-gate-deps"' in install
+    assert "pytest==8.2.1 pyyaml==6.0.2" in install
+
+
 def test_workflow_and_shell_syntax():
     yaml = pytest.importorskip("yaml")
     path = ROOT / ".github/workflows/ppu-890-rtc-grouped-gemm-gate.yml"

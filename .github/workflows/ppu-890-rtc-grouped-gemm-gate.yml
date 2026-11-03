@@ -48,9 +48,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # 精简 runner 的系统 Python 没有 pip；工具缓存放在当前 job 的可写临时目录。
+      - name: 准备 CPU Python 和 pip
+        uses: actions/setup-python@v5
+        env:
+          AGENT_TOOLSDIRECTORY: ${{ runner.temp }}/rtc-python
+        with:
+          python-version: '3.12'
+          update-environment: true
+
       - name: 验证 case 映射和门禁判定逻辑（CPU）
         shell: bash
         run: |
+          python3 -m pip --version
           python3 -m pip install --target "$RUNNER_TEMP/rtc-gate-deps" pytest==8.2.1 pyyaml==6.0.2
           PYTHONPATH="$RUNNER_TEMP/rtc-gate-deps" python3 -m pytest -q tests/pytorch/test_rtc_grouped_gemm_ci.py
 
