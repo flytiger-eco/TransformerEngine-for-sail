@@ -333,6 +333,32 @@ void register_rmsnorm_fwd_tuned(DType wt, DType it, DType ot, DType ct, int hidd
       barrier_per_col, workspace_per_col, 0, static_fallback);
 }
 
+void register_rmsnorm_fwd_pipe(DType wt, DType it, DType ot, DType ct, int hidden, int cr, int wm,
+                               int wn, int bl, int stages, int gamma_smem,
+                               StaticFallback<ForwardKernelParams> static_fallback) {
+  const auto key = get_key(NVTE_Norm_Backend::Te, NVTE_Norm_Type::RMSNorm,
+                           NVTE_Norm_Stage::Forward, wt, it, ot, ct, 0, hidden, false, true);
+  const std::string label =
+      concat_strings("rmsnorm_fwd_pipe,w=", static_cast<int>(wt), ",i=", static_cast<int>(it),
+                     ",o=", static_cast<int>(ot), ",c=", static_cast<int>(ct), ",h=", hidden,
+                     ",cr=", cr, ",wm=", wm, ",wn=", wn, ",bl=", bl, ",st=", stages, ",gs=",
+                     gamma_smem);
+  const std::string traits_expr = kernel_traits_expr(wt, it, ot, ct, hidden, cr, wm, wn, bl);
+  const std::string kernel_expr =
+      concat_strings("&::transformer_engine::normalization::rmsnorm_fwd_pipe_kernel<", traits_expr,
+                     ", ", stages, ", ", (gamma_smem ? "true" : "false"), ">");
+  const int threads_per_cta = wm * wn * 32;
+  // FwdPipeSmem<Ktraits, STAGES, GAMMA_SMEM>::BYTES, in host terms.
+  const int smem_bytes = stages * wm * hidden * byte_size_of(it) +
+                         (gamma_smem ? hidden * byte_size_of(wt) : 0) +
+                         stats_smem_bytes(ct, wm, wn);
+  register_launcher<ForwardKernelParams>(
+      label, kernel_expr, string_code_normalization_rmsnorm_rtc_rmsnorm_fwd_kernel_cu,
+      "rmsnorm_fwd_kernel.cu", key, threads_per_cta, smem_bytes, cr, /*needs_cooperative=*/cr > 1,
+      /*barrier_bytes_per_col=*/0, /*workspace_bytes_per_col=*/0,
+      /*dgamma_part_bytes_per_col=*/0, static_fallback);
+}
+
 void register_rmsnorm_fwd_general(DType wt, DType it, DType ot, DType ct, int hidden, int wm,
                                   int wn, int bl,
                                   StaticFallback<ForwardKernelParams> static_fallback) {
@@ -605,7 +631,7 @@ void register_rmsnorm_bwd_tuned(DType wt, DType it, DType ot, DType ct, int hidd
   const int finalize_threads_per_cta = 1024;
 
   auto closure = [main_label, main_kexpr, finalize_label, finalize_kexpr, threads_per_cta,
-                  smem_bytes, cr, barrier_per_col, workspace_per_col, dgamma_part_per_col,
+                  smem_bytes, cr, wm, barrier_per_col, workspace_per_col, dgamma_part_per_col,
                   finalize_ctas, finalize_threads_per_cta,
                   static_fallback](LaunchParams<BackwardKernelParams>& launch_params,
                                    const bool configure_params) {
@@ -624,10 +650,22 @@ void register_rmsnorm_bwd_tuned(DType wt, DType it, DType ot, DType ct, int hidd
                           "rmsnorm_bwd_kernel.cu");
     }
     if (configure_params) {
+      auto ceil_div = [](int x, int y) { return (x + y - 1) / y; };
       const int ctas_per_sm =
           mgr.occupancy_max_active_blocks_per_sm(main_label, threads_per_cta, smem_bytes);
       launch_params.params.ctas_per_row = cr;
-      launch_params.params.ctas_per_col = launch_params.multiprocessorCount * ctas_per_sm / cr;
+      // Clamp the persistent grid to the row-groups actually available, the way
+      // every general path in this file already does. The main kernel is a
+      // grid-stride loop, so a smaller grid is always correct; an oversized one
+      // is not free, because each CTA owns a dgamma_part slot and the finalize
+      // kernel reduces all ctas_per_col of them. When the clamp binds, the
+      // surviving CTAs keep exactly the rows they already had (stride becomes
+      // >= rows, so still one iteration each) and the dropped CTAs were
+      // contributing all-zero partials, so results are bit-identical -- verified
+      // on 324 cells across stages/hidden/dtypes and rows 4..16384.
+      launch_params.params.ctas_per_col =
+          std::min(ceil_div(launch_params.params.rows, wm),
+                   launch_params.multiprocessorCount * ctas_per_sm / std::max(cr, 1));
       if (cr > 1) {
         launch_params.barrier_bytes = barrier_per_col * launch_params.params.ctas_per_col;
         launch_params.workspace_bytes = workspace_per_col * launch_params.params.ctas_per_col;

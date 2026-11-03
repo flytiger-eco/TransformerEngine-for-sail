@@ -59,6 +59,36 @@ void launch_rmsnorm_fwd_tuned_(LaunchParams<ForwardKernelParams> &launch_params,
 }
 
 template <typename weight_t, typename input_t, typename output_t, typename compute_t,
+          typename index_t, int HIDDEN_SIZE, int CTAS_PER_ROW, int WARPS_M, int WARPS_N,
+          int BYTES_PER_LDG, int STAGES, bool GAMMA_SMEM>
+void launch_rmsnorm_fwd_pipe_(LaunchParams<ForwardKernelParams> &launch_params,
+                              const bool configure_params) {  // NOLINT(*)
+  static_assert(CTAS_PER_ROW == 1, "rmsnorm_fwd_pipe_kernel is single-CTA per row group");
+  using Kernel_traits = Kernel_traits<weight_t, input_t, output_t, compute_t, index_t, HIDDEN_SIZE,
+                                      CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG>;
+  using Smem = FwdPipeSmem<Kernel_traits, STAGES, GAMMA_SMEM>;
+  auto kernel = &rmsnorm_fwd_pipe_kernel<Kernel_traits, STAGES, GAMMA_SMEM>;
+
+  if (configure_params) {
+    int ctas_per_sm;
+    NVTE_CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, Smem::BYTES));
+    launch_params.params.ctas_per_row = CTAS_PER_ROW;
+    launch_params.params.ctas_per_col =
+        launch_params.multiprocessorCount * ctas_per_sm / CTAS_PER_ROW;
+    return;
+  }
+
+  if (Smem::BYTES >= 48 * 1024) {
+    NVTE_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         Smem::BYTES));
+  }
+  kernel<<<launch_params.params.ctas_per_col, Kernel_traits::THREADS_PER_CTA, Smem::BYTES,
+           launch_params.stream>>>(launch_params.params);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
+template <typename weight_t, typename input_t, typename output_t, typename compute_t,
           typename index_t, int HIDDEN_SIZE, int WARPS_M, int WARPS_N, int BYTES_PER_LDG>
 void launch_rmsnorm_fwd_general_(LaunchParams<ForwardKernelParams> &launch_params,
                                  const bool configure_params) {  // NOLINT(*)
@@ -127,6 +157,18 @@ void launch_rmsnorm_fwd_general_(LaunchParams<ForwardKernelParams> &launch_param
             return 0;                                                                                                     \
           })()
 
+#define REGISTER_NORM_LAUNCHER_RMSN_FWD_pipe(HIDDEN_SIZE, WTYPE, ITYPE, OTYPE, CTYPE, CTAS_PER_ROW, \
+                                             WARPS_M, WARPS_N, BYTES_PER_LDG, STAGES, GAMMA_SMEM,  \
+                                             STATIC_FALLBACK)                                     \
+  [[maybe_unused]] static const int _rmsn_fwd_pipe_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##OTYPE##_##CTYPE##_##CTAS_PER_ROW##_##WARPS_M##_##WARPS_N##_##BYTES_PER_LDG##_##STAGES##_##GAMMA_SMEM = \
+      ([] {                                                                                           \
+        ::transformer_engine::normalization::rtc_norm::register_rmsnorm_fwd_pipe(                     \
+            TypeToDType<WTYPE>::value, TypeToDType<ITYPE>::value, TypeToDType<OTYPE>::value,          \
+            TypeToDType<CTYPE>::value, HIDDEN_SIZE, CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG,    \
+            STAGES, GAMMA_SMEM, STATIC_FALLBACK);                                                     \
+        return 0;                                                                                     \
+      })()
+
 #if NVTE_BUILD_LEGACY_STATIC_NORM
 #define REGISTER_NORM_LAUNCHER(NORM_TYPE, NORM_STAGE, LAUNCH_TYPE, HIDDEN_SIZE, WTYPE, ITYPE,                   \
                                OTYPE, CTYPE, ...)                                                               \
@@ -150,6 +192,10 @@ void launch_rmsnorm_fwd_general_(LaunchParams<ForwardKernelParams> &launch_param
 
 // Create rmsnorm tuned launch function and register. Macro signature:
 //  HIDDEN_SIZE, WTYPE, ITYPE, OTYPE, CTYPE, CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG
+// The `pipe` rows below use rmsnorm_fwd_pipe_kernel and append
+//  STAGES, GAMMA_SMEM
+// (cp.async row prefetch depth, gamma staged in smem instead of registers).
+// They are only used for non-fp8 outputs; fp8 entries stay on the tuned kernel.
 
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 512, bf16, bf16, fp8e4m3, fp32, 1, 4, 1, 16);
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 512, fp16, fp16, fp8e4m3, fp32, 1, 4, 1, 16);
@@ -183,15 +229,15 @@ REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 4096, bf16, bf16, fp8e4m3, fp32,
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 4096, fp16, fp16, fp8e4m3, fp32, 1, 1, 4, 16);
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 4096, fp32, fp32, fp8e4m3, fp32, 1, 1, 4, 16);
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 4096, fp32, fp32, fp32, fp32, 1, 1, 4, 16);
-REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 4096, fp16, fp16, fp16, fp32, 1, 1, 4, 16);
-REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 4096, bf16, bf16, bf16, fp32, 1, 1, 4, 16);
+REGISTER_NORM_LAUNCHER(RMSNorm, Forward, pipe, 4096, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 3, 0);
+REGISTER_NORM_LAUNCHER(RMSNorm, Forward, pipe, 4096, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 2, 1);
 
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 8192, bf16, bf16, fp8e4m3, fp32, 1, 1, 4, 16);
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 8192, fp16, fp16, fp8e4m3, fp32, 1, 1, 4, 16);
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 8192, fp32, fp32, fp8e4m3, fp32, 1, 1, 4, 16);
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 8192, fp32, fp32, fp32, fp32, 1, 1, 4, 16);
-REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 8192, fp16, fp16, fp16, fp32, 1, 1, 4, 16);
-REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 8192, bf16, bf16, bf16, fp32, 1, 1, 4, 16);
+REGISTER_NORM_LAUNCHER(RMSNorm, Forward, pipe, 8192, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 1, 1);
+REGISTER_NORM_LAUNCHER(RMSNorm, Forward, pipe, 8192, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 1, 1);
 
 // Create rmsnorm general launch function and register. Macro signature:
 //  HIDDEN_SIZE, WTYPE, ITYPE, OTYPE, CTYPE, WARPS_M, WARPS_N, BYTES_PER_LDG

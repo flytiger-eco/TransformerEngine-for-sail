@@ -141,6 +141,18 @@ struct Kernel_traits : public Base {
   enum { SMEM_BYTES_FWD = Stats::SMEM_BYTES };
 };
 
+// Dynamic smem requirement of rmsnorm_fwd_pipe_kernel<Ktraits, STAGES, GAMMA_SMEM>:
+//   STAGES staged row groups + optional gamma copy + the Stats reduction scratch.
+template <typename Ktraits, int STAGES, bool GAMMA_SMEM>
+struct FwdPipeSmem {
+  enum {
+    BYTES = STAGES * Ktraits::ROWS_PER_CTA * Ktraits::COLS *
+                static_cast<int>(sizeof(typename Ktraits::input_t)) +
+            (GAMMA_SMEM ? Ktraits::COLS * static_cast<int>(sizeof(typename Ktraits::weight_t)) : 0) +
+            Ktraits::SMEM_BYTES_FWD
+  };
+};
+
 }  // namespace normalization
 }  // namespace transformer_engine
 

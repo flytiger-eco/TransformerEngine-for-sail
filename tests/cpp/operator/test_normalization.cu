@@ -237,6 +237,22 @@ std::vector<std::pair<size_t, size_t>> test_cases = {
   {2048, 12288},
 };
 
+// Tuned-bucket coverage. The four shapes above have hidden sizes 229/541/6144/12288,
+// none of which is a tuned bucket, so they only ever exercise the *general*
+// kernels. The RMSNorm tuned launch table (the exact-hidden buckets below, gated
+// on 16B-aligned pointers and rows % 4 == 0) is what the launch-geometry tuning
+// changes, so it needs its own cases. Rows are all multiples of 4 to stay on the
+// tuned path.
+std::vector<std::pair<size_t, size_t>> tuned_test_cases = [] {
+  std::vector<std::pair<size_t, size_t>> v;
+  for (size_t rows : {4, 256, 4096}) {
+    for (size_t hidden : {512, 768, 1024, 2048, 4096, 8192}) {
+      v.emplace_back(rows, hidden);
+    }
+  }
+  return v;
+}();
+
 }  // namespace
 
 class NormTestSuite : public ::testing::TestWithParam<std::tuple<bool,
@@ -301,4 +317,30 @@ INSTANTIATE_TEST_SUITE_P(
       std::to_string(std::get<6>(info.param)) + "X" +
       std::to_string(std::get<7>(info.param));
     return name;
+  });
+
+// Tuned-bucket suite: Te backend, RMSNorm, matched in/out dtypes only (the tuned
+// table registers matched WTYPE/ITYPE/OTYPE triples; mixed dtypes stay on the
+// general path and are already covered above). Both plain Backward and fused
+// BackwardAdd are covered, since the launch-geometry change touches both tables.
+INSTANTIATE_TEST_SUITE_P(
+  OperatorTunedTest,
+  NormTestSuite,
+  ::testing::ValuesIn([] {
+    std::vector<NormTestSuite::ParamType> v;
+    for (const auto& dt : {DType::kFloat32, DType::kBFloat16, DType::kFloat16}) {
+      for (const auto& shape : tuned_test_cases) {
+        for (const bool fused_bwd_add : {false, true}) {
+          v.emplace_back(false, NormType::RMSNorm, dt, dt, shape, false, false, fused_bwd_add);
+        }
+      }
+    }
+    return v;
+  }()),
+  [](const testing::TestParamInfo<NormTestSuite::ParamType>& info) {
+    return "TeTuned_" +
+      test::typeName(std::get<2>(info.param)) + "X" +
+      std::to_string(std::get<4>(info.param).first) + "X" +
+      std::to_string(std::get<4>(info.param).second) + "X" +
+      (std::get<7>(info.param) ? "fusedadd" : "bwd");
   });

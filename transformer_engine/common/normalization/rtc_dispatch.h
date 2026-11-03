@@ -46,6 +46,13 @@ void register_ln_bwd_general(DType wtype, DType itype, DType otype, DType ctype,
 void register_rmsnorm_fwd_tuned(DType wtype, DType itype, DType otype, DType ctype, int hidden_size,
                                 int ctas_per_row, int warps_m, int warps_n, int bytes_per_ldg,
                                 StaticFallback<ForwardKernelParams> static_fallback = nullptr);
+// RMSNorm forward with cp.async row prefetch (STAGES row buffers, optional
+// gamma staged in smem). Registered under the same tuned key as
+// register_rmsnorm_fwd_tuned; the caller picks one per (hidden, dtype).
+void register_rmsnorm_fwd_pipe(DType wtype, DType itype, DType otype, DType ctype, int hidden_size,
+                               int ctas_per_row, int warps_m, int warps_n, int bytes_per_ldg,
+                               int stages, int gamma_smem,
+                               StaticFallback<ForwardKernelParams> static_fallback = nullptr);
 void register_rmsnorm_fwd_general(DType wtype, DType itype, DType otype, DType ctype,
                                   int hidden_size, int warps_m, int warps_n, int bytes_per_ldg,
                                   StaticFallback<ForwardKernelParams> static_fallback = nullptr);

@@ -21,6 +21,21 @@
 namespace transformer_engine {
 namespace normalization {
 
+// 16B async copy / group bookkeeping used by rmsnorm_fwd_pipe_kernel below.
+__device__ __forceinline__ void cp_async_16B(void *smem_dst, const void *gmem_src) {
+  unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem_dst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem_src));
+}
+
+__device__ __forceinline__ void cp_async_commit_group() {
+  asm volatile("cp.async.commit_group;\n");
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+
 template <typename Ktraits>
 __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_kernel(
     ForwardKernelParams params) {
@@ -81,25 +96,29 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_ke
   for (int row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA) {
     Ivec x[LDGS];
     index_t idx = row * Ktraits::VEC_COLS + c;
-    compute_t xf[LDGS * NUM_ELTS];
+    // RMSNorm never needs the mean, so one pass over the row suffices: fold each
+    // element into the sum of squares as it is converted. That removes the fp32
+    // materialization of the whole row (LDGS * NUM_ELTS live floats, e.g. 64
+    // registers at h=8192), which existed only so the second stats pass could
+    // revisit the values. The output phase below reconverts from the packed x[];
+    // that is exact, since compute_t is at least as wide as input_t.
+    compute_t local_sum_squares = Zeros<compute_t>::get();
 #pragma unroll
     for (int it = 0; it < LDGS; it++) {
       x[it].load_from(params.x, idx);
 #pragma unroll
       for (int jt = 0; jt < NUM_ELTS; jt++) {
         compute_t x_ij = compute_t(x[it].data.elt[jt]);
-        xf[it * NUM_ELTS + jt] = x_ij;
+        local_sum_squares += x_ij * x_ij;
       }
       idx += VEC_COLS_PER_LDG;
     }
 
-    stats_t s = stats.compute(xf, rn);
+    stats_t s = stats.template compute_sum_squares<LDGS * NUM_ELTS>(local_sum_squares);
 
-    compute_t mu = Get<0>::of<stats_t, compute_t>(s);
     compute_t m2 = Get<1>::of<stats_t, compute_t>(s);
-    // reciprocal of root mean square
-    // we could optimize here to count mean square directly
-    compute_t rs = rsqrtf(rn * m2 + mu * mu + params.epsilon);
+    // reciprocal of root mean square; m2 is already sum(x^2) over the row
+    compute_t rs = rsqrtf(rn * m2 + params.epsilon);
 
     if (bidn == 0 && warp_n == 0 && lane == 0) {
       rs_ptr[row] = rs;
@@ -111,7 +130,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_ke
     for (int it = 0; it < LDGS; it++) {
 #pragma unroll
       for (int jt = 0; jt < NUM_ELTS; jt++) {
-        compute_t y_ij = rs * (xf[it * NUM_ELTS + jt]);
+        compute_t y_ij = rs * compute_t(x[it].data.elt[jt]);
         compute_t g_ij = gamma[it].data.elt[jt];
         if (params.zero_centered_gamma) {
           g_ij += 1;
@@ -312,6 +331,209 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_general_
     // Update scale-inverse
     if (blockIdx.x == 0 && threadIdx.x == 0 && params.scale_inv != nullptr) {
       reciprocal<compute_t>(reinterpret_cast<compute_t *>(params.scale_inv), scale);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pipelined forward: cp.async row prefetch into shared memory, optional gamma
+// staged in shared memory. Arithmetic and reduction order are identical to
+// rmsnorm_fwd_tuned_kernel, so for the same (WARPS_M, WARPS_N) the outputs are
+// bit-identical; what changes is register pressure (hence occupancy) and the
+// amount of memory traffic kept in flight per CTA.
+//
+//   STAGES == 1 : no pipeline; x stays packed in registers.
+//   STAGES >= 2 : each row is staged in smem via cp.async and read twice
+//                 (sum of squares, then output), so no row data lives in
+//                 registers across the reduction. One commit_group is issued
+//                 per row even when the row is out of range, which keeps the
+//                 wait_group<STAGES-1> accounting aligned for every thread.
+// ---------------------------------------------------------------------------
+template <typename Ktraits, int STAGES, bool GAMMA_SMEM>
+__global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_pipe_kernel(
+    ForwardKernelParams params) {
+  enum { WARPS_M = Ktraits::WARPS_M };
+  enum { WARPS_N = Ktraits::WARPS_N };
+  enum { LDGS = Ktraits::LDGS };
+  enum { NUM_ELTS = Ktraits::NUM_ELTS };
+  enum { THREADS = Ktraits::THREADS_PER_CTA };
+  enum { VCPL = Ktraits::VEC_COLS_PER_LDG };
+  enum { COLS = Ktraits::COLS };
+
+  static_assert(Ktraits::CTAS_PER_ROW == 1, "pipe kernel: single CTA per row group");
+  static_assert(Ktraits::WARPS_M == 1 || Ktraits::WARPS_N == 1,
+                "multi-row per CTA requires WARPS_N == 1 (one barrier per row)");
+
+  using input_t = typename Ktraits::input_t;
+  using weight_t = typename Ktraits::weight_t;
+  using output_t = typename Ktraits::output_t;
+  using compute_t = typename Ktraits::compute_t;
+  using index_t = typename Ktraits::index_t;
+  using Ivec = typename Ktraits::Ivec;
+  using Ovec = typename Ktraits::Ovec;
+  using Wvec = typename Ktraits::Wvec;
+  using Stats = typename Ktraits::Stats;
+  using stats_t = typename Stats::stats_t;
+
+  extern __shared__ char smem_[];
+  constexpr size_t ROWGROUP = size_t(WARPS_M) * COLS;  // elements per staged row group
+  input_t *stage = reinterpret_cast<input_t *>(smem_);
+  weight_t *gsmem = reinterpret_cast<weight_t *>(stage + size_t(STAGES) * ROWGROUP);
+  char *stats_smem = reinterpret_cast<char *>(gsmem + (GAMMA_SMEM ? COLS : 0));
+
+  const index_t tidx = threadIdx.x;
+  const index_t lane = tidx % THREADS_PER_WARP;
+  const index_t warp = tidx / THREADS_PER_WARP;
+  const index_t warp_m = warp / WARPS_N;
+  const index_t warp_n = warp % WARPS_N;
+
+  const index_t r0 = blockIdx.x * WARPS_M + warp_m;
+  const index_t c = warp_n * THREADS_PER_WARP + lane;
+  const index_t stride = params.ctas_per_col * WARPS_M;
+
+  Stats stats(params, blockIdx.x, 0, warp_m, warp_n, lane, stats_smem);
+
+  if (GAMMA_SMEM) {
+    for (index_t v = tidx; v < Ktraits::VEC_COLS; v += THREADS) {
+      Wvec g;
+      g.load_from(params.gamma, v);
+      g.store_to(gsmem, v);
+    }
+    __syncthreads();
+  }
+
+  Wvec gamma[GAMMA_SMEM ? 1 : LDGS];
+  if (!GAMMA_SMEM) {
+    index_t idx = c;
+#pragma unroll
+    for (int it = 0; it < LDGS; it++) {
+      gamma[it].load_from(params.gamma, idx);
+      idx += VCPL;
+    }
+  }
+
+  constexpr compute_t rn = 1.f / compute_t(COLS);
+  compute_t amax = 0;
+  const bool requires_amax = params.amax != nullptr;
+
+  if (STAGES > 1) {
+#pragma unroll
+    for (int s = 0; s < STAGES; s++) {
+      const index_t row = r0 + index_t(s) * stride;
+      if (row < params.rows) {
+        input_t *dst = stage + size_t(s) * ROWGROUP;
+        index_t off = row * COLS + c * NUM_ELTS;
+#pragma unroll
+        for (int it = 0; it < LDGS; it++) {
+          cp_async_16B(dst + (size_t(it) * THREADS + tidx) * NUM_ELTS,
+                       static_cast<const input_t *>(params.x) + off);
+          off += VCPL * NUM_ELTS;
+        }
+      }
+      cp_async_commit_group();
+    }
+  }
+
+  index_t i = 0;
+  for (index_t row = r0; row < params.rows; row += stride, ++i) {
+    Ivec x[STAGES > 1 ? 1 : LDGS];
+    const input_t *src = stage + size_t(i % STAGES) * ROWGROUP;
+    if (STAGES > 1) {
+      cp_async_wait_group<STAGES - 1>();
+    } else {
+      index_t idx = row * Ktraits::VEC_COLS + c;
+#pragma unroll
+      for (int it = 0; it < LDGS; it++) {
+        x[it].load_from(params.x, idx);
+        idx += VCPL;
+      }
+    }
+
+    compute_t local_sum_squares = Zeros<compute_t>::get();
+#pragma unroll
+    for (int it = 0; it < LDGS; it++) {
+      Ivec xv;
+      if (STAGES > 1) {
+        xv.load_from(src, size_t(it) * THREADS + tidx);
+      } else {
+        xv = x[it];
+      }
+#pragma unroll
+      for (int jt = 0; jt < NUM_ELTS; jt++) {
+        compute_t x_ij = compute_t(xv.data.elt[jt]);
+        local_sum_squares += x_ij * x_ij;
+      }
+    }
+
+    stats_t s = stats.template compute_sum_squares<LDGS * NUM_ELTS>(local_sum_squares);
+    compute_t m2 = Get<1>::of<stats_t, compute_t>(s);
+    compute_t rs = rsqrtf(rn * m2 + params.epsilon);
+
+    if (warp_n == 0 && lane == 0) {
+      static_cast<compute_t *>(params.rs)[row] = rs;
+    }
+
+    index_t idx = row * Ktraits::VEC_COLS + c;
+#pragma unroll
+    for (int it = 0; it < LDGS; it++) {
+      Ivec xv;
+      if (STAGES > 1) {
+        xv.load_from(src, size_t(it) * THREADS + tidx);
+      } else {
+        xv = x[it];
+      }
+      Ovec zv;
+#pragma unroll
+      for (int jt = 0; jt < NUM_ELTS; jt++) {
+        compute_t y_ij = rs * compute_t(xv.data.elt[jt]);
+        compute_t g_ij;
+        if (GAMMA_SMEM) {
+          Wvec g;
+          g.load_from(gsmem, c + it * VCPL);
+          g_ij = compute_t(g.data.elt[jt]);
+        } else {
+          g_ij = compute_t(gamma[it].data.elt[jt]);
+        }
+        if (params.zero_centered_gamma) {
+          g_ij += 1;
+        }
+        compute_t temp_output = g_ij * y_ij;
+        if (requires_amax) {
+          __builtin_assume(amax >= 0);
+          if (params.fp8_out) {
+            amax = fmaxf(amax, fabsf(temp_output));
+          } else {
+            output_t out_t_val = output_t(temp_output);
+            amax = fmaxf(amax, fabsf(compute_t(out_t_val)));
+          }
+        }
+        zv.data.elt[jt] = output_t(temp_output);
+      }
+      zv.store_to(params.z, idx);
+      idx += VCPL;
+    }
+
+    if (STAGES > 1) {
+      const index_t next_row = r0 + (i + STAGES) * stride;
+      if (next_row < params.rows) {
+        input_t *dst = stage + size_t(i % STAGES) * ROWGROUP;
+        index_t off = next_row * COLS + c * NUM_ELTS;
+#pragma unroll
+        for (int it = 0; it < LDGS; it++) {
+          cp_async_16B(dst + (size_t(it) * THREADS + tidx) * NUM_ELTS,
+                       static_cast<const input_t *>(params.x) + off);
+          off += VCPL * NUM_ELTS;
+        }
+      }
+      cp_async_commit_group();
+    }
+  }
+
+  if (requires_amax) {
+    amax = reduce_max<WARPS_M * WARPS_N>(amax, warp);
+    if (threadIdx.x == 0) {
+      static_assert(transformer_engine::detail::is_same<compute_t, float>::value);
+      atomicMaxFloat(reinterpret_cast<compute_t *>(params.amax), amax);
     }
   }
 }

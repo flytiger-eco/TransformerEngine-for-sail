@@ -814,6 +814,43 @@ struct Stats<T, 1, WARPS_M, WARPS_N> {
 
     return {m, m2};
   }
+
+  // Single-pass companion to compute(), for RMSNorm. N is the caller's per-thread
+  // element count, needed only to size the Chan update. Every warp reports a mean
+  // of exactly zero, so delta == 0 and the correction term vanishes exactly --
+  // warp_chan_upd_dynamic degenerates to a plain sum of the per-warp sums of
+  // squares, walked in the same shuffle tree as compute() uses. The returned mean
+  // slot is zero and must not be read.
+  template <uint32_t N>
+  inline __device__ stats_t compute_sum_squares(T local_sum_squares) {
+    stats_t *smem = use0_ ? smem0_ : smem1_;
+    use0_ = !use0_;
+    stats_t warp_stats = warp_stats_.compute_sum_squares(local_sum_squares);
+
+    // Each warp leader stores its stats
+    const auto warp_n = warp_stats_.reducer_.warp_n_;
+    const auto lane = warp_stats_.reducer_.lane_;
+    if (lane == 0) {
+      smem[warp_n] = warp_stats;
+    }
+    __syncthreads();
+
+    T n = Zeros<T>::get();
+    T m = Zeros<T>::get();
+    T m2 = Zeros<T>::get();
+
+    static_assert(WARPS_N <= 32);
+    if (lane < WARPS_N) {
+      stats_t result = smem[lane];
+      n = N * THREADS_PER_WARP;
+      m = transformer_engine::Get<0>::of<stats_t, T>(result);
+      m2 = transformer_engine::Get<1>::of<stats_t, T>(result);
+    }
+
+    warp_chan_upd_dynamic(m, m2, n, WARPS_N);
+
+    return {m, m2};
+  }
   WarpStats warp_stats_;
   stats_t *smem0_;
   stats_t *smem1_;
@@ -855,6 +892,21 @@ struct Stats<T, 1, WARPS_M, 1> {
     m2 = reducer_.allreduce(m2, sum);
 
     return {m, m2};
+  }
+
+  // Single-pass entry point for RMSNorm, which needs sum(x^2) and nothing else:
+  // rsqrt(mean(x^2) + eps) == rsqrt(var + mean^2 + eps), the quantity compute()
+  // above reconstructs from its two passes. Taking one pass lets the caller fold
+  // each element into the sum as it is converted, instead of holding a whole fp32
+  // row live in registers purely so the second pass can revisit it. The mean slot
+  // is returned as zero; see compute_sum_squares at the WARPS_N level.
+  //
+  // Also strictly better conditioned than the two-pass form: sum(x^2) accumulates
+  // non-negative terms, so there is no cancellation at all, whereas var + mean^2
+  // cancels to get var and is then dominated by the rounding error of mean^2.
+  inline __device__ stats_t compute_sum_squares(T local_sum_squares) {
+    auto sum = Sum<T>();
+    return {Zeros<T>::get(), reducer_.allreduce(local_sum_squares, sum)};
   }
 
   Reducer reducer_;
