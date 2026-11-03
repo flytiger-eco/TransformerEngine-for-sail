@@ -9,8 +9,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -264,7 +266,9 @@ def test_report_cli_input_compatibility(tmp_path, separate_input):
     assert json.loads((output / "gate.json").read_text())["verdict"] == "PASS"
 
 
-@pytest.mark.parametrize("failure", ["", "packaging==24.2", "nvidia-cudnn-frontend==1.25.0"])
+@pytest.mark.parametrize(
+    "failure", ["", "packaging==24.2", "nvidia-cudnn-frontend==1.25.0", "pydantic", "preflight"]
+)
 def test_build_bootstrap_before_frontend(tmp_path, failure):
     script = (ROOT / "qa/L0_pytorch_grouped_gemm_rtc/test.sh").read_text()
     function = re.search(r"(?ms)^build_arm\(\) \{.*?^\}", script).group()
@@ -277,7 +281,9 @@ def test_build_bootstrap_before_frontend(tmp_path, failure):
         "args = sys.argv[1:]\n"
         "code = sys.stdin.read() if args == ['-'] else ''\n"
         "with open(os.environ['CALLS'], 'a') as stream:\n"
-        "    stream.write(json.dumps({'args': args, 'code': code}) + '\\n')\n"
+        "    stream.write(json.dumps({'args': args, 'code': code, 'cwd': os.getcwd()}) + '\\n')\n"
+        "if os.environ['FAILURE'] == 'preflight' and 'general_grouped_gemm' in code:\n"
+        "    sys.exit(17)\n"
         "if os.environ['FAILURE'] and os.environ['FAILURE'] in args:\n"
         "    sys.exit(17)\n"
         "if args[:3] == ['-m', 'pip', 'wheel']:\n"
@@ -326,13 +332,134 @@ def test_build_bootstrap_before_frontend(tmp_path, failure):
     assert frontend[:3] == ["-m", "pip", "install"]
     assert "--no-deps" in frontend and "--only-binary=:all:" in frontend
     assert "nvidia-cudnn-frontend==1.25.0" in frontend
-    if failure:
+    if failure == "nvidia-cudnn-frontend==1.25.0":
         assert len(recorded) == 3
         return
     assert "cudnn_frontend.h" in recorded[3]["code"]
-    compile(recorded[3]["code"], str(ROOT / "qa/L0_pytorch_grouped_gemm_rtc/test.sh"), "exec")
-    assert recorded[4]["args"][:3] == ["-m", "pip", "wheel"]
-    assert "--no-build-isolation" in recorded[4]["args"]
+    assert "torch==" in recorded[4]["code"]
+    runtime = recorded[5]["args"]
+    assert runtime[:3] == ["-m", "pip", "install"]
+    assert "--constraint" in runtime and "--only-binary=:all:" in runtime
+    assert "--no-deps" not in runtime
+    assert {
+        "pydantic",
+        "importlib-metadata>=1.0",
+        "einops",
+        "onnx",
+        "onnxscript",
+        "nvdlfw-inspect",
+    } <= set(runtime)
+    assert not any(arg.startswith(("torch", "nvidia-")) for arg in runtime)
+    if failure == "pydantic":
+        assert len(recorded) == 6
+        return
+    assert recorded[6]["args"][:3] == ["-m", "pip", "wheel"]
+    assert "--no-build-isolation" in recorded[6]["args"]
+    assert "--no-deps" in recorded[7]["args"]
+    assert "--ignore-installed" in recorded[7]["args"]
+    assert "general_grouped_gemm" in recorded[8]["code"]
+    assert recorded[8]["cwd"] == str(tmp_path), "导入预检不能在源码目录内执行"
+    assert len(recorded) == 9
+    for call in recorded:
+        if call["code"]:
+            compile(call["code"], str(ROOT / "qa/L0_pytorch_grouped_gemm_rtc/test.sh"), "exec")
+
+
+def test_runtime_dependencies_match_project():
+    import ast
+
+    def declared(path, variable):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == variable:
+                return set(ast.literal_eval(node.value))
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.List):
+                return set(ast.literal_eval(node.value))
+        raise AssertionError(f"未找到依赖声明：{path}")
+
+    requirements = declared(ROOT / "setup.py", "install_reqs")
+    requirements |= declared(ROOT / "build_tools/pytorch.py", None)
+    required = requirements - {"torch>=2.1", "packaging", "nvidia-cudnn-frontend>=1.25.0"}
+    script = (ROOT / "qa/L0_pytorch_grouped_gemm_rtc/test.sh").read_text()
+    runtime = shlex.split(re.search(r'--constraint "[^"\n]+" \\\n(.*?)\n', script).group(1))
+    assert set(runtime) == required
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "",
+        "pydantic",
+        "system-te",
+        "system-core",
+        "torch-version",
+        "torch-path",
+        "headers",
+        "device",
+    ],
+)
+def test_import_preflight(tmp_path, monkeypatch, failure):
+    import builtins
+    import importlib.metadata
+
+    script = (ROOT / "qa/L0_pytorch_grouped_gemm_rtc/test.sh").read_text()
+    code = re.findall(r'"\$py" - <<\'PY\'\n(.*?)\nPY', script, re.S)[-1]
+    site = tmp_path / "lib/site-packages"
+    package = site / "transformer_engine"
+    header = site / "include/cutlass3/cutlass/cutlass.h"
+    header.parent.mkdir(parents=True)
+    if failure != "headers":
+        header.touch()
+    torch = ModuleType("torch")
+    torch.__file__ = str(tmp_path / "sdk/torch/__init__.py")
+    torch.cuda = SimpleNamespace(
+        is_available=lambda: failure != "device", get_device_capability=lambda _: (8, 9)
+    )
+    sdk = {"version": "2.11.0", "path": torch.__file__}
+    (tmp_path / "rtc-ci-sdk.json").write_text(json.dumps(sdk))
+    if failure == "torch-path":
+        torch.__file__ = str(tmp_path / "other/torch/__init__.py")
+    te = ModuleType("transformer_engine")
+    te.__file__ = str(package / "__init__.py")
+    if failure == "system-te":
+        te.__file__ = "/system/transformer_engine/__init__.py"
+    te.pytorch = ModuleType("transformer_engine.pytorch")
+    te.pytorch.__file__ = str(package / "pytorch/__init__.py")
+    common = ModuleType("transformer_engine.common")
+    common._get_shared_object_file = lambda name: (
+        Path("/system/libtransformer_engine.so")
+        if failure == "system-core" and name == "core"
+        else site / f"{name}.so"
+    )
+    gemm = ModuleType("transformer_engine.pytorch.cpp_extensions.gemm")
+    gemm.general_grouped_gemm = lambda: None
+    for name, module in {
+        "torch": torch,
+        "transformer_engine": te,
+        "transformer_engine.pytorch": te.pytorch,
+        "transformer_engine.common": common,
+        "transformer_engine.pytorch.cpp_extensions.gemm": gemm,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda _: "2.10.0" if failure == "torch-version" else "2.11.0",
+    )
+    original_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if failure == "pydantic" and name == "transformer_engine.pytorch":
+            raise ModuleNotFoundError("No module named 'pydantic'")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    if failure:
+        with pytest.raises(ModuleNotFoundError if failure == "pydantic" else AssertionError):
+            exec(compile(code, "rtc-preflight", "exec"), {})
+    else:
+        exec(compile(code, "rtc-preflight", "exec"), {})
 
 
 def test_workflow_report_paths():
@@ -344,19 +471,66 @@ def test_workflow_report_paths():
     steps = workflow["jobs"]["gate"]["steps"]
     report = next(step for step in steps if "--tolerance" in step.get("run", ""))
     assert report["env"]["REPORT_OUT"] == "${{ runner.temp }}/rtc-grouped-gemm-report"
-    assert 'echo "REPORT_OUT=$REPORT_OUT" >> "$GITHUB_ENV"' in report["run"]
+    assert "$GITHUB_ENV" not in report["run"]
     assert '--input "$NAS_OUT" --output "$REPORT_OUT"' in report["run"]
     assert 'mkdir -p "$NAS_OUT"' not in report["run"]
     assert 'cat "$REPORT_OUT/gate.md"' in report["run"]
     assert 'exit "$rc"' in report["run"]
     comment = next(step for step in steps if step.get("uses") == "actions/github-script@v7")
     assert "process.env.REPORT_OUT + '/gate.md'" in comment["with"]["script"]
+    assert comment["env"]["REPORT_OUT"] == report["env"]["REPORT_OUT"]
     artifact = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
     paths = artifact["with"]["path"].splitlines()
-    assert "${{ env.REPORT_OUT }}/gate.*" in paths
+    assert "${{ runner.temp }}/rtc-grouped-gemm-report/gate.*" in paths
+    assert not any("env.REPORT_OUT" in path for path in paths)
     assert "${{ env.NAS_OUT }}/*.log" in paths
     assert "${{ env.NAS_OUT }}/base/**/*.json" in paths
     assert "${{ env.NAS_OUT }}/head/**/*.json" in paths
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_report_paths_after_failed_step(tmp_path, missing):
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/ppu-890-rtc-grouped-gemm-gate.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    steps = workflow["jobs"]["gate"]["steps"]
+    report = next(step for step in steps if "--tolerance" in step.get("run", ""))
+    source = tmp_path / "nas"
+    if not missing:
+        for arm in ("base", "head"):
+            for sweep in range(4):
+                directory = source / arm / f"sweep-{sweep}"
+                directory.mkdir(parents=True)
+                (directory / "results.json").write_text(json.dumps(payload([100.0] * 27)))
+    directory = report["env"]["REPORT_OUT"].replace("${{ runner.temp }}", str(tmp_path))
+    summary = tmp_path / "summary.md"
+    env = {
+        **os.environ,
+        "NAS_OUT": str(source),
+        "REPORT_OUT": directory,
+        "BASE_SHA": "base",
+        "HEAD_SHA": "head",
+        "POLICY": "advisory",
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
+    env.pop("GITHUB_ENV", None)
+    result = subprocess.run(
+        ["bash"], input=report["run"], cwd=ROOT, env=env, text=True, capture_output=True
+    )
+    assert result.returncode == (3 if missing else 0), result.stderr
+    assert ("ERROR" if missing else "PASS") in summary.read_text()
+    # 后续步骤只使用自己的 env/表达式，不继承报告步骤的动态环境。
+    comment = next(step for step in steps if step.get("uses") == "actions/github-script@v7")
+    comment_directory = comment["env"]["REPORT_OUT"].replace("${{ runner.temp }}", str(tmp_path))
+    assert (Path(comment_directory) / "gate.md").is_file()
+    artifact = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
+    pattern = artifact["with"]["path"].splitlines()[0].replace("${{ runner.temp }}", str(tmp_path))
+    assert {p.name for p in Path(pattern).parent.glob(Path(pattern).name)} == {
+        "gate.md",
+        "gate.json",
+    }
 
 
 def test_worker_failure_is_recorded(tmp_path):

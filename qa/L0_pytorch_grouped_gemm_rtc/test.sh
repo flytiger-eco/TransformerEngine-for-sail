@@ -53,6 +53,25 @@ header = Path(frontend.locate_file("include/cudnn_frontend.h"))
 assert header.is_file(), f"cuDNN frontend 缺少构建头文件：{header}"
 print(f"[RTC CI] cuDNN frontend={frontend.version}, header={header}")
 PY
+    # --no-deps 安装 TE 前补齐非 GPU 运行依赖；约束间接依赖不得替换 SDK torch。
+    "$py" - <<'PY'
+import json
+import sys
+from importlib.metadata import version
+from pathlib import Path
+import torch
+
+prefix = Path(sys.prefix)
+sdk = {"version": version("torch"), "path": str(Path(torch.__file__).resolve())}
+(prefix / "rtc-ci-sdk.json").write_text(json.dumps(sdk), encoding="utf-8")
+(prefix / "rtc-ci-sdk-constraints.txt").write_text(
+    f"torch=={sdk['version']}\npackaging==24.2\nnvidia-cudnn-frontend==1.25.0\n",
+    encoding="utf-8",
+)
+print(f"[RTC CI] 保留 SDK torch：{sdk}")
+PY
+    "$py" -m pip install --only-binary=:all: --constraint "$SCRATCH/$arm-venv/rtc-ci-sdk-constraints.txt" \
+        pydantic 'importlib-metadata>=1.0' einops onnx onnxscript nvdlfw-inspect
     mkdir -p "$SCRATCH/$arm-wheel"
     (
         cd "$tree"
@@ -60,6 +79,37 @@ PY
     )
     # 不卸载容器预装的 TE/torch；venv 中的当前 wheel 必须优先于系统包。
     "$py" -m pip install --ignore-installed --no-deps "$SCRATCH/$arm-wheel"/transformer_engine*.whl
+    # 在源码树外完整导入；错误立即终止，不能重复运行全部必失败的 worker。
+    (
+        cd "$SCRATCH"
+        "$py" - <<'PY'
+import json
+import sys
+from importlib.metadata import version
+from pathlib import Path
+import torch
+import transformer_engine
+import transformer_engine.pytorch
+from transformer_engine.common import _get_shared_object_file
+from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
+
+prefix = Path(sys.prefix).resolve()
+sdk = json.loads((prefix / "rtc-ci-sdk.json").read_text(encoding="utf-8"))
+assert version("torch") == sdk["version"], "SDK torch 版本被替换"
+assert str(Path(torch.__file__).resolve()) == sdk["path"], "SDK torch 路径被替换"
+for path in (transformer_engine.__file__, transformer_engine.pytorch.__file__,
+             _get_shared_object_file("core"), _get_shared_object_file("torch")):
+    assert Path(path).resolve().is_relative_to(prefix), f"TE 必须来自当前 venv：{path}"
+    print(f"[RTC CI] 导入预检：{path}")
+site = Path(transformer_engine.__file__).resolve().parent.parent
+headers = site / "include/cutlass3/cutlass/cutlass.h"
+assert headers.is_file(), f"wheel 缺少 RTC headers：{headers}"
+assert callable(general_grouped_gemm), "GroupedGemm 入口不可调用"
+assert torch.cuda.is_available(), "必须有可用 PPU，不能跳过测试"
+assert torch.cuda.get_device_capability(0) in ((8, 0), (8, 9)), "设备不支持 RTC"
+print(f"[RTC CI] 运行环境预检通过，RTC headers={headers}")
+PY
+    )
 }
 
 build_arm base "$SCRATCH/base" 2>&1 | tee "$OUT/base-build.log"
