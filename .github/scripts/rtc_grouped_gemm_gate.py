@@ -4,6 +4,7 @@
 """RTC GroupGemm 的逐 case 测量、配对性能判定和报告；控制面不依赖 torch。"""
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import math
@@ -18,14 +19,45 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CASES = ROOT / "benchmarks/gemm/grouped_gemm_rtc_ci_cases.txt"
 DEFAULT_REPLAY = ROOT / "benchmarks/gemm/replay_tag.py"
-SCOPE = re.compile(
-    r"^(transformer_engine/common/(gemm/|util/|include/|CMakeLists\.txt)|"
-    r"transformer_engine/pytorch/(cpp_extensions/|csrc/|module/grouped_linear\.py)|"
-    r"3rdparty/|include/|build_tools/|setup\.py$|pyproject\.toml$|MANIFEST\.in$|\.gitmodules$|"
-    r"benchmarks/gemm/|tests/pytorch/(test_grouped|test_rtc_grouped_gemm_ci\.py$)|"
-    r"qa/L0_pytorch_grouped_gemm_rtc/|\.github/scripts/rtc_grouped_gemm_gate\.py$|"
-    r"\.github/workflows/ppu-890-rtc-grouped-gemm-gate\.yml$)"
+# 与 workflow 的 pull_request.paths 保持一致；不泛选所有 util/csrc/3rdparty。
+SCOPE_PATHS = (
+    "transformer_engine/common/gemm/cutlass_grouped_gemm*",
+    "transformer_engine/common/gemm/rtc/**",
+    "transformer_engine/common/gemm/actlize_overlay/**",
+    "transformer_engine/common/gemm/ppu_adaptive_tile.hpp",
+    "transformer_engine/common/gemm/cublaslt_grouped_gemm.cu",
+    "transformer_engine/common/gemm/config.cpp",
+    "transformer_engine/common/gemm/config.h",
+    "transformer_engine/common/gemm/te_profiling_interface.h",
+    "transformer_engine/common/util/rtc.cpp",
+    "transformer_engine/common/util/rtc.h",
+    "transformer_engine/common/include/transformer_engine/gemm.h",
+    "transformer_engine/common/CMakeLists.txt",
+    "transformer_engine/pytorch/cpp_extensions/gemm.py",
+    "transformer_engine/pytorch/csrc/extensions/gemm.cpp",
+    "transformer_engine/pytorch/module/grouped_linear.py",
+    "3rdparty/actlize",
+    "3rdparty/actlize/**",
+    "3rdparty/cudafy-for-sail",
+    "3rdparty/cudafy-for-sail/**",
+    "include/cutlass3/**",
+    "include/cutlass3_overlay/**",
+    "build_tools/build_ext.py",
+    "build_tools/pytorch.py",
+    "build_tools/utils.py",
+    "setup.py",
+    "pyproject.toml",
+    "MANIFEST.in",
+    ".gitmodules",
+    "benchmarks/gemm/replay_tag.py",
+    "benchmarks/gemm/grouped_gemm_rtc_ci_cases.txt",
+    "tests/pytorch/test_grouped*",
+    "tests/pytorch/test_rtc_grouped_gemm_ci.py",
+    "qa/L0_pytorch_grouped_gemm_rtc/**",
+    ".github/scripts/rtc_grouped_gemm_gate.py",
+    ".github/workflows/ppu-890-rtc-grouped-gemm-gate.yml",
 )
+SCOPE = re.compile("^(?:" + "|".join(fnmatch.translate(path) for path in SCOPE_PATHS) + ")")
 
 
 def policy_for(subjects, labels, manual=False):
@@ -164,6 +196,57 @@ def compare(cases, measurements, tolerance):
     return rows
 
 
+def plot_report(gate, output):
+    """无显示环境绘制延迟及配对变化；不把独立中位数之比冒充配对比率。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = gate["rows"]
+    figure, axes = plt.subplots(2, 1, figsize=(16, 9), constrained_layout=True)
+    try:
+        figure.suptitle(
+            f"RTC GroupGemm (890P) | {gate['verdict']} | "
+            f"{gate['base_sha'][:8]} -> {gate['head_sha'][:8]} | {gate['sweeps']} AB/BA sweeps"
+        )
+        if gate["error"]:
+            # 缺测时不得绘制空柱并暗示性能通过。
+            for axis in axes:
+                axis.set_axis_off()
+            axes[0].text(0.5, 0.5, "ERROR: no valid paired measurements", ha="center", fontsize=18)
+            axes[1].text(0.5, 0.5, "See the report and case/build logs.", ha="center", fontsize=14)
+        else:
+            ids = [row["id"] for row in rows]
+            axes[0].bar([i - 0.2 for i in ids], [r["base_us"] for r in rows], 0.4, label="base")
+            axes[0].bar([i + 0.2 for i in ids], [r["head_us"] for r in rows], 0.4, label="head")
+            axes[0].set_ylabel("RTC kernel latency (μs)")
+            axes[0].legend()
+            changes = [(row["latency_ratio"] - 1) * 100 for row in rows]
+            colors = [
+                "#d62728" if r["regression"] else "#2ca02c" if c < 0 else "#7f7f7f"
+                for r, c in zip(rows, changes)
+            ]
+            axes[1].bar(ids, changes, color=colors)
+            axes[1].axhline(0, color="black", linewidth=0.8)
+            axes[1].axhline(
+                gate["tolerance"] * 100,
+                color="#d62728",
+                linestyle="--",
+                label=f"+{gate['tolerance']:.0%} tolerance",
+            )
+            axes[1].set_ylabel("Paired head/base latency change (%)")
+            axes[1].legend()
+            for axis in axes:
+                axis.set_xticks(ids, [f"{i:02d}" for i in ids])
+                axis.set_xlabel("case (lower latency is better)")
+                axis.grid(axis="y", alpha=0.25)
+                axis.set_axisbelow(True)
+        figure.savefig(output, dpi=140)
+    finally:
+        plt.close(figure)
+
+
 def report(args):
     out = Path(args.output)
     # NAS 由 pod 写入；runner 只读测量，将报告写到自己的可写目录。
@@ -228,6 +311,12 @@ def report(args):
             "</details>",
         ]
     (out / "gate.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if getattr(args, "plot", False):
+        try:
+            plot_report(gate, out / "gate.png")
+        except Exception as exc:
+            # 绘图仅用于展示；文字报告和原有门禁退出码仍以实际测量为准。
+            print(f"::warning::RTC GroupGemm 图表生成失败：{exc}", file=sys.stderr)
     print(
         f"::notice::RTC GroupGemm: {verdict}, policy={args.policy}, regressions={len(regressions)}"
     )
@@ -254,6 +343,7 @@ def main():
     summary = commands.add_parser("report")
     summary.add_argument("--output", required=True, help="gate.json/gate.md 的输出目录")
     summary.add_argument("--input", help="测量结果输入目录；省略时与 --output 相同")
+    summary.add_argument("--plot", action="store_true", help="生成 gate.png；需要 matplotlib")
     summary.add_argument("--cases", default=str(DEFAULT_CASES))
     summary.add_argument("--base-sha", required=True)
     summary.add_argument("--head-sha", required=True)

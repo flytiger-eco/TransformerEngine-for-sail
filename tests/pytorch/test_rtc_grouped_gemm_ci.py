@@ -104,12 +104,53 @@ def test_policy(subject, labels, manual, expected):
         ("build_tools/build_ext.py", True),
         ("3rdparty/actlize", True),
         ("benchmarks/gemm/replay_tag.py", True),
+        ("transformer_engine/common/util/rtc.h", True),
+        ("transformer_engine/common/gemm/cutlass_grouped_gemm_rtc.cu", True),
+        ("transformer_engine/common/gemm/ppu_adaptive_tile.hpp", True),
+        ("transformer_engine/pytorch/cpp_extensions/gemm.py", True),
+        ("3rdparty/cudafy-for-sail", True),
+        ("qa/L0_pytorch_grouped_gemm_rtc/test.sh", True),
+        (".github/workflows/ppu-890-rtc-grouped-gemm-gate.yml", True),
         ("docs/installation.rst", False),
+        ("docs/transformer_engine/common/util/rtc.h", False),
+        ("transformer_engine/common/gemm/cublaslt_gemm.cu", False),
+        ("transformer_engine/common/normalization/rtc_dispatch.cpp", False),
+        ("transformer_engine/common/util/logging.h", False),
+        ("transformer_engine/pytorch/csrc/extensions/attention.cpp", False),
+        ("transformer_engine/pytorch/cpp_extensions/normalization.py", False),
+        ("build_tools/jax.py", False),
+        ("3rdparty/nccl", False),
+        ("benchmarks/gemm/benchmark_gemm.py", False),
+        ("transformer_engine/pytorch/cpp_extensions/gemm.py.bak", False),
         ("transformer_engine/pytorch/attention/dot_product_attention.py", False),
     ],
 )
 def test_scope(path, expected):
     assert bool(GATE.SCOPE.search(path)) == expected
+
+
+def workflow_config():
+    import yaml
+
+    return yaml.load(
+        (ROOT / ".github/workflows/ppu-890-rtc-grouped-gemm-gate.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+
+
+def test_workflow_paths_match_scope():
+    workflow = workflow_config()
+    trigger = workflow["on"]["pull_request"]
+    assert trigger["branches"] == ["v2.18-SAIL"]
+    assert set(trigger["paths"]) == set(GATE.SCOPE_PATHS)
+    assert len(trigger["paths"]) == len(GATE.SCOPE_PATHS)
+    assert "workflow_dispatch" in workflow["on"]
+    assert "push" not in workflow["on"] and "schedule" not in workflow["on"]
+    assert {"edited", "labeled", "unlabeled", "synchronize"} <= set(trigger["types"])
+    for pattern in trigger["paths"]:
+        assert GATE.SCOPE.fullmatch(pattern.replace("**", "a/b").replace("*", "a"))
+    scope = next(step for step in workflow["jobs"]["gate"]["steps"] if step.get("id") == "scope")
+    assert "run = manual or any(gate.SCOPE.search(path) for path in changed)" in scope["run"]
 
 
 def payload(times):
@@ -476,10 +517,16 @@ def test_workflow_report_paths():
     assert 'mkdir -p "$NAS_OUT"' not in report["run"]
     assert 'cat "$REPORT_OUT/gate.md"' in report["run"]
     assert 'exit "$rc"' in report["run"]
-    comment = next(step for step in steps if step.get("uses") == "actions/github-script@v7")
-    assert "process.env.REPORT_OUT + '/gate.md'" in comment["with"]["script"]
+    comment = workflow["jobs"]["publish"]["steps"][-1]
+    assert "process.env.REPORT_OUT" in comment["with"]["script"]
+    assert "dir + '/gate.md'" in comment["with"]["script"]
     assert comment["env"]["REPORT_OUT"] == report["env"]["REPORT_OUT"]
-    artifact = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
+    deps = next(step for step in steps if "GATE_DEPS" in step.get("env", {}))
+    assert deps["env"]["GATE_DEPS"] == report["env"]["PYTHONPATH"]
+    assert "--plot" in report["run"]
+    artifact = next(
+        step for step in steps if "base/**/*.json" in step.get("with", {}).get("path", "")
+    )
     paths = artifact["with"]["path"].splitlines()
     assert "${{ runner.temp }}/rtc-grouped-gemm-report/gate.*" in paths
     assert not any("env.REPORT_OUT" in path for path in paths)
@@ -521,8 +568,8 @@ def test_report_paths_after_failed_step(tmp_path, missing):
     )
     assert result.returncode == (3 if missing else 0), result.stderr
     assert ("ERROR" if missing else "PASS") in summary.read_text()
-    # 后续步骤只使用自己的 env/表达式，不继承报告步骤的动态环境。
-    comment = next(step for step in steps if step.get("uses") == "actions/github-script@v7")
+    # 发布 job 通过 artifact 接收报告，不依赖前一 job 的环境。
+    comment = workflow["jobs"]["publish"]["steps"][-1]
     comment_directory = comment["env"]["REPORT_OUT"].replace("${{ runner.temp }}", str(tmp_path))
     assert (Path(comment_directory) / "gate.md").is_file()
     artifact = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
@@ -530,7 +577,271 @@ def test_report_paths_after_failed_step(tmp_path, missing):
     assert {p.name for p in Path(pattern).parent.glob(Path(pattern).name)} == {
         "gate.md",
         "gate.json",
+        "gate.png",
     }
+
+
+def test_workflow_publisher_isolated():
+    workflow = workflow_config()
+    gate, publisher = workflow["jobs"]["gate"], workflow["jobs"]["publish"]
+    assert gate["permissions"] == {"contents": "read"}
+    assert publisher["permissions"] == {"contents": "write", "pull-requests": "write"}
+    assert publisher["needs"] == "gate"
+    assert "always()" in publisher["if"] and "!cancelled()" in publisher["if"]
+    assert "head.repo.full_name == github.repository" in publisher["if"]
+    assert "github.event_name == 'pull_request'" in publisher["if"]
+    assert publisher["steps"][0]["uses"] == "actions/download-artifact@v4"
+    assert publisher["steps"][0]["with"]["artifact-ids"] == "${{ needs.gate.outputs.report_id }}"
+    assert gate["outputs"]["report_id"] == "${{ steps.report_artifact.outputs.artifact-id }}"
+    assert not any(
+        step.get("run") or step.get("uses", "").startswith("actions/checkout")
+        for step in publisher["steps"]
+    )
+    artifact = next(step for step in gate["steps"] if step.get("id") == "report_artifact")
+    assert "always()" in artifact["if"]
+    assert artifact["with"]["path"] == "${{ runner.temp }}/rtc-grouped-gemm-report/gate.*"
+
+
+@pytest.mark.parametrize("missing,regression", [(False, False), (False, True), (True, False)])
+def test_report_plot_cli(tmp_path, missing, regression):
+    if not missing:
+        for arm, latency in (("base", 100.0), ("head", 106.0 if regression else 98.0)):
+            directory = tmp_path / arm / "sweep-0"
+            directory.mkdir(parents=True)
+            (directory / "results.json").write_text(json.dumps(payload([latency] * 27)))
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github/scripts/rtc_grouped_gemm_gate.py"),
+            "report",
+            "--output",
+            str(tmp_path),
+            "--base-sha",
+            "base",
+            "--head-sha",
+            "head",
+            "--sweeps",
+            "1",
+            "--plot",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == (3 if missing else 2 if regression else 0), result.stderr
+    assert (tmp_path / "gate.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    from PIL import Image
+
+    with Image.open(tmp_path / "gate.png") as image:
+        assert image.size == (2240, 1260)
+
+
+@pytest.mark.parametrize("missing,regression", [(False, False), (False, True), (True, False)])
+def test_plot_failure_preserves_verdict(tmp_path, monkeypatch, capsys, missing, regression):
+    if not missing:
+        for arm, latency in (("base", 100.0), ("head", 106.0 if regression else 98.0)):
+            directory = tmp_path / arm / "sweep-0"
+            directory.mkdir(parents=True)
+            (directory / "results.json").write_text(json.dumps(payload([latency] * 27)))
+
+    def unavailable(*_):
+        raise ImportError("模拟绘图依赖不可用")
+
+    monkeypatch.setattr(GATE, "plot_report", unavailable)
+    args = argparse.Namespace(
+        output=str(tmp_path),
+        cases=GATE.DEFAULT_CASES,
+        sweeps=1,
+        tolerance=0.05,
+        policy="enforced",
+        base_sha="base",
+        head_sha="head",
+        plot=True,
+    )
+    assert GATE.report(args) == (3 if missing else 2 if regression else 0)
+    verdict = "ERROR" if missing else "REGRESSION" if regression else "PASS"
+    assert json.loads((tmp_path / "gate.json").read_text())["verdict"] == verdict
+    assert verdict in (tmp_path / "gate.md").read_text()
+    assert "图表生成失败" in capsys.readouterr().err
+    assert not (tmp_path / "gate.png").exists()
+
+
+@pytest.mark.parametrize("error", [False, True])
+def test_plot_paired_data_and_error(tmp_path, monkeypatch, error):
+    import matplotlib.figure
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import to_rgba
+
+    rows = GATE.compare(CASES, [(payload([100.0] * 27), payload([110.0] * 27))], 0.05)
+    # 强制独立中位数与配对比率不同，确认下图采用门禁真正使用的比率。
+    rows[0].update(latency_ratio=0.98, regression=False)
+    gate = {
+        "rows": rows,
+        "error": "缺测" if error else None,
+        "verdict": "ERROR" if error else "REGRESSION",
+        "base_sha": "base",
+        "head_sha": "head",
+        "sweeps": 4,
+        "tolerance": 0.05,
+    }
+    figures = []
+    original = matplotlib.figure.Figure.savefig
+
+    def save(figure, *args, **kwargs):
+        figures.append(figure)
+        return original(figure, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", save)
+    GATE.plot_report(gate, tmp_path / "gate.png")
+    axes = figures[0].axes
+    if error:
+        assert not any(axis.patches for axis in axes)
+        assert "ERROR" in axes[0].texts[0].get_text()
+    else:
+        assert len(axes[0].patches) == 54 and len(axes[1].patches) == 27
+        assert axes[0].patches[0].get_height() == 100
+        assert axes[0].patches[27].get_height() == 110
+        assert axes[1].patches[0].get_height() == pytest.approx(-2)
+        assert axes[1].patches[0].get_facecolor() == to_rgba("#2ca02c")
+        assert axes[1].patches[1].get_facecolor() == to_rgba("#d62728")
+        assert axes[1].lines[1].get_ydata() == [5.0, 5.0]
+    assert not plt.fignum_exists(figures[0].number)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "new",
+        "existing",
+        "conflict",
+        "create-race",
+        "forbidden",
+        "missing-png",
+        "bad-png",
+        "oversized",
+        "exhausted",
+        "error-report",
+        "missing-commit",
+    ],
+)
+def test_publisher_api(scenario):
+    import quickjs
+
+    script = workflow_config()["jobs"]["publish"]["steps"][-1]["with"]["script"]
+    vm = quickjs.Context()
+    vm.eval("const scenario = " + json.dumps(scenario) + ";")
+    vm.eval(
+        r"""
+        const calls = [], warnings = [];
+        let done = false, failure = null, branches = 0, commits = 0, updates = 0;
+        const context = {serverUrl: 'https://github.com', repo: {owner: 'owner', repo: 'repo'},
+                         runId: 123, issue: {number: 38}};
+        const process = {env: {REPORT_OUT: '/report', GITHUB_RUN_ATTEMPT: '2'}};
+        const core = {warning: message => warnings.push(message)};
+        function fail(status) { throw Object.assign(new Error('模拟 API 失败'), {status}); }
+        const fs = {readFileSync: path => {
+            if (path.endsWith('.md')) return scenario === 'error-report' ? 'ERROR: 缺测' : 'PASS';
+            if (scenario === 'missing-png') throw new Error('PNG 不存在');
+            return {length: scenario === 'oversized' ? 6000000 : 8,
+                    subarray: () => ({toString: () => scenario === 'bad-png' ? 'bad' : '89504e470d0a1a0a'}),
+                    toString: () => 'iVBORw0KGgo='};
+        }};
+        const require = name => { if (name !== 'fs') throw new Error(name); return fs; };
+        const git = {};
+        for (const name of ['createBlob', 'getRef', 'getCommit', 'createTree',
+                            'createCommit', 'createRef', 'updateRef']) {
+            git[name] = async args => {
+                calls.push({name, args});
+                if (scenario === 'forbidden') fail(403);
+                if (name === 'getRef') {
+                    branches++;
+                    if (['new', 'create-race', 'error-report'].includes(scenario) && branches === 1) fail(404);
+                    return {data: {object: {sha: 'parent-' + branches}}};
+                }
+                if (name === 'getCommit') {
+                    if (scenario === 'missing-commit') fail(404);
+                    return {data: {tree: {sha: 'old-tree'}}};
+                }
+                if (name === 'createCommit') return {data: {sha: 'commit-' + (++commits)}};
+                if (name === 'createRef' && scenario === 'create-race') fail(422);
+                if (name === 'updateRef') {
+                    updates++;
+                    if (scenario === 'exhausted' || (scenario === 'conflict' && updates === 1)) fail(422);
+                }
+                return {data: {sha: name === 'createBlob' ? 'blob' : 'tree'}};
+            };
+        }
+        const issues = {listComments: 'list',
+                        createComment: async args => calls.push({name: 'createComment', args}),
+                        updateComment: async args => calls.push({name: 'updateComment', args})};
+        const github = {rest: {git, issues}, paginate: async () => scenario === 'existing' ? [
+            {id: 7, user: {login: 'someone'}, body: '<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->'},
+            {id: 9, user: {login: 'github-actions[bot]'}, body: '<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->'}
+        ] : []};
+    """
+    )
+    vm.eval(
+        "(async () => {\n"
+        + script
+        + "\n})().then(() => done = true, error => {failure = String(error); done = true;});"
+    )
+    for _ in range(200):
+        if not vm.execute_pending_job():
+            break
+    assert vm.eval("done") and vm.eval("failure") is None
+    calls = json.loads(vm.eval("JSON.stringify(calls)"))
+    comments = [call for call in calls if call["name"] in ("createComment", "updateComment")]
+    assert len(comments) == 1
+    body = comments[0]["args"]["body"]
+    assert body.startswith("<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->")
+    assert ("ERROR: 缺测" if scenario == "error-report" else "PASS") in body
+    assert "actions/runs/123" in body
+    if scenario == "existing":
+        assert comments[0]["name"] == "updateComment" and comments[0]["args"]["comment_id"] == 9
+    fallback = scenario in (
+        "forbidden",
+        "missing-png",
+        "bad-png",
+        "oversized",
+        "exhausted",
+        "missing-commit",
+    )
+    if fallback:
+        assert "图表未能内嵌" in body and "![" not in body
+        assert json.loads(vm.eval("JSON.stringify(warnings)"))
+    else:
+        assert "/raw/commit-" in body and "/rtc-grouped-gemm/pr-38/run-123-2/gate.png" in body
+        assert "![RTC GroupGemm" in body
+    for call in calls:
+        args = call["args"]
+        if "ref" in args:
+            assert args["ref"] in ("heads/ci-reports", "refs/heads/ci-reports")
+        if call["name"] == "updateRef":
+            assert args["force"] is False
+        if call["name"] == "createTree":
+            assert args["tree"] == [
+                {
+                    "path": "rtc-grouped-gemm/pr-38/run-123-2/gate.png",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": "blob",
+                }
+            ]
+    commits = [call for call in calls if call["name"] == "createCommit"]
+    if scenario in ("new", "create-race", "error-report"):
+        assert commits[0]["args"]["parents"] == []
+    if scenario in ("conflict", "create-race"):
+        assert len(commits) == 2
+        assert commits[1]["args"]["parents"] == ["parent-2"]
+    if scenario == "exhausted":
+        assert len(commits) == 5
+    if scenario == "missing-commit":
+        assert not any(
+            call["name"] in ("createTree", "createCommit", "updateRef", "createRef")
+            for call in calls
+        )
+    trees = [call for call in calls if call["name"] == "createTree"]
+    for tree, commit in zip(trees, commits):
+        assert tree["args"].get("base_tree") == ("old-tree" if commit["args"]["parents"] else None)
 
 
 def test_worker_failure_is_recorded(tmp_path):
@@ -574,8 +885,9 @@ def test_workflow_bootstraps_cpu_python():
     install = next(step["run"] for _, step in consumers if "python3 -m pip install" in step["run"])
     assert "python3 -m pip --version" in install
     assert install.index("python3 -m pip --version") < install.index("python3 -m pip install")
-    assert '--target "$RUNNER_TEMP/rtc-gate-deps"' in install
-    assert "pytest==8.2.1 pyyaml==6.0.2" in install
+    assert '--target "$GATE_DEPS"' in install
+    assert "pytest==8.2.1 pyyaml==6.0.2 matplotlib==3.10.0 quickjs==1.19.4" in install
+    assert "--only-binary=:all:" in install
 
 
 def test_workflow_and_shell_syntax():

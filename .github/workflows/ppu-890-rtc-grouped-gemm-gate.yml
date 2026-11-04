@@ -2,11 +2,48 @@ name: ppu-890-rtc-grouped-gemm-gate
 
 # 对所有相关 PR 运行 27 个 case；perf/refactor 和手动运行阻断超过 5% 的退化。
 # 数值错误、RTC 回退、tile 不匹配和基础设施失败始终阻断。
-# 不使用 workflow_run，确保 PR 自身有可用作 required check 的门禁。
+# 无关 PR 由 paths 跳过；不要将此 workflow 设为所有 PR 无条件必需的检查。
 on:
   pull_request:
     branches: ['v2.18-SAIL']
     types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
+    # 与 gate.py 的 SCOPE_PATHS 一致；保留公共构建入口，但排除无关模块。
+    paths:
+      - 'transformer_engine/common/gemm/cutlass_grouped_gemm*'
+      - 'transformer_engine/common/gemm/rtc/**'
+      - 'transformer_engine/common/gemm/actlize_overlay/**'
+      - 'transformer_engine/common/gemm/ppu_adaptive_tile.hpp'
+      - 'transformer_engine/common/gemm/cublaslt_grouped_gemm.cu'
+      - 'transformer_engine/common/gemm/config.cpp'
+      - 'transformer_engine/common/gemm/config.h'
+      - 'transformer_engine/common/gemm/te_profiling_interface.h'
+      - 'transformer_engine/common/util/rtc.cpp'
+      - 'transformer_engine/common/util/rtc.h'
+      - 'transformer_engine/common/include/transformer_engine/gemm.h'
+      - 'transformer_engine/common/CMakeLists.txt'
+      - 'transformer_engine/pytorch/cpp_extensions/gemm.py'
+      - 'transformer_engine/pytorch/csrc/extensions/gemm.cpp'
+      - 'transformer_engine/pytorch/module/grouped_linear.py'
+      - '3rdparty/actlize'
+      - '3rdparty/actlize/**'
+      - '3rdparty/cudafy-for-sail'
+      - '3rdparty/cudafy-for-sail/**'
+      - 'include/cutlass3/**'
+      - 'include/cutlass3_overlay/**'
+      - 'build_tools/build_ext.py'
+      - 'build_tools/pytorch.py'
+      - 'build_tools/utils.py'
+      - 'setup.py'
+      - 'pyproject.toml'
+      - 'MANIFEST.in'
+      - '.gitmodules'
+      - 'benchmarks/gemm/replay_tag.py'
+      - 'benchmarks/gemm/grouped_gemm_rtc_ci_cases.txt'
+      - 'tests/pytorch/test_grouped*'
+      - 'tests/pytorch/test_rtc_grouped_gemm_ci.py'
+      - 'qa/L0_pytorch_grouped_gemm_rtc/**'
+      - '.github/scripts/rtc_grouped_gemm_gate.py'
+      - '.github/workflows/ppu-890-rtc-grouped-gemm-gate.yml'
   workflow_dispatch:
     inputs:
       base_ref:
@@ -38,7 +75,9 @@ jobs:
     timeout-minutes: 300
     permissions:
       contents: read
-      pull-requests: write
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      report_id: ${{ steps.report_artifact.outputs.artifact-id }}
     container:
       image: ghcr.io/actions/actions-runner:latest
     steps:
@@ -59,10 +98,14 @@ jobs:
 
       - name: 验证 case 映射和门禁判定逻辑（CPU）
         shell: bash
+        env:
+          GATE_DEPS: ${{ runner.temp }}/rtc-gate-deps
+          MPLCONFIGDIR: ${{ runner.temp }}/rtc-matplotlib
         run: |
           python3 -m pip --version
-          python3 -m pip install --target "$RUNNER_TEMP/rtc-gate-deps" pytest==8.2.1 pyyaml==6.0.2
-          PYTHONPATH="$RUNNER_TEMP/rtc-gate-deps" python3 -m pytest -q tests/pytorch/test_rtc_grouped_gemm_ci.py
+          python3 -m pip install --only-binary=:all: --target "$GATE_DEPS" \
+            pytest==8.2.1 pyyaml==6.0.2 matplotlib==3.10.0 quickjs==1.19.4
+          PYTHONPATH="$GATE_DEPS" python3 -m pytest -q tests/pytorch/test_rtc_grouped_gemm_ci.py
 
       - name: 确定改动范围和门禁策略
         id: scope
@@ -139,41 +182,25 @@ jobs:
           HEAD_SHA: ${{ steps.scope.outputs.head_sha }}
           POLICY: ${{ steps.scope.outputs.policy }}
           REPORT_OUT: ${{ runner.temp }}/rtc-grouped-gemm-report
+          PYTHONPATH: ${{ runner.temp }}/rtc-gate-deps
+          MPLCONFIGDIR: ${{ runner.temp }}/rtc-matplotlib
         run: |
           set -euo pipefail
           rc=0
           python3 .github/scripts/rtc_grouped_gemm_gate.py report --input "$NAS_OUT" --output "$REPORT_OUT" \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --policy "$POLICY" \
-            --sweeps 4 --tolerance 0.05 || rc=$?
+            --sweeps 4 --tolerance 0.05 --plot || rc=$?
           cat "$REPORT_OUT/gate.md" >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
-      - name: 发布或更新 PR 报告
-        if: always() && steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
-        continue-on-error: true
-        uses: actions/github-script@v7
-        env:
-          REPORT_OUT: ${{ runner.temp }}/rtc-grouped-gemm-report
+      - name: 上传独立报告供发布 job 使用
+        id: report_artifact
+        if: always() && steps.scope.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
         with:
-          script: |
-            const fs = require('fs');
-            const path = process.env.REPORT_OUT + '/gate.md';
-            if (!fs.existsSync(path)) {
-              core.warning('没有生成 RTC 报告，请查看调度或构建日志');
-              return;
-            }
-            const marker = '<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->';
-            const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const body = marker + '\n' + fs.readFileSync(path, 'utf8') + '\n运行记录：' + url;
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              ...context.repo, issue_number: context.issue.number, per_page: 100
-            });
-            const existing = comments.find(c => c.user.login === 'github-actions[bot]' && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({...context.repo, comment_id: existing.id, body});
-            } else {
-              await github.rest.issues.createComment({...context.repo, issue_number: context.issue.number, body});
-            }
+          name: te-rtc-grouped-gemm-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rtc-grouped-gemm-report/gate.*
+          if-no-files-found: error
 
       - name: 上传逐 case 结果和构建日志
         if: always() && steps.scope.outputs.run == 'true'
@@ -188,3 +215,97 @@ jobs:
             ${{ env.NAS_OUT }}/head/**/*.json
             ${{ env.NAS_OUT }}/head/**/*.log
           if-no-files-found: error
+
+  # 写权限只给独立发布 job；不 checkout 或执行 PR 源码，仅读取当前运行的报告。
+  publish:
+    name: 发布 RTC 图表和 PR 评论
+    needs: gate
+    if: always() && !cancelled() && needs.gate.outputs.run == 'true' && needs.gate.outputs.report_id != '' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: k8s-runner-group-cpu-flytiger
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.gate.outputs.report_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rtc-grouped-gemm-report
+
+      - name: 发布图表到 ci-reports 并更新评论
+        uses: actions/github-script@v7
+        env:
+          REPORT_OUT: ${{ runner.temp }}/rtc-grouped-gemm-report
+        with:
+          script: |
+            const fs = require('fs');
+            const dir = process.env.REPORT_OUT;
+            const marker = '<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->';
+            const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const report = fs.readFileSync(dir + '/gate.md', 'utf8');
+            let image = '';
+            try {
+              const png = fs.readFileSync(dir + '/gate.png');
+              if (png.length > 5 * 1024 * 1024 || png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') {
+                throw new Error('图表不是有效 PNG 或超过 5 MiB');
+              }
+              const branch = 'ci-reports';
+              const imagePath = `rtc-grouped-gemm/pr-${context.issue.number}/run-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}/gate.png`;
+              const blob = await github.rest.git.createBlob({
+                ...context.repo, content: png.toString('base64'), encoding: 'base64'
+              });
+              let published = false;
+              // 并行 PR 可能更新同一分支；只做快进，冲突时重新取最新父提交。
+              for (let attempt = 0; attempt < 5 && !published; attempt++) {
+                let parent = null;
+                let baseTree;
+                try {
+                  const ref = await github.rest.git.getRef({...context.repo, ref: `heads/${branch}`});
+                  parent = ref.data.object.sha;
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+                if (parent) {
+                  // 已有分支必须成功读取完整树；提交查询失败不能当作空分支重建。
+                  const previous = await github.rest.git.getCommit({...context.repo, commit_sha: parent});
+                  baseTree = previous.data.tree.sha;
+                }
+                const tree = await github.rest.git.createTree({
+                  ...context.repo, ...(baseTree ? {base_tree: baseTree} : {}),
+                  tree: [{path: imagePath, mode: '100644', type: 'blob', sha: blob.data.sha}]
+                });
+                const commit = await github.rest.git.createCommit({
+                  ...context.repo, message: `RTC GroupGemm report: PR #${context.issue.number}, run ${context.runId}`,
+                  tree: tree.data.sha, parents: parent ? [parent] : []
+                });
+                try {
+                  if (parent) {
+                    await github.rest.git.updateRef({...context.repo, ref: `heads/${branch}`, sha: commit.data.sha, force: false});
+                  } else {
+                    await github.rest.git.createRef({...context.repo, ref: `refs/heads/${branch}`, sha: commit.data.sha});
+                  }
+                  const imageUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/raw/${commit.data.sha}/${imagePath}`;
+                  image = `\n![RTC GroupGemm 延迟柱状图](${imageUrl})\n`;
+                  published = true;
+                } catch (error) {
+                  if (![409, 422].includes(error.status) || attempt === 4) throw error;
+                }
+              }
+            } catch (error) {
+              // 图片发布失败不覆盖数值/性能结论；文字报告和 artifact 仍可查看。
+              core.warning(`图表发布失败：${error.message}`);
+              image = '\n图表未能内嵌；文字结果见下方，图表（如已生成）和日志可从运行记录的 artifact 下载。\n';
+            }
+            const body = marker + '\n' + image + report.slice(0, 60000) + '\n运行记录：' + url;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: context.issue.number, per_page: 100
+            });
+            const existing = comments.find(c => c.user.login === 'github-actions[bot]' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({...context.repo, comment_id: existing.id, body});
+            } else {
+              await github.rest.issues.createComment({...context.repo, issue_number: context.issue.number, body});
+            }
