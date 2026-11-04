@@ -24,7 +24,9 @@
 //   NVTE_GG_TRANS_A : 0 or 1
 //   NVTE_GG_TRANS_B : 0 or 1
 //   NVTE_GG_ARCH    : 80 or 89  (selects the PPU0010 / PPU0015 ArchTag)
-//   NVTE_GG_DTYPE   : 0 = bf16 (default), 1 = fp16
+//   NVTE_GG_DTYPE   : 0 = bf16 (default), 1 = fp16  (A/B and, unless
+//                     NVTE_GG_OUT_FP32, also C/D)
+//   NVTE_GG_OUT_FP32: 0 = C/D carry the A/B dtype (default), 1 = C/D are fp32
 //   NVTE_GG_WITH_C  : 0 or 1    (0 = ElementC=void; skip source-C load)
 //   NVTE_GG_TILE_M  : tile rows (default 256)
 //   NVTE_GG_TILE_N  : tile cols (default 128)
@@ -76,6 +78,9 @@
 #ifndef NVTE_GG_DTYPE
 #define NVTE_GG_DTYPE 0  // 0 = bf16, 1 = fp16
 #endif
+#ifndef NVTE_GG_OUT_FP32
+#define NVTE_GG_OUT_FP32 0
+#endif
 #ifndef NVTE_GG_STAGES
 #define NVTE_GG_STAGES 0  // 0 = StageCountAutoCarveout
 #endif
@@ -83,14 +88,23 @@
 namespace {
 
 #if NVTE_GG_DTYPE == 1
-using ElementA = cutlass::half_t;
-using ElementB = cutlass::half_t;
-using ElementD = cutlass::half_t;
+using ElementAB = cutlass::half_t;
 #else
-using ElementA = cutlass::bfloat16_t;
-using ElementB = cutlass::bfloat16_t;
-using ElementD = cutlass::bfloat16_t;
+using ElementAB = cutlass::bfloat16_t;
 #endif
+using ElementA = ElementAB;
+using ElementB = ElementAB;
+
+// Gradient accumulation (wgrad with fuse_wgrad_accumulation) writes straight
+// into the fp32 main_grad, so D and the aliased C carry 32-bit values while the
+// operands stay 16-bit. Everything else keeps C/D at the operand dtype, which
+// is the latency-optimal form for a 16-bit destination.
+#if NVTE_GG_OUT_FP32
+using ElementD = float;
+#else
+using ElementD = ElementAB;
+#endif
+
 using ElementAccumulator = float;
 
 // When accumulate=false (no source C load), ElementC=void tells the epilogue
@@ -135,8 +149,12 @@ using ArchTag = cutlass::arch::PPU0015;
 
 constexpr int kAlignmentA = 8;
 constexpr int kAlignmentB = 8;
-constexpr int kAlignmentC = 8;
-constexpr int kAlignmentD = 8;
+// ppu_builder.inl types the gmem store atom as
+// AutoVectorizingCopyWithAssumedAlignment<sizeof(ElementD) * AlignmentD * 8>,
+// and that trait only accepts MaxVecBits <= 128. A 4-byte ElementD therefore
+// caps the alignment at 4 elements (= 128 bit); 8 would not compile.
+constexpr int kAlignmentC = NVTE_GG_OUT_FP32 ? 4 : 8;
+constexpr int kAlignmentD = kAlignmentC;
 
 // Tile comes from the host-provided macros; the host uses the same values to
 // size the launch grid and block, so they must agree. ClusterShape mirrors the
