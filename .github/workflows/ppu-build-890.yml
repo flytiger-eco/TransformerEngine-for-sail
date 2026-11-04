@@ -37,15 +37,8 @@ env:
     fi
 
     # PCCL (NCCL wrapper)
-    # PCCL 来自内网；合并已有绕行规则，公网下载继续使用原代理。
-    if [[ "${no_proxy:-}" == '*' || "${NO_PROXY:-}" == '*' ]]; then
-      no_proxy='*'
-    else
-      no_proxy="${no_proxy:+${no_proxy},}${NO_PROXY:+${NO_PROXY},}pkg.flytiger-eco.com"
-    fi
-    export no_proxy NO_PROXY="$no_proxy"
     PCCL_TARBALL="/tmp/$(basename "${PCCL_URL}")"
-    wget --no-verbose --timeout=60 --tries=3 -O "${PCCL_TARBALL}" "${PCCL_URL}"
+    wget -q -O "${PCCL_TARBALL}" "${PCCL_URL}"
     tar zxf "${PCCL_TARBALL}" -C /usr/local
     set +u; source /usr/local/pccl/envsetup.sh; set -u
     export CPATH="${NCCL_HOME}/include${CPATH:+:${CPATH}}"
