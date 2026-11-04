@@ -159,6 +159,13 @@ jobs:
             if [[ -f "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh" ]]; then
               set +u; source "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh"; set -u
             fi
+            # PCCL 来自内网；合并已有绕行规则，公网下载继续使用原代理。
+            if [[ "${no_proxy:-}" == '*' || "${NO_PROXY:-}" == '*' ]]; then
+              no_proxy='*'
+            else
+              no_proxy="${no_proxy:+${no_proxy},}${NO_PROXY:+${NO_PROXY},}pkg.flytiger-eco.com"
+            fi
+            export no_proxy NO_PROXY="$no_proxy"
             export PCCL_URL='${{ env.PCCL_URL }}'
             python3 -c 'import os, urllib.request; urllib.request.urlretrieve(os.environ["PCCL_URL"], "/tmp/pccl.tar.gz")'
             tar zxf /tmp/pccl.tar.gz -C /usr/local
