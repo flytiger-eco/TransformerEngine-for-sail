@@ -36,7 +36,6 @@ env:
       set +u; source "${SDK_INSTALL_DIR}/PPU_SDK/envsetup.sh"; set -u
     fi
 
-    # PCCL (NCCL wrapper)
     PCCL_TARBALL="/tmp/$(basename "${PCCL_URL}")"
     wget -q -O "${PCCL_TARBALL}" "${PCCL_URL}"
     tar zxf "${PCCL_TARBALL}" -C /usr/local
