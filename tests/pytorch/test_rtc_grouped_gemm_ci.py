@@ -591,6 +591,9 @@ def test_workflow_publisher_isolated():
     assert "head.repo.full_name == github.repository" in publisher["if"]
     assert "github.event_name == 'pull_request'" in publisher["if"]
     assert publisher["steps"][0]["uses"] == "actions/download-artifact@v4"
+    publish = publisher["steps"][-1]
+    assert publish["env"]["PR_NUMBER"] == "${{ github.event.pull_request.number }}"
+    assert "context.issue" not in publish["with"]["script"]
     assert publisher["steps"][0]["with"]["artifact-ids"] == "${{ needs.gate.outputs.report_id }}"
     assert gate["outputs"]["report_id"] == "${{ steps.report_artifact.outputs.artifact-id }}"
     assert not any(
@@ -721,24 +724,40 @@ def test_plot_paired_data_and_error(tmp_path, monkeypatch, error):
         "exhausted",
         "error-report",
         "missing-commit",
+        "missing-pr",
+        "invalid-pr",
+        "zero-pr",
+        "fractional-pr",
+        "unsafe-pr",
     ],
 )
-def test_publisher_api(scenario):
+@pytest.mark.parametrize("context_number", [38, None, 999])
+def test_publisher_api(scenario, context_number):
     import quickjs
 
     script = workflow_config()["jobs"]["publish"]["steps"][-1]["with"]["script"]
     vm = quickjs.Context()
     vm.eval("const scenario = " + json.dumps(scenario) + ";")
+    vm.eval("const contextNumber = " + json.dumps(context_number) + ";")
     vm.eval(
         r"""
         const calls = [], warnings = [];
-        let done = false, failure = null, branches = 0, commits = 0, updates = 0;
+        let done = false, failure = null, branches = 0, commits = 0, updates = 0, reads = 0;
         const context = {serverUrl: 'https://github.com', repo: {owner: 'owner', repo: 'repo'},
-                         runId: 123, issue: {number: 38}};
-        const process = {env: {REPORT_OUT: '/report', GITHUB_RUN_ATTEMPT: '2'}};
+                         runId: 123};
+        // 事件文件缺失时，禁止通过 context.issue 获取 PR 编号。
+        Object.defineProperty(context, 'issue', {get: () => {
+            if (contextNumber === null) throw new Error('事件文件不存在');
+            return {number: contextNumber};
+        }});
+        const invalidPr = {'missing-pr': undefined, 'invalid-pr': 'abc', 'zero-pr': '0',
+                           'fractional-pr': '38.5', 'unsafe-pr': '9007199254740992'};
+        const prNumber = scenario in invalidPr ? invalidPr[scenario] : '38';
+        const process = {env: {REPORT_OUT: '/report', GITHUB_RUN_ATTEMPT: '2', PR_NUMBER: prNumber}};
         const core = {warning: message => warnings.push(message)};
         function fail(status) { throw Object.assign(new Error('模拟 API 失败'), {status}); }
         const fs = {readFileSync: path => {
+            reads++;
             if (path.endsWith('.md')) return scenario === 'error-report' ? 'ERROR: 缺测' : 'PASS';
             if (scenario === 'missing-png') throw new Error('PNG 不存在');
             return {length: scenario === 'oversized' ? 6000000 : 8,
@@ -773,10 +792,13 @@ def test_publisher_api(scenario):
         const issues = {listComments: 'list',
                         createComment: async args => calls.push({name: 'createComment', args}),
                         updateComment: async args => calls.push({name: 'updateComment', args})};
-        const github = {rest: {git, issues}, paginate: async () => scenario === 'existing' ? [
-            {id: 7, user: {login: 'someone'}, body: '<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->'},
-            {id: 9, user: {login: 'github-actions[bot]'}, body: '<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->'}
-        ] : []};
+        const github = {rest: {git, issues}, paginate: async (method, args) => {
+            calls.push({name: 'listComments', args});
+            return scenario === 'existing' ? [
+                {id: 7, user: {login: 'someone'}, body: '<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->'},
+                {id: 9, user: {login: 'github-actions[bot]'}, body: '<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->'}
+            ] : [];
+        }};
     """
     )
     vm.eval(
@@ -787,8 +809,13 @@ def test_publisher_api(scenario):
     for _ in range(200):
         if not vm.execute_pending_job():
             break
-    assert vm.eval("done") and vm.eval("failure") is None
+    assert vm.eval("done")
     calls = json.loads(vm.eval("JSON.stringify(calls)"))
+    if scenario in ("missing-pr", "invalid-pr", "zero-pr", "fractional-pr", "unsafe-pr"):
+        assert "PR_NUMBER" in vm.eval("failure")
+        assert not calls and vm.eval("reads") == 0
+        return
+    assert vm.eval("failure") is None
     comments = [call for call in calls if call["name"] in ("createComment", "updateComment")]
     assert len(comments) == 1
     body = comments[0]["args"]["body"]
@@ -815,6 +842,10 @@ def test_publisher_api(scenario):
         args = call["args"]
         if "ref" in args:
             assert args["ref"] in ("heads/ci-reports", "refs/heads/ci-reports")
+        if call["name"] in ("listComments", "createComment"):
+            assert args["issue_number"] == 38
+        if call["name"] == "createCommit":
+            assert "PR #38" in args["message"]
         if call["name"] == "updateRef":
             assert args["force"] is False
         if call["name"] == "createTree":

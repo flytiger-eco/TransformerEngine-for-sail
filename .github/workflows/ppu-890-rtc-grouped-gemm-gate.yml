@@ -239,10 +239,17 @@ jobs:
         uses: actions/github-script@v7
         env:
           REPORT_OUT: ${{ runner.temp }}/rtc-grouped-gemm-report
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         with:
           script: |
             const fs = require('fs');
             const dir = process.env.REPORT_OUT;
+            // K8s 容器 hook 可能未挂载事件文件；编号由 runner 表达式显式传入。
+            const rawPrNumber = process.env.PR_NUMBER || '';
+            const prNumber = Number(rawPrNumber);
+            if (!/^[1-9]\d*$/.test(rawPrNumber) || !Number.isSafeInteger(prNumber)) {
+              throw new Error('PR_NUMBER 缺失或无效；停止发布，避免写入错误 PR 路径');
+            }
             const marker = '<!-- te-rtc-grouped-gemm-gate:ZW-M890P -->';
             const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const report = fs.readFileSync(dir + '/gate.md', 'utf8');
@@ -253,7 +260,7 @@ jobs:
                 throw new Error('图表不是有效 PNG 或超过 5 MiB');
               }
               const branch = 'ci-reports';
-              const imagePath = `rtc-grouped-gemm/pr-${context.issue.number}/run-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}/gate.png`;
+              const imagePath = `rtc-grouped-gemm/pr-${prNumber}/run-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}/gate.png`;
               const blob = await github.rest.git.createBlob({
                 ...context.repo, content: png.toString('base64'), encoding: 'base64'
               });
@@ -278,7 +285,7 @@ jobs:
                   tree: [{path: imagePath, mode: '100644', type: 'blob', sha: blob.data.sha}]
                 });
                 const commit = await github.rest.git.createCommit({
-                  ...context.repo, message: `RTC GroupGemm report: PR #${context.issue.number}, run ${context.runId}`,
+                  ...context.repo, message: `RTC GroupGemm report: PR #${prNumber}, run ${context.runId}`,
                   tree: tree.data.sha, parents: parent ? [parent] : []
                 });
                 try {
@@ -301,11 +308,11 @@ jobs:
             }
             const body = marker + '\n' + image + report.slice(0, 60000) + '\n运行记录：' + url;
             const comments = await github.paginate(github.rest.issues.listComments, {
-              ...context.repo, issue_number: context.issue.number, per_page: 100
+              ...context.repo, issue_number: prNumber, per_page: 100
             });
             const existing = comments.find(c => c.user.login === 'github-actions[bot]' && c.body.includes(marker));
             if (existing) {
               await github.rest.issues.updateComment({...context.repo, comment_id: existing.id, body});
             } else {
-              await github.rest.issues.createComment({...context.repo, issue_number: context.issue.number, body});
+              await github.rest.issues.createComment({...context.repo, issue_number: prNumber, body});
             }
