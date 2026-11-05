@@ -16,6 +16,7 @@
 
 #include "transformer_engine/normalization.h"
 #include "transformer_engine/transformer_engine.h"
+#include "tuned_dispatch.h"
 
 /*
 
@@ -514,7 +515,8 @@ NormalizationPlanBase* NormalizationPlanRegistry::getNormalizationPlan(
     const size_t sm_count, const bool zero_centered_gamma, const bool is_aligned,
     const NVTEScalingMode mode, const bool training, const bool gamma_in_weight_dtype) {
   const DType ctype = DType::kFloat32;
-  bool is_tuned = is_aligned && (batch_size % 4 == 0);
+  bool is_tuned = tuned_dispatch_supported(NormType == NVTE_Norm_Type::RMSNorm, batch_size,
+                                           is_aligned);
   auto key =
       get_key(NormBackend, NormType, NormStage, wtype, itype, otype, ctype, batch_size, hidden_size,
               zero_centered_gamma, is_tuned, mode, training, gamma_in_weight_dtype);
