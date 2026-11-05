@@ -17,6 +17,7 @@
 
 #include <transformer_engine/normalization.h>
 #include <transformer_engine/transformer_engine.h>
+#include "normalization/tuned_dispatch.h"
 #include "../test_common.h"
 #include "test_normalization.h"
 
@@ -235,6 +236,19 @@ std::vector<std::pair<size_t, size_t>> test_cases = {
   {29, 541},
   {768, 6144},
   {2048, 12288},
+  {5447, 5120},
+};
+
+// RMSNorm row counts that are not a multiple of 4 used to be routed to the
+// general kernel. The tuned presets covered here include both WARPS_M == 1
+// (2560/3072/5120) and WARPS_M == 4 (512) layouts.
+std::vector<std::pair<size_t, size_t>> odd_row_test_cases = {
+  {1, 5120},
+  {3, 1024},
+  {5445, 3072},
+  {5447, 512},
+  {5447, 2560},
+  {5447, 5120},
 };
 
 }  // namespace
@@ -302,3 +316,59 @@ INSTANTIATE_TEST_SUITE_P(
       std::to_string(std::get<7>(info.param));
     return name;
   });
+
+// The gate decides between tuned and general kernels before any kernel lookup,
+// so it is checked directly; the numerical tests below cover the resulting path.
+TEST(NormTunedDispatchGate, RmsnormAcceptsAnyRowCount) {
+  const size_t rows_to_check[] = {1, 2, 3, 5, 5447, 5448};
+  for (const size_t rows : rows_to_check) {
+    EXPECT_TRUE(normalization::tuned_dispatch_supported(true, rows, true)) << "rows=" << rows;
+  }
+}
+
+TEST(NormTunedDispatchGate, LayernormRequiresRowsMultipleOfFour) {
+  EXPECT_FALSE(normalization::tuned_dispatch_supported(false, 5447, true));
+  EXPECT_TRUE(normalization::tuned_dispatch_supported(false, 5448, true));
+}
+
+TEST(NormTunedDispatchGate, UnalignedPointersDisableTuned) {
+  EXPECT_FALSE(normalization::tuned_dispatch_supported(true, 5448, false));
+  EXPECT_FALSE(normalization::tuned_dispatch_supported(false, 5448, false));
+}
+
+class NormOddRowTestSuite
+    : public ::testing::TestWithParam<std::tuple<transformer_engine::DType, std::pair<size_t, size_t>,
+                                                 bool, bool>> {};
+
+TEST_P(NormOddRowTestSuite, TestNorm) {
+  using namespace transformer_engine;
+  using namespace test;
+
+  const DType dtype = std::get<0>(GetParam());
+  const auto size = std::get<1>(GetParam());
+  const bool zero_centered_gamma = std::get<2>(GetParam());
+  const bool fused_bwd_add = std::get<3>(GetParam());
+
+  // This suite targets the TE dispatch path, never the cuDNN backend.
+  nvte_enable_cudnn_norm_fwd(false);
+  nvte_enable_cudnn_norm_bwd(false);
+
+  TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(
+      dtype, T,
+      performTest<T, T>(size.first, size.second, zero_centered_gamma, NormType::RMSNorm, false,
+                        false, fused_bwd_add););
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    OperatorTest, NormOddRowTestSuite,
+    ::testing::Combine(::testing::Values(DType::kFloat32, DType::kBFloat16, DType::kFloat16),
+                       ::testing::ValuesIn(odd_row_test_cases), ::testing::Values(false, true),
+                       ::testing::Values(false, true)),
+    [](const testing::TestParamInfo<NormOddRowTestSuite::ParamType>& info) {
+      std::string name = test::typeName(std::get<0>(info.param)) + "X" +
+                         std::to_string(std::get<1>(info.param).first) + "X" +
+                         std::to_string(std::get<1>(info.param).second) + "X" +
+                         std::to_string(std::get<2>(info.param)) + "X" +
+                         std::to_string(std::get<3>(info.param));
+      return name;
+    });
