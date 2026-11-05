@@ -43,19 +43,19 @@ constexpr size_t pipe_block_size = THREADS_PER_WARP * pipe_warps;
 constexpr size_t pipe_div(size_t a, size_t b) { return b == 0 ? 0 : a / b; }
 
 bool pipeline_eligible(const Tensor &input, const Tensor &output, size_t row_length,
-                       size_t num_rows, size_t itype_size, size_t otype_size) {
+                       size_t num_rows, size_t itype_size, size_t otype_size, size_t load_size) {
   if (getenv<int>("NVTE_CAST_TRANSPOSE_PIPELINE", 1) == 0 || cuda::sm_arch() < 80) return false;
   if (itype_size != 2 && itype_size != 4) return false;
-  if (pipe_load_size % itype_size != 0 || pipe_store_size % otype_size != 0) return false;
+  if (load_size % itype_size != 0 || pipe_store_size % otype_size != 0) return false;
   const size_t tile_m = THREADS_PER_WARP * pipe_div(pipe_store_size, otype_size);
-  const size_t tile_n = THREADS_PER_WARP * pipe_div(pipe_load_size, itype_size);
+  const size_t tile_n = THREADS_PER_WARP * pipe_div(load_size, itype_size);
   if (row_length == 0 || num_rows == 0 || tile_m == 0 || tile_n == 0) return false;
   if (row_length % tile_n != 0 || num_rows % tile_m != 0) return false;
   if (num_rows > ((size_t{1} << 31) - 1) / row_length) return false;
   if (num_rows * row_length <= (size_t{2} << 20)) return false;
   // Rowwise output is written as Vec<OType, load_size / itype_size>, columnwise
   // output as Vec<OType, store_size / otype_size>.
-  const size_t rowwise_vec_bytes = pipe_div(pipe_load_size, itype_size) * otype_size;
+  const size_t rowwise_vec_bytes = pipe_div(load_size, itype_size) * otype_size;
   return reinterpret_cast<uintptr_t>(input.data.dptr) % 16 == 0 &&
          reinterpret_cast<uintptr_t>(output.data.dptr) % rowwise_vec_bytes == 0 &&
          reinterpret_cast<uintptr_t>(output.columnwise_data.dptr) % pipe_store_size == 0;
@@ -320,29 +320,48 @@ void cast_transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cu
             if (aligned && rtc::is_enabled()) {  // Runtime-compiled tuned kernel
               auto &rtc_manager = rtc::KernelManager::instance();
               bool launched = false;
-              if (pipeline_eligible(input, output, row_length, num_rows, itype_size, otype_size)) {
+              // 只在已验证的 FP8 形状范围使用新配置，其余保留原有路径。
+              // bytewise 转换算术不变；32 位元素偏移受 pipeline_eligible 的 2^31 上限保护。
+              const size_t elements = input.numel();
+              const bool wide = otype_size == 1 &&
+                                ((itype_size == 4 && elements >= (size_t{8} << 20)) ||
+                                 (itype_size == 2 && elements >= (size_t{32} << 20)));
+              const bool wide_aligned = wide &&
+                                        pipeline_eligible(input, output, row_length, num_rows,
+                                                          itype_size, otype_size, 8);
+              const bool narrow = otype_size == 1 && itype_size == 2 &&
+                                  elements <= (size_t{16} << 20);
+              const bool compact_index = wide_aligned || narrow;
+              const size_t load_size = wide_aligned ? 8 : pipe_load_size;
+              const size_t stages = wide_aligned ? 1 : pipe_stages;
+              if (pipeline_eligible(input, output, row_length, num_rows, itype_size, otype_size,
+                                    load_size)) {
                 const size_t tile_m = THREADS_PER_WARP * pipe_div(pipe_store_size, otype_size);
-                const size_t tile_n = THREADS_PER_WARP * pipe_div(pipe_load_size, itype_size);
+                const size_t tile_n = THREADS_PER_WARP * pipe_div(load_size, itype_size);
                 const size_t stage_bytes = tile_m * (tile_n * itype_size + 16);
-                const size_t staging_bytes =
-                    THREADS_PER_WARP * (THREADS_PER_WARP + 1) * pipe_store_size;
-                const size_t dyn_smem = pipe_stages * stage_bytes + staging_bytes;
+                const size_t staging_bytes = THREADS_PER_WARP * (THREADS_PER_WARP + 1) *
+                                             pipe_store_size *
+                                             (compact_index ? pipe_div(load_size, itype_size) : 1);
+                const size_t dyn_smem = stages * stage_bytes + staging_bytes;
                 const unsigned num_tiles_m = static_cast<unsigned>(num_rows / tile_m);
                 const unsigned total_tiles =
                     static_cast<unsigned>(num_tiles_m * (row_length / tile_n));
                 const std::string pipe_label = concat_strings(
                     "cast_transpose_pipeline,itype=", itype_name, ",otype=", otype_name,
-                    ",load_size=", pipe_load_size, ",store_size=", pipe_store_size,
-                    ",warps_per_tile=", pipe_warps, ",stages=", pipe_stages);
+                    ",load_size=", load_size, ",store_size=", pipe_store_size,
+                    ",warps_per_tile=", pipe_warps, ",stages=", stages,
+                    ",compact_index=", compact_index);
                 if (!rtc_manager.is_compiled(pipe_label)) {
                   std::string code = string_code_transpose_rtc_cast_transpose_pipeline_cu;
                   code = regex_replace(code, "__ITYPE__", itype_name);
                   code = regex_replace(code, "__OTYPE__", otype_name);
-                  code = regex_replace(code, "__LOAD_SIZE__", pipe_load_size);
+                  code = regex_replace(code, "__LOAD_SIZE__", load_size);
                   code = regex_replace(code, "__STORE_SIZE__", pipe_store_size);
                   code = regex_replace(code, "__WARPS_PER_TILE__", pipe_warps);
                   code = regex_replace(code, "__BLOCK_SIZE__", pipe_block_size);
-                  code = regex_replace(code, "__STAGES__", pipe_stages);
+                  code = regex_replace(code, "__STAGES__", stages);
+                  code = regex_replace(code, "__INDEX_TYPE__", compact_index ? "unsigned" : "size_t");
+                  code = regex_replace(code, "__COMBINE_COMPONENTS__", compact_index ? "true" : "false");
                   rtc_manager.compile(
                       pipe_label, "cast_transpose_pipeline_kernel", code,
                       "transformer_engine/common/transpose/rtc/cast_transpose_pipeline.cu");

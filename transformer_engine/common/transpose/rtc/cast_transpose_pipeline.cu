@@ -13,6 +13,8 @@ namespace {
 using CType = float;
 using IType = __ITYPE__;
 using OType = __OTYPE__;
+using IndexType = __INDEX_TYPE__;
+constexpr bool combine_components = __COMBINE_COMPONENTS__;
 constexpr size_t load_size = __LOAD_SIZE__;
 constexpr size_t store_size = __STORE_SIZE__;
 constexpr size_t warps_per_tile = __WARPS_PER_TILE__;
@@ -108,7 +110,8 @@ __global__ void __launch_bounds__(block_size) cast_transpose_pipeline_kernel(
   auto issue_tile = [&](unsigned t, IType *stage) {
     const unsigned id_m = t % num_tiles_m;
     const unsigned id_n = t / num_tiles_m;
-    const IType *src = input + static_cast<size_t>(id_m * tile_dim_m) * row_length +
+    // 元素索引缩窄不改变指针宽度；dispatch 已检查 2^31 元素上限。
+    const IType *src = input + static_cast<IndexType>(id_m * tile_dim_m) * row_length +
                        id_n * tile_dim_n;
 #pragma unroll
     for (size_t c = 0; c < kChunksPerThread; ++c) {
@@ -116,7 +119,7 @@ __global__ void __launch_bounds__(block_size) cast_transpose_pipeline_kernel(
       const unsigned r = chunk / kChunksPerRow;
       const unsigned k = chunk % kChunksPerRow;
       cp_async16(stage + r * kRowElts + k * kChunkElts,
-                 src + static_cast<size_t>(r) * row_length + k * kChunkElts);
+                 src + static_cast<IndexType>(r) * row_length + k * kChunkElts);
     }
   };
 
@@ -147,29 +150,57 @@ __global__ void __launch_bounds__(block_size) cast_transpose_pipeline_kernel(
           local_output_c.data.elt[j2] = out;
           local_output_t[j2][iter].data.elt[i2] = out;
         }
-        local_output_c.store_to(&output_c[static_cast<size_t>(row) * row_length + col]);
+        local_output_c.store_to(&output_c[static_cast<IndexType>(row) * row_length + col]);
       }
     }
 
+    if constexpr (combine_components) {
 #pragma unroll
-    for (size_t j2 = 0; j2 < nvec_in; ++j2) {
+      for (size_t j2 = 0; j2 < nvec_in; ++j2) {
 #pragma unroll
-      for (size_t iter = 0; iter < num_iterations; ++iter) {
-        const size_t i1 = tidy + iter * bdimy;
-        const size_t j1 = tidx;
-        staging[j1 * (THREADS_PER_WARP + 1) + i1] = local_output_t[j2][iter];
+        for (size_t iter = 0; iter < num_iterations; ++iter) {
+          const size_t i1 = tidy + iter * bdimy;
+          const size_t j1 = tidx;
+          staging[(j2 * THREADS_PER_WARP + j1) * (THREADS_PER_WARP + 1) + i1] =
+              local_output_t[j2][iter];
+        }
       }
+      // 一次填充所有分量，共享内存换取更少同步及独立读取窗口。
       __syncthreads();
 #pragma unroll
-      for (size_t iter = 0; iter < num_iterations; ++iter) {
-        const size_t i1 = tidx;
-        const size_t j1 = tidy + iter * bdimy;
-        const unsigned row = tile_row + i1 * nvec_out;
-        const unsigned col = tile_col + j1 * nvec_in + j2;
-        staging[j1 * (THREADS_PER_WARP + 1) + i1]
-            .store_to(&output_t[static_cast<size_t>(col) * num_rows + row]);
+      for (size_t j2 = 0; j2 < nvec_in; ++j2) {
+#pragma unroll
+        for (size_t iter = 0; iter < num_iterations; ++iter) {
+          const size_t i1 = tidx;
+          const size_t j1 = tidy + iter * bdimy;
+          const unsigned row = tile_row + i1 * nvec_out;
+          const unsigned col = tile_col + j1 * nvec_in + j2;
+          staging[(j2 * THREADS_PER_WARP + j1) * (THREADS_PER_WARP + 1) + i1]
+              .store_to(&output_t[static_cast<IndexType>(col) * num_rows + row]);
+        }
       }
       __syncthreads();
+    } else {
+#pragma unroll
+      for (size_t j2 = 0; j2 < nvec_in; ++j2) {
+#pragma unroll
+        for (size_t iter = 0; iter < num_iterations; ++iter) {
+          const size_t i1 = tidy + iter * bdimy;
+          const size_t j1 = tidx;
+          staging[j1 * (THREADS_PER_WARP + 1) + i1] = local_output_t[j2][iter];
+        }
+        __syncthreads();
+#pragma unroll
+        for (size_t iter = 0; iter < num_iterations; ++iter) {
+          const size_t i1 = tidx;
+          const size_t j1 = tidy + iter * bdimy;
+          const unsigned row = tile_row + i1 * nvec_out;
+          const unsigned col = tile_col + j1 * nvec_in + j2;
+          staging[j1 * (THREADS_PER_WARP + 1) + i1]
+              .store_to(&output_t[static_cast<IndexType>(col) * num_rows + row]);
+        }
+        __syncthreads();
+      }
     }
   };
 
