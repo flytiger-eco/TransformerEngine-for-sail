@@ -1198,7 +1198,18 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
     return true;
   };
 
-  auto is_supported_dtype = [&]() -> bool {
+  // Dtype classes the CUTLASS grouped-GEMM family can serve:
+  //   0 = unsupported
+  //   1 = 16-bit A/B and a 16-bit D (every backend below)
+  //   2 = 16-bit A/B with an fp32 D. This is the wgrad gradient-accumulation
+  //       case: GroupedLinear(fuse_wgrad_accumulation=True) accumulates into an
+  //       fp32 main_grad (Megatron runs the optimizer master weights in fp32),
+  //       so A/B are bf16/fp16 while the destination tensor is fp32. Only the
+  //       RTC backend instantiates an fp32-output epilogue; the statically
+  //       compiled CUTLASS paths stay 16-bit-D-only.
+  // C is aliased to D inside every one of these backends, so the D type also
+  // describes the source tensor.
+  auto dtype_class = [&]() -> int {
     auto *inputA = transformer_engine::convertNVTETensorCheck(A[0]);
     auto *inputB = transformer_engine::convertNVTETensorCheck(B[0]);
     auto *OutputD = transformer_engine::convertNVTETensorCheck(D[0]);
@@ -1206,8 +1217,11 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
     auto B_type = get_cuda_dtype(inputB->data.dtype);
     auto D_type = get_cuda_dtype(OutputD->data.dtype);
 
-    return (A_type == B_type) && (A_type == D_type) &&
-           ((A_type == CUDA_R_16BF) || (A_type == CUDA_R_16F));
+    if (A_type != B_type) return 0;
+    if (A_type != CUDA_R_16BF && A_type != CUDA_R_16F) return 0;
+    if (D_type == A_type) return 1;
+    if (D_type == CUDA_R_32F) return 2;
+    return 0;
   };
 
   // CUTLASS Grouped GEMM fast path (SM90/TMA)
@@ -1229,11 +1243,31 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   //  - grad is irrelevant when bias/pre_gelu_out are empty.
   //
   // Otherwise, fall back to cuBLAS.
-  if (is_empty_arr(bias) && is_empty_arr(pre_gelu_out) && is_supported_dtype() &&
+  const int dtype_cls = dtype_class();
+  if (is_empty_arr(bias) && is_empty_arr(pre_gelu_out) && dtype_cls != 0 &&
       all_groups_min_aligned() &&
       (sm80_disable_alignment_check || all_groups_uniform_k128(B, transb))) {
-    // Optional NVRTC-JIT fast path for SM80/SM89.
-    if (use_cutlass_rtc && (is_sm80 || is_sm89)) {
+    // Optional NVRTC-JIT fast path for SM80/SM89. It is the only backend that
+    // covers both dtype classes: its epilogue is instantiated for a 16-bit and
+    // for an fp32 destination.
+    //
+    // Exception: an fp32 destination with accumulate=true (wgrad into an fp32
+    // main_grad) still defaults to cuBLAS. The gate was added for a defect that
+    // corrupted D over the first M tile; the cause was later found on the host
+    // side, where an fp32 request was dispatched twice (the 16-bit launcher ran
+    // first and overwrote the leading rows of D, so the fp32 launcher read back
+    // an already clobbered source). The single mutually exclusive dispatch in
+    // cutlass_grouped_gemm_rtc() fixes that, and
+    // test_grouped_wgrad_rtc_inplace covers the first and later M tiles against
+    // an fp32 reference. The gate is kept as a conservative default for now:
+    // flipping it changes the backend every wgrad takes, which is a separate
+    // decision from landing the kernel.
+    //
+    // NVTE_GG_ALLOW_FP32_ACCUM=1 routes fp32 accumulate through the RTC path.
+    const bool rtc_handles_accum =
+        !(dtype_cls == 2 && accumulate) ||
+        transformer_engine::getenv<bool>("NVTE_GG_ALLOW_FP32_ACCUM", false);
+    if (use_cutlass_rtc && (is_sm80 || is_sm89) && rtc_handles_accum) {
       const bool ok = cutlass_grouped_gemm_rtc(
           A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
           current_device, math_sm_count, stream);
@@ -1245,6 +1279,20 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
                  "CUTLASS RTC grouped GEMM failed and NVTE_FORCE_RTC_NO_FALLBACK=1.");
       if (warn_fallback) {
         NVTE_WARN("CUTLASS RTC grouped GEMM unavailable, falling back to cuBLAS.");
+      }
+      cublas_path_tagged();
+      return;
+    }
+
+    if (dtype_cls == 2) {
+      // fp32 destination with the RTC arm disabled: the static CUTLASS paths
+      // have no fp32-output epilogue, so hand it to cuBLAS rather than launch a
+      // kernel that would read the 32-bit buffer as 16-bit. This also covers
+      // accumulate=true, which the RTC arm declines (see rtc_handles_accum).
+      if (warn_fallback) {
+        NVTE_WARN("Fallback to cuBLAS grouped GEMM (fp32 destination is only "
+                  "implemented by the CUTLASS RTC arm, which declines "
+                  "accumulate=true).");
       }
       cublas_path_tagged();
       return;

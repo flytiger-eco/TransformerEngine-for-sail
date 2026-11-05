@@ -54,13 +54,57 @@
 
 #include "cutlass/epilogue/fusion/ppu_callbacks.hpp"
 
+// RTC in-place accumulation folds C into the direct output fragment; the host
+// guarantees alpha==beta==1.
+#ifndef NVTE_GG_PRELOAD_C
+#define NVTE_GG_PRELOAD_C 0
+#endif
+#ifndef NVTE_GG_PROLOGUE_C
+#define NVTE_GG_PROLOGUE_C 0
+#endif
+#ifndef NVTE_GG_ATOMIC_C
+#define NVTE_GG_ATOMIC_C 0
+#endif
+#ifndef NVTE_GG_ATOMIC_GLOBAL
+#define NVTE_GG_ATOMIC_GLOBAL 0
+#endif
+#ifndef NVTE_GG_ATOMIC_INTERLEAVE
+#define NVTE_GG_ATOMIC_INTERLEAVE 0
+#endif
+// A3-native: bulk-prefetch C into smem with an AIU tensor copy instead of a
+// per-thread global vector load. Measured over eight shapes, the ACU tensor
+// core active rate gains a geometric mean of +23.78% and the net cost of C
+// drops to 0.339x, with D bit-identical to the baseline — hence on by default.
+// A tile whose shape does not qualify falls back to the fragment path silently
+// via kCanStageC.
+#ifndef NVTE_GG_C_AIU_SMEM
+#define NVTE_GG_C_AIU_SMEM 1
+#endif
+// Upper bound on the C prefetch pipeline depth. Depth 2 measured a further
+// +6.3% over depth 1 (TFU 59.88 vs 56.33, non-overlapping distributions), so 2
+// is the default. The second stage must be borrowed from the kernel union's
+// slack and must never live in the epilogue's own SharedStorage: that would be
+// subtracted from the 256KB by StageCountAutoCarveout, and 4 of 7 tiles with
+// stages=0 measurably lost a mainloop stage as a result (256x256x64 dropped
+// straight to 1 and also tripped the mainloop's Stages>=2 assertion).
+// Borrowing the slack leaves sizeof(SharedStorage) completely unchanged.
+#ifndef NVTE_GG_C_AIU_STAGES
+#define NVTE_GG_C_AIU_STAGES 2
+#endif
+
+#if NVTE_GG_C_AIU_SMEM
+#include "cute/arch/copy_ppu.hpp"
+#include "cute/arch/copy_ppu0015_aiu.hpp"
+#endif
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
 namespace epilogue {
 namespace collective {
 
-// Direct store 只支持无坐标依赖、无归约节点的 LinearCombination。
+// Direct store only supports a LinearCombination with no coordinate dependency
+// and no reduction node.
 template <class Operation>
 struct IsDirectStoreLinearCombination {
   static constexpr bool value = false;
@@ -176,7 +220,7 @@ public:
   template <class IndexType>
   static constexpr ElementC const*
   get_c_ptr(const Params& params, IndexType l, bool isSrcNeeded) {
-    if (!isSrcNeeded) {
+    if (!isSrcNeeded || params.ptr_C == nullptr) {
       return nullptr;
     }
     if constexpr (IsUsePtrArray) {
@@ -275,7 +319,13 @@ public:
     class BlockCoordMNKL,
     class FrgEngine, class FrgLayout,
     class TiledMma,
-    class ResidueMNK
+    class ResidueMNK,
+    // Bytes actually usable from smem_buf onwards (the size of the kernel-side
+    // union). The C prefetch pipeline borrows the union's slack for its second
+    // stage, and the epilogue cannot see how much of it the mainloop occupies,
+    // so this bound can only come from the kernel. 0 = use only the epilogue's
+    // own block.
+    class CSmemBytes = cute::Int<0>
   >
   CUTLASS_DEVICE void
   operator()(
@@ -286,8 +336,41 @@ public:
       TiledMma tiled_mma,
       ResidueMNK residue_mnk,
       int thread_idx,
-      char* smem_buf)
+      char* smem_buf,
+      CSmemBytes c_smem_bytes = {})
   {
+#if (defined(__CUDACC_RTC__) || defined(NVTE_GG_PROFILE_RTC)) && \
+    NVTE_GG_ATOMIC_C && NVTE_GG_PRELOAD_C && \
+    !NVTE_GG_PROLOGUE_C && NVTE_GG_TRANS_A && !NVTE_GG_TRANS_B && NVTE_GG_OUT_FP32
+    // RTC fp32 NT wgrad only: the host pins alpha=1 and requests beta=1, while
+    // the EVT sees beta=0. Compare the actual per-group C/D address and stride;
+    // anything not aliased stays on the original fragment path.
+    static_assert(IsDirectStoreSupported && cute::is_same_v<ElementC, float> &&
+                  cute::is_same_v<ElementD, float> &&
+                  cute::is_same_v<ElementAccumulator, float>,
+                  "Atomic C requires fp32 pointer-array LinearCombination");
+    auto l = cute::get<3>(blk_coord_mnkl);
+    auto source = get_c_ptr(params, l, true);
+    if (__builtin_expect(source != nullptr, 0) && source == get_d_ptr(params, l) &&
+        get_stride_c(params, l) == get_stride_d(params, l)) {
+      compute_epilogue_atomic(problem_shape_mnkl, blk_shape_MNK, blk_coord_mnkl,
+                              accumulators, tiled_mma, residue_mnk, thread_idx);
+      return;
+    }
+#endif
+#if NVTE_GG_PRELOAD_C && !NVTE_GG_PROLOGUE_C
+    // Must come before the beta==0 direct short circuit; ptr_C is the host's
+    // signal that it wants C folded in.
+    if (__builtin_expect(get_c_ptr(params, cute::get<3>(blk_coord_mnkl), true) != nullptr, 0)) {
+      static_assert(IsDirectStoreSupported,
+                    "Preload C requires pointer-array LinearCombination");
+      compute_epilogue_direct<ProblemShapeMNKL, BlockShapeMNK, BlockCoordMNKL,
+          FrgEngine, FrgLayout, TiledMma, ResidueMNK, true>(
+          problem_shape_mnkl, blk_shape_MNK, blk_coord_mnkl,
+          accumulators, tiled_mma, residue_mnk, thread_idx, smem_buf, c_smem_bytes);
+      return;
+    }
+#endif
 #if !defined(NVTE_GG_DISABLE_DIRECT_EPILOGUE)
     if constexpr (IsDirectStoreSupported) {
       if (!__builtin_expect(is_source_needed(), 0)) {
@@ -539,14 +622,100 @@ public:
     cst_callbacks.end();
   }
 
-#if !defined(NVTE_GG_DISABLE_DIRECT_EPILOGUE)
+#if (defined(__CUDACC_RTC__) || defined(NVTE_GG_PROFILE_RTC)) && \
+    NVTE_GG_ATOMIC_C && NVTE_GG_PRELOAD_C && \
+    !NVTE_GG_PROLOGUE_C && NVTE_GG_TRANS_A && !NVTE_GG_TRANS_B && NVTE_GG_OUT_FP32
+  template <class ProblemShapeMNKL, class BlockShapeMNK, class BlockCoordMNKL,
+            class FrgEngine, class FrgLayout, class TiledMma, class ResidueMNK>
+  CUTLASS_DEVICE void
+  compute_epilogue_atomic(
+      ProblemShapeMNKL problem_shape_mnkl,
+      BlockShapeMNK blk_shape_MNK,
+      BlockCoordMNKL blk_coord_mnkl,
+      cute::Tensor<FrgEngine, FrgLayout> const& accumulators,
+      TiledMma tiled_mma,
+      ResidueMNK residue_mnk,
+      int thread_idx)
+  {
+    using namespace cute;
+    using X = Underscore;
+    auto M = get<0>(problem_shape_mnkl);
+    auto N = get<1>(problem_shape_mnkl);
+    auto [m_coord, n_coord, k_coord, l_coord] = blk_coord_mnkl;
+    Tensor mD = make_tensor(make_gmem_ptr(get_d_ptr(params, l_coord)),
+                           make_shape(M, N, Int<1>{}), get_stride_d(params, l_coord));
+    Tensor gD_mnl = local_tile(mD, blk_shape_MNK, make_coord(_,_,_), Step<_1,_1,X>{});
+    Tensor gD = gD_mnl(_,_,m_coord,n_coord,0);
+    auto tiled_copy = make_tiled_copy_C(CopyAtomR2S{}, tiled_mma);
+    auto thread_copy = tiled_copy.get_thread_slice(thread_idx);
+    Tensor tCrAcc = thread_copy.retile_S(accumulators);
+    Tensor tCgD = thread_copy.partition_D(gD);
+    Tensor cD = make_identity_tensor(take<0,2>(blk_shape_MNK));
+    Tensor tCcD = thread_copy.partition_D(cD);
+    CUTE_STATIC_ASSERT(size(tCrAcc) == size(tCgD));
+    constexpr int FragSize = decltype(size(tCrAcc(_,0,0)))::value;
+    auto issue = [&](auto rotate) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < size<1>(tCrAcc); ++m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < size<2>(tCrAcc); ++j) {
+          // The two 256-thread warp groups interleave their accesses to the N
+          // fragments, still one writer per element. The fragment index is
+          // expanded statically in each branch, so the accumulator is never
+          // indexed dynamically (which would spill).
+          constexpr int NumN = decltype(size<2>(tCrAcc))::value;
+          int n = (j + decltype(rotate)::value * (NumN / 2)) % NumN;
+          Tensor tCrAcc_frag = tCrAcc(_,m,n);
+          Tensor tCgD_frag = tCgD(_,m,n);
+          Tensor tCcD_frag = tCcD(_,m,n);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < FragSize; ++i) {
+            auto coord = tCcD_frag(i);
+            if (get<0>(coord) < get<0>(residue_mnk) &&
+                get<1>(coord) < get<1>(residue_mnk)) {
+#if NVTE_GG_ATOMIC_GLOBAL && NVTE_GG_ARCH == 89
+              // D is proven to be gmem, so address it explicitly and discard the
+              // result, which skips the per-element generic/TSM test.
+              // The memory clobber stays to stop the compiler from reordering
+              // related memory accesses across this RMW.
+              asm volatile("ppu.atom.global.add.f32 _, [%0], %1;\n"
+                           :: "l"(&tCgD_frag(i)), "f"(tCrAcc_frag(i)) : "memory");
+#else
+              // The returned old value is unused; the underlying op is still an
+              // RMW.
+              atomicAdd(&tCgD_frag(i), tCrAcc_frag(i));
+#endif
+            }
+          }
+        }
+      }
+    };
+#if NVTE_GG_ATOMIC_INTERLEAVE
+    if constexpr (decltype(size(tiled_mma))::value == 512) {
+      if (thread_idx >= 256) {
+        issue(Int<1>{});
+      } else {
+        issue(Int<0>{});
+      }
+    } else {
+      issue(Int<0>{});
+    }
+#else
+    issue(Int<0>{});
+#endif
+  }
+#endif
+
+#if !defined(NVTE_GG_DISABLE_DIRECT_EPILOGUE) || NVTE_GG_PRELOAD_C
   template<
     class ProblemShapeMNKL,
     class BlockShapeMNK,
     class BlockCoordMNKL,
     class FrgEngine, class FrgLayout,
     class TiledMma,
-    class ResidueMNK
+    class ResidueMNK,
+    bool preloadC = false,
+    class CSmemBytes = cute::Int<0>
   >
   CUTLASS_DEVICE void
   compute_epilogue_direct(
@@ -556,7 +725,9 @@ public:
       cute::Tensor<FrgEngine,FrgLayout> const& accumulators,
       TiledMma tiled_mma,
       ResidueMNK residue_mnk,
-      int thread_idx)
+      int thread_idx,
+      char* smem_buf = nullptr,
+      CSmemBytes c_smem_bytes = {})
   {
     using namespace cute;
     using X = Underscore;
@@ -579,7 +750,8 @@ public:
         mD_mnl, blk_shape_MNK, make_coord(_,_,_), Step<_1,_1, X>{});
     Tensor gD = gD_mnl(_,_,m_coord,n_coord,mock_l_coord);
 
-    // 与 DeepGemm 一样按 MMA-C 分片映射 D，避免 SMEM 中转。
+    // Map D by the MMA-C fragment just like DeepGemm does, which avoids the
+    // detour through SMEM.
     auto tiled_r2s = make_tiled_copy_C(CopyAtomR2S{}, tiled_mma);
     auto thread_r2s = tiled_r2s.get_slice(thread_idx);
     auto tC = tiled_r2s.get_thread_slice(thread_idx);
@@ -592,14 +764,17 @@ public:
     Tensor cD = make_identity_tensor(make_shape(size<0>(gD), size<1>(gD)));
     Tensor tCcD = tC.partition_D(cD);
 
-    // LinearCombination 在 beta==0 时只消费 alpha 和 accumulator；这里保留
-    // 原 callback 以支持标量 alpha，同时用占位 C tensor 满足 EVT 参数契约。
+    // With beta==0 the LinearCombination only consumes alpha and the
+    // accumulator. The original callback is kept here so that a scalar alpha
+    // still works, with a placeholder C tensor to satisfy the EVT argument
+    // contract.
     Tensor mC_mnl = make_tensor(
-        make_gmem_ptr(get_c_ptr(params, l_coord, false)), make_shape(M,N,mock_L),
+        make_gmem_ptr(get_c_ptr(params, l_coord, preloadC)), make_shape(M,N,mock_L),
         get_stride_c(params, l_coord));
     Tensor gC_mnl = local_tile(
         mC_mnl, blk_shape_MNK, make_coord(_,_,_), Step<_1,_1, X>{});
     Tensor gC = gC_mnl(_,_,m_coord,n_coord,mock_l_coord);
+    Tensor tCaG = tC.partition_D(gC);
     auto tile = make_shape(size<0>(SmemLayout{}), size<1>(SmemLayout{}));
     Tensor gCt = flat_divide(gC, tile);
     auto tiled_s2r = TiledCopyS2R{};
@@ -637,6 +812,185 @@ public:
         fusion_callbacks.template get_consumer_store_callbacks<true>(cst_args);
     cst_callbacks.begin();
 
+#if NVTE_GG_C_AIU_SMEM
+    // A3-native: instead of every thread issuing a global vector load for C,
+    // an AIU bulk tensor copy moves the whole C block into smem and the MMA-C
+    // fragment is then read from smem. A single AIU instruction moves one cube,
+    // is issued at warp granularity, costs no vreg and is asynchronous, so the
+    // transfer overlaps the accumulate/store work.
+    //
+    // This path imposes hard requirements on C's type, layout and tile shape.
+    // They have to degrade silently rather than static_assert: once this is on
+    // by default every tile reaches here, and a tile_m=128 chunk (kMmaM=2) is
+    // exactly twice the smem tile, so a hard assertion would make small tiles
+    // that are live in production fail at RTC compile time.
+    constexpr int kAiuMmaM   = decltype(size<1>(tCaC))::value;
+    constexpr int kAiuBlockM = decltype(size<0>(cD))::value;
+    constexpr int kAiuBlockN = decltype(size<1>(cD))::value;
+    // The AIU's contiguous extent tops out at 128B, i.e. 32 fp32 columns.
+    constexpr int kAiuCubeW  = 128 / int(sizeof(ElementC));
+    constexpr bool kCanStageC =
+        sizeof(ElementC) == 4 &&
+        cute::is_same_v<ElementC, ElementAccumulator> &&
+        // the AIU's 2D descriptor can only express a C that is contiguous in N
+        cute::is_constant<1, decltype(cute::get<1>(InternalStrideC{}))>::value &&
+        // a chunk has to divide evenly into cubes
+        kAiuBlockN % kAiuCubeW == 0 &&
+        // a chunk must tile the epilogue's smem block exactly, or it would run
+        // past the end and corrupt something else
+        (kAiuBlockM / kAiuMmaM) * kAiuBlockN == int(cute::cosize_v<SmemLayout>);
+
+    if constexpr (preloadC && kCanStageC) {
+      // One chunk = one mma_m row band x all of mma_n, which is exactly the
+      // shape of SmemLayout.
+      constexpr int kMmaN   = decltype(size<2>(tCaC))::value;
+      constexpr int kChunkM = kAiuBlockM / kAiuMmaM;
+      constexpr int kChunkN = kAiuBlockN;
+      constexpr int kChunks = kAiuMmaM;
+      constexpr int kCubeH  = kChunkM;
+      constexpr int kCubeW  = kAiuCubeW;
+      constexpr int kCubes  = kChunkN / kCubeW;
+      constexpr int kCubeElems  = kCubeH * kCubeW;
+      constexpr int kChunkElems = kChunkM * kChunkN;
+      // One stage fills smem_epilogue exactly, so the second one lands on the
+      // FusionStorage that follows it. Double buffering is only allowed when
+      // that really is an empty shell AND the union as a whole has room for it.
+      // If either condition fails, fall back to single buffering silently: that
+      // gives up roughly a third of the gain but never runs out of bounds.
+      constexpr int kChunkBytes  = kChunkElems * int(sizeof(ElementC));
+      constexpr int kWantStages  = NVTE_GG_C_AIU_STAGES;
+      constexpr bool kSlackFitsC = sizeof(FusionStorage) <= 1 &&
+                                   int(CSmemBytes::value) >= kWantStages * kChunkBytes;
+      constexpr int kStages =
+          (kWantStages > 1 && kSlackFitsC && kChunks >= kWantStages) ? kWantStages : 1;
+
+      // Swzl=false selects padz.linear: in smem each cube is stored row-major
+      // and the cubes are laid out one after another.
+      using CAiuLoad = cute::PPU0015_AIU_LOAD<
+          cute::C<kCubeElems * cute::sizeof_bits<ElementC>::value>,
+          ElementC, /*Trans=*/false, kCubeH, kCubeW, /*Swzl=*/false>;
+      using CChunkLayout = Layout<Shape <Int<kCubeH>, Shape <Int<kCubeW>, Int<kCubes>>>,
+                                  Stride<Int<kCubeW>, Stride<        _1, Int<kCubeElems>>>>;
+
+      ElementC* smem_c = reinterpret_cast<ElementC*>(smem_buf);
+      ElementC const* ptr_c = get_c_ptr(params, l_coord, preloadC);
+
+      cute::AiuDesc desc;
+      desc.init(reinterpret_cast<const uint8_t*>(ptr_c), int(M), int(N),
+                int(cute::get<0>(get_stride_c(params, l_coord))));
+
+      const int m_base = int(m_coord) * kAiuBlockM;
+      const int n_base = int(n_coord) * kAiuBlockN;
+      const int warp_idx = thread_idx / 32;
+
+      // The AIU is issued per warp, so a chunk's kCubes cubes are spread over
+      // the first kCubes warps.
+      auto issue_chunk = [&](int chunk, int stage) {
+        if (warp_idx < kCubes) {
+          CAiuLoad::copy(smem_c + stage * kChunkElems + warp_idx * kCubeElems,
+                         ptr_c, desc,
+                         /*coord_w=*/n_base + warp_idx * kCubeW,
+                         /*coord_h=*/m_base + chunk * kChunkM);
+        }
+      };
+
+      // The mainloop leaves its trailing AIU groups undrained on exit, and the
+      // smem_a/smem_b they write aliases the C buffer used here through the
+      // union, so this wait_all is required for correctness — it is not merely
+      // group-count bookkeeping.
+      cp_async_wait<0>();
+      __syncthreads();
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int st = 0; st < kStages; ++st) {
+        issue_chunk(st, st);
+        cp_async_fence();
+      }
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int s = 0; s < kChunks; ++s) {
+        // Groups are committed in order, so every chunk but the last may leave
+        // kStages-1 groups still in flight.
+        if (s + 1 < kChunks) {
+          cp_async_wait<kStages - 1>();
+        } else {
+          cp_async_wait<0>();
+        }
+        __syncthreads();
+
+        Tensor sC_chunk = make_tensor(
+            make_smem_ptr(smem_c + (s % kStages) * kChunkElems), CChunkLayout{});
+        Tensor tCsC = tC.partition_D(sC_chunk);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int mma_n = 0; mma_n < kMmaN; ++mma_n) {
+          Tensor tCaC_frag = tCaC(_,s,mma_n);
+          Tensor tCaD_frag = tCaD(_,s,mma_n);
+          Tensor tCcD_frag = tCcD(_,s,mma_n);
+
+          bool any_valid = false;
+          bool all_valid = true;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < EvtFragSize; ++i) {
+            auto coord = tCcD_frag(i);
+            bool valid = get<0>(coord) < get<0>(residue_mnk) &&
+                         get<1>(coord) < get<1>(residue_mnk);
+            any_valid = any_valid || valid;
+            all_valid = all_valid && valid;
+          }
+
+          if (any_valid) {
+            using MmaAccType = typename FrgEngine::value_type;
+            using AccArray = cutlass::Array<MmaAccType, EvtFragSize>;
+            auto const& accumulator = *reinterpret_cast<const AccArray*>(tCaC_frag.data());
+            // padz already zeroed the out-of-bounds elements in smem, so the
+            // tail chunk does not need a per-element predicate on the C read.
+            Tensor tCrC_frag = make_tensor<ElementC>(shape(tCaC_frag));
+            copy(CopyAtomR2S{}, tCsC(_,0,mma_n), tCrC_frag);
+            AccArray combined;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < EvtFragSize; ++i) {
+              combined[i] = accumulator[i] + static_cast<MmaAccType>(tCrC_frag(i));
+            }
+            auto output = cst_callbacks.visit(combined, s * kMmaN + mma_n, s, mma_n);
+            Tensor tDrD_frag = make_tensor(output.data(), tCaC_frag.layout());
+
+            if (all_valid) {
+              copy(tiled_r2s, tDrD_frag, tCaD_frag);
+            } else {
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < EvtFragSize; ++i) {
+                auto coord = tCcD_frag(i);
+                if (get<0>(coord) < get<0>(residue_mnk) &&
+                    get<1>(coord) < get<1>(residue_mnk)) {
+                  tCaD_frag(i) = tDrD_frag(i);
+                }
+              }
+            }
+          }
+        }
+
+        if (s + kStages < kChunks) {
+          // Before a buffer is reused, every thread must have finished reading
+          // the current chunk out of it.
+          __syncthreads();
+          issue_chunk(s + kStages, s % kStages);
+          cp_async_fence();
+        }
+      }
+
+      // The next work tile's mainloop immediately issues AIU copies into the
+      // aliased smem, so a barrier here is mandatory on the way out.
+      __syncthreads();
+      cst_callbacks.end();
+      return;
+    }
+#endif
+    // The fallback path (macro off, non-fp32 C, or a tile shape that fails
+    // kCanStageC) never touches smem.
+    (void) smem_buf;
+    (void) c_smem_bytes;
+
     CUTLASS_PRAGMA_UNROLL
     for (int mma_m = 0; mma_m < size<1>(tCaC); ++mma_m) {
       CUTLASS_PRAGMA_UNROLL
@@ -659,15 +1013,50 @@ public:
         if (any_valid) {
           using MmaAccType = typename FrgEngine::value_type;
           using AccArray = cutlass::Array<MmaAccType, EvtFragSize>;
-          auto output = cst_callbacks.visit(
-              *reinterpret_cast<const AccArray*>(tCaC_frag.data()),
-              mma_m * size<2>(tCaC) + mma_n, mma_m, mma_n);
+          auto const& accumulator = *reinterpret_cast<const AccArray*>(tCaC_frag.data());
+          auto output = [&]() {
+            if constexpr (preloadC) {
+              // C and D share the same MMA-C fragment; a full fragment is read
+              // as a vector, a tail one element at a time.
+              // Only the current fragment is held, which avoids a writable view
+              // over the whole accumulator and a second pass over it.
+              Tensor tCrC_frag = make_tensor<ElementC>(shape(tCaC_frag));
+              Tensor tCgC_frag = tCaG(_,mma_m,mma_n);
+              if (all_valid) {
+                copy(CopyAtomG2R{}, tCgC_frag, tCrC_frag);
+              } else {
+                clear(tCrC_frag);
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < EvtFragSize; ++i) {
+                  auto coord = tCcD_frag(i);
+                  if (get<0>(coord) < get<0>(residue_mnk) &&
+                      get<1>(coord) < get<1>(residue_mnk)) {
+                    tCrC_frag(i) = tCgC_frag(i);
+                  }
+                }
+              }
+              AccArray combined;
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < EvtFragSize; ++i) {
+                combined[i] = accumulator[i] + static_cast<MmaAccType>(tCrC_frag(i));
+              }
+              // bf16 has to be accumulated in fp32 before the conversion; the
+              // EVT's beta==0 keeps it from consuming C a second time.
+              return cst_callbacks.visit(combined,
+                  mma_m * size<2>(tCaC) + mma_n, mma_m, mma_n);
+            } else {
+              return cst_callbacks.visit(accumulator,
+                  mma_m * size<2>(tCaC) + mma_n, mma_m, mma_n);
+            }
+          }();
           Tensor tDrD_frag = make_tensor(output.data(), tCaC_frag.layout());
 
           if (all_valid) {
             copy(tiled_r2s, tDrD_frag, tCaD_frag);
           } else {
-            // 仅尾块走逐元素写，避免 fragment 首元素有效时越界覆盖下一组 D。
+            // Only a tail fragment stores element by element; a vector store
+            // would overwrite the next group's D whenever just the leading
+            // elements of the fragment are valid.
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < EvtFragSize; ++i) {
               auto coord = tCcD_frag(i);

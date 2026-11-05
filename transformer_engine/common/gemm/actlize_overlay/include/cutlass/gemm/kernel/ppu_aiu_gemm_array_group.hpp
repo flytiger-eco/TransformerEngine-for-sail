@@ -151,6 +151,13 @@ public:
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
+  // The NVTE_GG_C_AIU_SMEM prefetch reuses the smem tile the epilogue already
+  // owns and declares nothing new, so SharedStorageSize and the mainloop's auto
+  // stage selection are identical to the baseline.
+  // Deliberately no "epilogue <= mainloop" assertion here: 256x256x32_s2 has an
+  // epilogue slightly larger than its mainloop, so such an assertion would
+  // reject an already working configuration for no reason.
+
   static constexpr uint32_t MaxThreadsPerBlock = cute::size(TiledMma{});
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
 
@@ -419,6 +426,168 @@ public:
       Tensor accumulators = partition_fragment_C(tiled_mma, take<0,2>(blk_shape)); // (MMA,MMA_M,MMA_N)
       clear(accumulators);
 
+#if defined(NVTE_GG_PROLOGUE_C) && NVTE_GG_PROLOGUE_C && NVTE_GG_PRELOAD_C
+      // Experiment: seed every persistent work tile with C, so the MMA uses that
+      // accumulator as both src and dst. A null ptr_C leaves it cleared. This
+      // branch is only enabled by the RTC path's restricted LinearCombination.
+      static_assert(CollectiveEpilogue::IsDirectStoreSupported,
+                    "Prologue C requires pointer-array LinearCombination");
+#if defined(NVTE_GG_C_LATE) && NVTE_GG_C_LATE && defined(NVTE_GG_C_SMEM) && NVTE_GG_C_SMEM
+#error "NVTE_GG_C_LATE stages C after the mainloop owns smem; incompatible with NVTE_GG_C_SMEM"
+#endif
+      // Every C read is confined to this lambda so that NVTE_GG_C_LATE can
+      // choose between running it here and handing it to the mainloop to run
+      // after the A/B prefetches have been issued — both produce the same
+      // initial values and the same summation order.
+      auto init_accum_from_c = [&] () {
+        auto source = CollectiveEpilogue::get_c_ptr(params.epilogue, l_coord, true);
+        if (source != nullptr) {
+          Tensor mC = make_tensor(make_gmem_ptr(source), make_shape(M,N,Int<1>{}),
+              CollectiveEpilogue::get_stride_c(params.epilogue, l_coord));
+          Tensor gC_mnl = local_tile(mC, blk_shape, make_coord(_,_,_), Step<_1,_1,X>{});
+          Tensor gC = gC_mnl(_,_,m_coord,n_coord,0);
+#if defined(NVTE_GG_C_SMEM) && NVTE_GG_C_SMEM
+          // Experiment (disproven, off by default): read C through the
+          // epilogue's coalesced partition (4 consecutive fp32 = 16B per
+          // thread) and redistribute it back to the MMA-C fragment through
+          // smem. Measured net cost of C rose from 435.6us to 445.2us
+          // (1.022x) — the smem round trip's st/ld plus two __syncthreads is
+          // more expensive than the half of the LSU transactions it saves.
+          // Kept only as a negative reference.
+          // The mainloop's smem is still unfilled at this point, so its first
+          // 64KB is borrowed as scratch: SharedStorageSize and occupancy are
+          // unchanged, and since no cp_async group is created, the mainloop's
+          // wait constants need no adjustment.
+          using SmemLayoutC = typename CollectiveEpilogue::SmemLayout;
+          using CopyAtomVec = typename CollectiveEpilogue::CopyAtomR2S;
+          Tensor sC = make_tensor(
+              make_smem_ptr(reinterpret_cast<ElementAccumulator*>(smem_buf)), SmemLayoutC{});
+          auto c_tile = make_shape(size<0>(sC), size<1>(sC));
+          Tensor gCt = flat_divide(gC, c_tile);                 // (SMEM_M,SMEM_N,TILE_M,TILE_N)
+          Tensor cC_full = make_identity_tensor(take<0,2>(blk_shape));
+          Tensor cCt = flat_divide(cC_full, c_tile);
+
+          // Coalesced side: the same thread mapping the epilogue uses to store D
+          // and to read C.
+          auto tDc = typename CollectiveEpilogue::TiledCopyS2R{}.get_thread_slice(thread_idx);
+          Tensor tDgC = tDc.partition_D(gCt);     // ((Atom,AtomNum),ATOM_M,ATOM_N,TILE_M,TILE_N)
+          Tensor tDsC = tDc.partition_S(sC);      // ((Atom,AtomNum),ATOM_M,ATOM_N)
+          Tensor tDcC = tDc.partition_D(cCt);
+          Tensor tDrC = make_tensor<ElementC>(take<0,3>(shape(tDgC)));
+
+          // MMA-C side: the same partition the epilogue uses to spill the
+          // accumulator to smem.
+          auto tCc = make_tiled_copy_C(CopyAtomVec{}, tiled_mma).get_thread_slice(thread_idx);
+          Tensor tCaC = tCc.retile_S(accumulators);
+          Tensor tCsC = tCc.partition_D(sC);
+
+          constexpr int kCSteps = decltype(size<2>(gCt))::value * decltype(size<3>(gCt))::value;
+          constexpr int kCStepN = decltype(size<3>(gCt))::value;
+          // An out-of-bounds 16B vector is zeroed as a whole: C contributes 0
+          // past the edge, and the D store carries its own predication.
+          // Same assumption as the epilogue — a vector never straddles the
+          // boundary, which relies on N % AlignmentC == 0.
+          auto load_c_chunk = [&](int step_m, int step_n) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int m = 0; m < size<1>(tDgC); ++m) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int n = 0; n < size<2>(tDgC); ++n) {
+                if (elem_less(tDcC(0,m,n,step_m,step_n), take<0,2>(residue_mnk))) {
+                  copy(typename CollectiveEpilogue::CopyAtomG2R{},
+                       tDgC(_,m,n,step_m,step_n), tDrC(_,m,n));
+                } else {
+                  clear(tDrC(_,m,n));
+                }
+              }
+            }
+          };
+
+          load_c_chunk(0, 0);
+          CUTLASS_PRAGMA_UNROLL
+          for (int step = 0; step < kCSteps; ++step) {
+            int step_m = step / kCStepN;
+            int step_n = step % kCStepN;
+            // The previous chunk's smem reads must all have retired before it
+            // can be overwritten.
+            __syncthreads();
+            CUTLASS_PRAGMA_UNROLL
+            for (int m = 0; m < size<1>(tDsC); ++m) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int n = 0; n < size<2>(tDsC); ++n) {
+                copy(CopyAtomVec{}, tDrC(_,m,n), tDsC(_,m,n));
+              }
+            }
+            __syncthreads();
+            // Issue the next chunk's global read first, so its latency hides
+            // behind this chunk's smem round trip.
+            if (step + 1 < kCSteps) {
+              load_c_chunk((step + 1) / kCStepN, (step + 1) % kCStepN);
+            }
+            CUTLASS_PRAGMA_UNROLL
+            for (int pipe_m = 0; pipe_m < size<1>(tCsC); ++pipe_m) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int pipe_n = 0; pipe_n < size<2>(tCsC); ++pipe_n) {
+                int mma_m = step_m * size<1>(tCsC) + pipe_m;
+                int mma_n = step_n * size<2>(tCsC) + pipe_n;
+                Tensor tCrC = make_tensor<ElementC>(shape(tCsC(_,pipe_m,pipe_n)));
+                copy(CopyAtomVec{}, tCsC(_,pipe_m,pipe_n), tCrC);
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < size(tCrC); ++i) {
+                  tCaC(i,mma_m,mma_n) = static_cast<ElementAccumulator>(tCrC(i));
+                }
+              }
+            }
+          }
+          // The mainloop is about to write A/B into this same smem, so wait for
+          // every C read to finish first.
+          __syncthreads();
+#else
+          auto tiled_copy_c = make_tiled_copy_C(typename CollectiveEpilogue::CopyAtomR2S{}, tiled_mma);
+          auto thread_copy_c = tiled_copy_c.get_thread_slice(thread_idx);
+          Tensor tCrAcc = thread_copy_c.retile_S(accumulators);
+          Tensor tCgC = thread_copy_c.partition_D(gC);
+          Tensor cC = make_identity_tensor(take<0,2>(blk_shape));
+          Tensor tCcC = thread_copy_c.partition_D(cC);
+          constexpr int FragSize = decltype(size(tCrAcc(_,0,0)))::value;
+          CUTLASS_PRAGMA_UNROLL
+          for (int m = 0; m < size<1>(tCrAcc); ++m) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < size<2>(tCrAcc); ++n) {
+              Tensor tCrAcc_frag = tCrAcc(_,m,n);
+              Tensor tCgC_frag = tCgC(_,m,n);
+              Tensor tCcC_frag = tCcC(_,m,n);
+              bool all_valid = true;
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < FragSize; ++i) {
+                auto coord = tCcC_frag(i);
+                all_valid = all_valid && get<0>(coord) < m_max_coord && get<1>(coord) < n_max_coord;
+              }
+              if (all_valid) {
+                Tensor tCrC = make_tensor<ElementC>(shape(tCrAcc_frag));
+                copy(typename CollectiveEpilogue::CopyAtomG2R{}, tCgC_frag, tCrC);
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < FragSize; ++i) {
+                  tCrAcc_frag(i) = static_cast<ElementAccumulator>(tCrC(i));
+                }
+              } else {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < FragSize; ++i) {
+                  auto coord = tCcC_frag(i);
+                  if (get<0>(coord) < m_max_coord && get<1>(coord) < n_max_coord) {
+                    tCrAcc_frag(i) = static_cast<ElementAccumulator>(tCgC_frag(i));
+                  }
+                }
+              }
+            }
+          }
+#endif
+        }
+      };
+#if !(defined(NVTE_GG_C_LATE) && NVTE_GG_C_LATE)
+      init_accum_from_c();
+#endif
+#endif
+
       auto k_tile_iter  = cute::make_coord_iterator(shape<2>(gA));
       int  k_tile_count = size<2>(gA);
 
@@ -433,6 +602,10 @@ public:
         residue_mnk,
         thread_idx,
         smem_buf
+#if defined(NVTE_GG_PROLOGUE_C) && NVTE_GG_PROLOGUE_C && NVTE_GG_PRELOAD_C && \
+    defined(NVTE_GG_C_LATE) && NVTE_GG_C_LATE
+        , init_accum_from_c
+#endif
       );
 
       // Epilogue and write to gD
@@ -447,7 +620,11 @@ public:
           tiled_mma,
           residue_mnk,
           thread_idx,
-          (char*)&shared_storage.tensors.epilogue
+          (char*)&shared_storage.tensors.epilogue,
+          // Double buffering the C prefetch has to borrow the union's slack, and
+          // the epilogue cannot see how much of it the mainloop occupies, so the
+          // usable upper bound can only be passed in from here.
+          cute::Int<int(sizeof(typename SharedStorage::SharedTensorStorage))>{}
         );
       }
       // Get next work tile

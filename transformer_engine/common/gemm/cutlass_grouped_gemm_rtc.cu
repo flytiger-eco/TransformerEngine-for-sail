@@ -16,6 +16,8 @@
 //      - validate tile is implementable on PPU (smem fits, dims sane); fall
 //        back to the fixed (256, 256, 64), stages=3 configuration on mismatch
 //      - select ElementC=void variant when accumulate=false
+//      - select the fp32 C/D variant when the destination is an fp32 main_grad
+//        (wgrad accumulation), keeping A/B at their 16-bit operand dtype
 //   2. launch_grouped_gemm_rtc()
 //      - pack host-side per-group ptr arrays for A/B/C/D
 //      - construct GemmKernel::Arguments and call to_underlying_arguments
@@ -30,7 +32,8 @@
 //        CMakeLists.txt). The PPU generation is selected purely by the
 //        ArchTag (PPU0010 / PPU0015), not by a preprocessor version macro.
 //      - cubin symbol encodes the full config so each (layout, sm, tile,
-//        stages, with_C) compiles to a distinct symbol visible to profilers
+//        stages, with_C, output dtype) compiles to a distinct symbol visible to
+//        profilers
 
 #include <cublasLt.h>
 #include <cuda.h>
@@ -135,7 +138,8 @@ namespace grouped_gemm_rtc {
 
 template <bool trans_a, bool trans_b, int SmArch,
           typename Element_ = cutlass::bfloat16_t,
-          int TileM = 256, int TileN = 128, int TileK = 64, int Stages = 0>
+          int TileM = 256, int TileN = 128, int TileK = 64, int Stages = 0,
+          bool OutFp32 = false>
 struct GemmTraits {
   // actlize keys its AIU copy atoms and MMA instruction selection off the
   // ArchTag (cutlass/gemm/config/gemm_operands.hpp compares against
@@ -149,8 +153,13 @@ struct GemmTraits {
 
   using ElementA = Element_;
   using ElementB = Element_;
-  using ElementC = Element_;
-  using ElementD = Element_;
+  // C always aliases D in this launcher, so both track the output element.
+  // OutFp32 keeps A/B 16-bit and switches only the accumulator read/store side
+  // to fp32, which is what wgrad gradient accumulation needs (main_grad is
+  // fp32 in the Megatron-style optimizer path).
+  using ElementOut = std::conditional_t<OutFp32, float, Element_>;
+  using ElementC = ElementOut;
+  using ElementD = ElementOut;
   using ElementAccumulator = float;
 
   using LayoutA = std::conditional_t<trans_a, cutlass::layout::ColumnMajor,
@@ -161,8 +170,12 @@ struct GemmTraits {
 
   static constexpr int kAlignmentA = 8;
   static constexpr int kAlignmentB = 8;
-  static constexpr int kAlignmentC = 8;
-  static constexpr int kAlignmentD = 8;
+  // ppu_builder.inl derives the gmem store atom from
+  // AutoVectorizingCopyWithAssumedAlignment<sizeof(ElementD) * AlignmentD * 8>,
+  // whose MaxVecBits is capped at 128, so a 4-byte ElementD allows at most 4
+  // aligned elements. Must match the NVRTC template's own kAlignmentC/D.
+  static constexpr int kAlignmentC = OutFp32 ? 4 : 8;
+  static constexpr int kAlignmentD = kAlignmentC;
 
   // Tile MUST match the NVRTC cubin's tile: the GroupScheduler bakes
   // FastDivmod(cta_shape) into Params at to_underlying_arguments time, and the
@@ -1272,7 +1285,8 @@ CompiledKernel load_cubin_module(const std::string& cubin,
 }
 
 std::vector<std::string> make_nvrtc_options(int sm_arch, bool trans_a, bool trans_b,
-                                            TileConfig const& cfg, int dtype_id) {
+                                            TileConfig const& cfg, int dtype_id,
+                                            bool out_fp32) {
   const std::string cuda_include = cuda::include_directory(true);
   const std::string cutlass_include = get_cutlass_include_dir();
   const std::string cccl_include = cuda_include + "/cccl";
@@ -1306,7 +1320,20 @@ std::vector<std::string> make_nvrtc_options(int sm_arch, bool trans_a, bool tran
       // cubin is built from.
       concat_strings("-DNVTE_GG_ARCH=", sm_arch),
       concat_strings("-DNVTE_GG_DTYPE=", dtype_id),
+      concat_strings("-DNVTE_GG_OUT_FP32=", out_fp32 ? 1 : 0),
       concat_strings("-DNVTE_GG_WITH_C=", cfg.with_C ? 1 : 0),
+      // An fp32 destination folds C in by default; a 16-bit wgrad only does so
+      // under an explicit experiment switch, because the bf16 fragment and
+      // prologue arms never beat the staged epilogue and the production path
+      // therefore keeps the stock EVT.
+      // NVTE_GG_C_EVT_CLASSIC=1 reverts to that stock EVT accumulation (beta=1,
+      // the epilogue loads C itself), which is the reference arm for a merged
+      // 16B C partition. It must be toggled together with the beta/ptr_C bypass
+      // below: enabling only one makes both sites skip C and silently drop it.
+      concat_strings("-DNVTE_GG_PRELOAD_C=",
+                     (!getenv<bool>("NVTE_GG_C_EVT_CLASSIC", false) &&
+                      (out_fp32 || (trans_a && !trans_b &&
+                       getenv<bool>("NVTE_GG_WGRAD_C_FUSION", false)))) ? 1 : 0),
       concat_strings("-DNVTE_GG_TILE_M=", cfg.tile_m),
       concat_strings("-DNVTE_GG_TILE_N=", cfg.tile_n),
       concat_strings("-DNVTE_GG_TILE_K=", cfg.tile_k),
@@ -1328,7 +1355,12 @@ std::vector<std::string> make_nvrtc_options(int sm_arch, bool trans_a, bool tran
   // "unrecognized option" and the whole RTC path fails.
   const std::string extra_defines = getenv<std::string>("NVTE_GG_EXTRA_DEFINES");
   if (!extra_defines.empty()) {
-    opts.push_back(extra_defines);
+    // NVRTC parses exactly one option per array entry; several -D flags cannot
+    // be packed into a single macro value.
+    std::istringstream tokens(extra_defines);
+    for (std::string option; tokens >> option;) {
+      opts.push_back(option);
+    }
   }
   
   // Match the flags the statically built PPU CUTLASS TUs get (see
@@ -1474,9 +1506,11 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
   using GemmKernel = typename Traits::GemmKernel;
   constexpr int dtype_id =
       std::is_same_v<typename Traits::ElementA, cutlass::half_t> ? 1 : 0;
+  constexpr bool out_fp32 =
+      std::is_same_v<typename Traits::ElementD, float>;
 
-  const std::vector<std::string> opts =
-      make_nvrtc_options(sm_arch, trans_a, trans_b, cfg, dtype_id);
+  const std::vector<std::string> opts = make_nvrtc_options(
+      sm_arch, trans_a, trans_b, cfg, dtype_id, out_fp32);
 
   const std::string kernel_label = make_kernel_label<Traits>(sm_arch, cfg);
   const std::string kernel_symbol = make_kernel_symbol<Traits>(sm_arch, cfg);
@@ -1669,14 +1703,15 @@ HostWsRing& host_ws_ring(int device) {
 
 template <bool trans_a, bool trans_b, int SmArch,
           typename Element = cutlass::bfloat16_t,
-          int TileM = 256, int TileN = 128, int TileK = 64, int Stages = 0>
+          int TileM = 256, int TileN = 128, int TileK = 64, int Stages = 0,
+          bool OutFp32 = false>
 void launch_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
                              NVTETensor* D, NVTETensor* workspace, float alpha,
                              float beta, int num_gemms, int sm_arch,
                              int math_sm_count, cudaStream_t stream,
                              TileConfig const& cfg) {
   using Traits = GemmTraits<trans_a, trans_b, SmArch, Element,
-                            TileM, TileN, TileK, Stages>;
+                            TileM, TileN, TileK, Stages, OutFp32>;
   using GemmKernel = typename Traits::GemmKernel;
 
   using ElementA = typename Traits::ElementA;
@@ -1854,6 +1889,21 @@ void launch_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
   fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
   fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
   epilogue_args.ptr_C = (cfg.with_C && beta > 0.0f) ? d_ptr_C : nullptr;
+  // With NVTE_GG_C_EVT_CLASSIC=1, beta stays at 1 so the stock EVT accumulates
+  // C in the epilogue itself (paired with -DNVTE_GG_PRELOAD_C=0 in the compile
+  // options). Reading the route toggle once is enough: this runs on every
+  // launch, and a per-launch getenv is measurable host overhead.
+  static const bool c_evt_classic = getenv<bool>("NVTE_GG_C_EVT_CLASSIC", false);
+  if (!c_evt_classic &&
+      (OutFp32 || (trans_a && !trans_b &&
+        getenv<bool>("NVTE_GG_WGRAD_C_FUSION", false))) && cfg.with_C && beta > 0.0f) {
+    // This launcher fixes alpha==1 and beta at 0/1; C is added to the
+    // accumulator in fp32 inside the direct fragment and only then converted to
+    // the output type. beta==0 keeps the EVT from accumulating it a second
+    // time, while ptr_C stays set because the fragment load still needs it.
+    fusion_args.beta = 0.0f;
+    epilogue_args.ptr_C = d_ptr_C;
+  }
   epilogue_args.dC = d_ldc;
   epilogue_args.ptr_D = d_ptr_D;
   epilogue_args.dD = d_ldd;
@@ -2064,7 +2114,8 @@ void launch_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
               " block=(", block.x, ",", block.y, ",", block.z, ")",
               " smem=", kernel.smem_size, "B  num_gemms=", num_gemms,
               " tile=(", cfg.tile_m, ",", cfg.tile_n, ",", cfg.tile_k, ")",
-              " stages=", cfg.stages, " with_C=", cfg.with_C);
+              " stages=", cfg.stages, " with_C=", cfg.with_C,
+              " out_fp32=", std::is_same_v<typename Traits::ElementD, float>);
   }
 }
 
@@ -2080,6 +2131,17 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   const bool is_bf16 = (inputA->data.dtype == DType::kBFloat16);
   const bool is_fp16 = (inputA->data.dtype == DType::kFloat16);
   if (!is_bf16 && !is_fp16) return false;
+
+  // Output element type. D carries the operand dtype in the common case; the
+  // exception is gradient accumulation into an fp32 main_grad
+  // (fuse_wgrad_accumulation), which needs a 32-bit C/D while A/B stay 16-bit.
+  // C is aliased to D by this launcher (there is no separate C tensor), so a
+  // single flag describes both.
+  const DType out_dtype = convertNVTETensorCheck(D[0])->data.dtype;
+  if (out_dtype != inputA->data.dtype && out_dtype != DType::kFloat32) {
+    return false;
+  }
+  const bool out_fp32 = (out_dtype == DType::kFloat32);
 
   const int sm_arch = cuda::sm_arch(device);
   if (sm_arch != 80 && sm_arch != 89) return false;
@@ -2101,6 +2163,9 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   for (int i = 0; i < num_gemms; ++i) {
     const Tensor* tin = convertNVTETensorCheck(B[i]);  // input  (M, K)
     const Tensor* twt = convertNVTETensorCheck(A[i]);  // weight (N)
+    // The kernel compiles one output element type for every group, so a mixed
+    // group set has to fall back instead of being silently mistyped.
+    if (convertNVTETensorCheck(D[i])->data.dtype != out_dtype) return false;
     const int m = ta ? static_cast<int>(tin->data.shape[1])
                      : static_cast<int>(tin->data.shape[0]);
     const int k = ta ? static_cast<int>(tin->data.shape[0])
@@ -2136,6 +2201,12 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   static const std::string with_c_env = getenv<std::string>("NVTE_GG_FORCE_WITH_C");
   if (!with_c_env.empty()) {
     with_C = (with_c_env == "1" || with_c_env == "true" || with_c_env == "TRUE");
+  }
+  // The fp32 destination kernel folds the source into the accumulator fragment
+  // and therefore always needs a typed source pointer; ElementC=void would
+  // elide the very load that performs the accumulation.
+  if (out_fp32) {
+    with_C = true;
   }
   TileConfig cfg = get_or_query_tile_stages(avg_m, avg_n, avg_k, num_gemms,
                                             transa, transb, sm_arch, num_sms,
@@ -2194,7 +2265,7 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   if (verbose_tile_debug()) {
     NVTE_WARN("CUTLASS RTC grouped GEMM dispatch: num_gemms=", num_gemms,
               " sm_arch=", sm_arch, " transa=", transa, " transb=", transb,
-              " accumulate=", accumulate,
+              " accumulate=", accumulate, " out_fp32=", out_fp32,
               " avg_shape=(", avg_m, ",", avg_n, ",", avg_k, ")",
               " tile=(", cfg.tile_m, ",", cfg.tile_n, ",",
               cfg.tile_k, ") stages=", cfg.stages, " with_C=", cfg.with_C);
@@ -2208,21 +2279,28 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   // is a bug in the snap above, not a user error — hence the hard error at the
   // end rather than a fallback. Falling through used to return without ever
   // launching, which reported success and produced a silently untouched D.
-  auto run = [&](auto ta_const, auto tb_const, auto arch_const) {
+  // 4th parameter selects the output element type: OutFp32 keeps A/B 16-bit and
+  // makes C/D fp32. It is a template argument of the launcher, so the two
+  // variants are separate instantiations rather than a runtime branch inside
+  // the kernel.
+  auto run = [&](auto ta_const, auto tb_const, auto arch_const, auto out_const) {
     constexpr bool ta = decltype(ta_const)::value;
     constexpr bool tb = decltype(tb_const)::value;
     constexpr int Arch = decltype(arch_const)::value;
+    constexpr bool OutFp32 = decltype(out_const)::value;
 #define NVTE_GG_LAUNCH_TILE_STAGES(TM, TN, TK, ST)                             \
   if (cfg.tile_m == (TM) && cfg.tile_n == (TN) && cfg.tile_k == (TK) &&        \
       cfg.stages == (ST)) {                                                    \
-    if (is_fp16) {                                                            \
-      launch_grouped_gemm_rtc<ta, tb, Arch, cutlass::half_t, TM, TN, TK, ST>(  \
-          B, A, D, workspace, alpha, beta, num_gemms, Arch, math_sm_count,     \
-          stream, cfg);                                                        \
-    } else {                                                                  \
+    if (is_fp16) {                                                             \
+      launch_grouped_gemm_rtc<ta, tb, Arch, cutlass::half_t, TM, TN, TK, ST,    \
+                              OutFp32>(B, A, D, workspace, alpha, beta,        \
+                                        num_gemms, Arch, math_sm_count,        \
+                                        stream, cfg);                          \
+    } else {                                                                   \
       launch_grouped_gemm_rtc<ta, tb, Arch, cutlass::bfloat16_t, TM, TN, TK,   \
-                              ST>(B, A, D, workspace, alpha, beta, num_gemms,   \
-                                  Arch, math_sm_count, stream, cfg);           \
+                              ST, OutFp32>(B, A, D, workspace, alpha, beta,    \
+                                           num_gemms, Arch, math_sm_count,     \
+                                           stream, cfg);                       \
     }                                                                          \
     return;                                                                    \
   }
@@ -2238,20 +2316,35 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
                "dispatch table; the two have drifted apart.");
   };
 
-  auto dispatch_layout = [&](auto arch_const) -> bool {
+  auto dispatch_layout = [&](auto arch_const, auto out_const) -> bool {
     using F = std::false_type;
     using T = std::true_type;
-    if (!transa && !transb) { run(F{}, F{}, arch_const); return true; }
-    if (!transb && transa)  { run(F{}, T{}, arch_const); return true; }
-    if (transb && !transa)  { run(T{}, F{}, arch_const); return true; }
+    if (!transa && !transb) { run(F{}, F{}, arch_const, out_const); return true; }
+    if (!transb && transa)  { run(F{}, T{}, arch_const, out_const); return true; }
+    if (transb && !transa)  { run(T{}, F{}, arch_const, out_const); return true; }
     return false;  // TT not supported
   };
 
   bool ok = false;
+  // A request may only be dispatched once: the bf16 launcher would clobber the
+  // leading half of an fp32 D, and the original values cannot be recovered when
+  // the in-place accumulation reads C back afterwards.
   if (sm_arch == 80) {
-    ok = dispatch_layout(std::integral_constant<int, 80>{});
+    if (out_fp32) {
+      ok = dispatch_layout(std::integral_constant<int, 80>{},
+                           std::integral_constant<bool, true>{});
+    } else {
+      ok = dispatch_layout(std::integral_constant<int, 80>{},
+                           std::integral_constant<bool, false>{});
+    }
   } else {
-    ok = dispatch_layout(std::integral_constant<int, 89>{});
+    if (out_fp32) {
+      ok = dispatch_layout(std::integral_constant<int, 89>{},
+                           std::integral_constant<bool, true>{});
+    } else {
+      ok = dispatch_layout(std::integral_constant<int, 89>{},
+                           std::integral_constant<bool, false>{});
+    }
   }
   return ok;
 }
