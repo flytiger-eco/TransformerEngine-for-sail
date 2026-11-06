@@ -357,8 +357,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Required workspace size for grouped GEMM setup");
   m.def("te_general_grouped_gemm", &transformer_engine::pytorch::te_general_grouped_gemm,
         "Grouped GEMM");
-  m.def("te_general_grouped_gemm_single_input",
-        &transformer_engine::pytorch::te_general_grouped_gemm, "Grouped GEMM with unsplit input");
   m.def("te_general_grouped_gemm_for_grouped_tensor",
         &transformer_engine::pytorch::te_general_grouped_gemm_for_grouped_tensor,
         "Grouped GEMM for GroupedTensor");

@@ -113,17 +113,7 @@ pybind11::object MakePythonDType(transformer_engine::DType dtype) {
 
 TensorWrapper makeTransformerEngineTensor(py::handle tensor, py::handle quantizer) {
   NVTE_CHECK(!tensor.is_none(), "Tensor is not allocated!");
-  // Only the no-quantizer path needs a stack-allocated NoneQuantizer.
-  std::optional<NoneQuantizer> none_quantizer;
-  std::unique_ptr<Quantizer> quantizer_ptr;
-  Quantizer* my_quantizer;
-  if (quantizer.is_none()) {
-    init_extension();
-    my_quantizer = &none_quantizer.emplace(quantizer);
-  } else {
-    quantizer_ptr = convert_quantizer(quantizer);
-    my_quantizer = quantizer_ptr.get();
-  }
+  std::unique_ptr<Quantizer> my_quantizer = convert_quantizer(quantizer);
   // check for both quantizer & tensor type:
   // mxfp8 tensor -> mxfp8 quantizer
   // float8 tensor -> delayed scaling quantizer OR current scaling quantizer
@@ -134,11 +124,11 @@ TensorWrapper makeTransformerEngineTensor(py::handle tensor, py::handle quantize
       if (!(quantizer.is_none() || check_quantizer_type(quantizer.ptr()))) {
         continue;
       }
-      auto x = create_tensor(tensor, my_quantizer);
+      auto x = create_tensor(tensor, my_quantizer.get());
       return x;
     }
   }
-  NVTE_CHECK(dynamic_cast<NoneQuantizer*>(my_quantizer) != nullptr,
+  NVTE_CHECK(dynamic_cast<NoneQuantizer*>(my_quantizer.get()) != nullptr,
              "Unexpected quantization params type.");
 
   // Regular pyTorch tensor
