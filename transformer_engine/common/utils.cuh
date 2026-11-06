@@ -815,17 +815,15 @@ struct Stats<T, 1, WARPS_M, WARPS_N> {
     return {m, m2};
   }
 
-  // Single-pass companion to compute(), for RMSNorm. N is the caller's per-thread
-  // element count, needed only to size the Chan update. Every warp reports a mean
-  // of exactly zero, so delta == 0 and the correction term vanishes exactly --
-  // warp_chan_upd_dynamic degenerates to a plain sum of the per-warp sums of
-  // squares, walked in the same shuffle tree as compute() uses. The returned mean
-  // slot is zero and must not be read.
-  template <uint32_t N>
-  inline __device__ stats_t compute_sum_squares(T local_sum_squares) {
+  // 使用按需载入的元素执行基线两趟统计，保持元素顺序与 Chan 合并树不变。
+  // load(it, v) 产生第 it 个向量的 NUM_ELTS 个精确转换值。
+  template <uint32_t LDGS, uint32_t NUM_ELTS, typename Load>
+  inline __device__ stats_t compute_from(Load load, const T rn) {
+    constexpr uint32_t N = LDGS * NUM_ELTS;
     stats_t *smem = use0_ ? smem0_ : smem1_;
     use0_ = !use0_;
-    stats_t warp_stats = warp_stats_.compute_sum_squares(local_sum_squares);
+    constexpr T warp_rn = 1.f / T(N * THREADS_PER_WARP);
+    stats_t warp_stats = warp_stats_.template compute_from<LDGS, NUM_ELTS>(load, warp_rn);
 
     // Each warp leader stores its stats
     const auto warp_n = warp_stats_.reducer_.warp_n_;
@@ -894,19 +892,38 @@ struct Stats<T, 1, WARPS_M, 1> {
     return {m, m2};
   }
 
-  // Single-pass entry point for RMSNorm, which needs sum(x^2) and nothing else:
-  // rsqrt(mean(x^2) + eps) == rsqrt(var + mean^2 + eps), the quantity compute()
-  // above reconstructs from its two passes. Taking one pass lets the caller fold
-  // each element into the sum as it is converted, instead of holding a whole fp32
-  // row live in registers purely so the second pass can revisit it. The mean slot
-  // is returned as zero; see compute_sum_squares at the WARPS_N level.
-  //
-  // Also strictly better conditioned than the two-pass form: sum(x^2) accumulates
-  // non-negative terms, so there is no cancellation at all, whereas var + mean^2
-  // cancels to get var and is then dominated by the rounding error of mean^2.
-  inline __device__ stats_t compute_sum_squares(T local_sum_squares) {
+  // 与 compute(elts, rn) 相同的两趟运算及累加顺序。
+  // 仅改变中间值存放方式，不改变基线均值和中心化平方和的计算。
+  template <uint32_t LDGS, uint32_t NUM_ELTS, typename Load>
+  inline __device__ stats_t compute_from(Load load, const T rn) {
     auto sum = Sum<T>();
-    return {Zeros<T>::get(), reducer_.allreduce(local_sum_squares, sum)};
+
+    T m = Zeros<T>::get();
+#pragma unroll
+    for (int it = 0; it < LDGS; it++) {
+      T v[NUM_ELTS];
+      load(it, v);
+#pragma unroll
+      for (int jt = 0; jt < NUM_ELTS; jt++) {
+        m += v[jt];
+      }
+    }
+    m = reducer_.allreduce(m, sum) * rn;
+
+    T m2 = Zeros<T>::get();
+#pragma unroll
+    for (int it = 0; it < LDGS; it++) {
+      T v[NUM_ELTS];
+      load(it, v);
+#pragma unroll
+      for (int jt = 0; jt < NUM_ELTS; jt++) {
+        T diff = (v[jt] - m);
+        m2 += diff * diff;
+      }
+    }
+    m2 = reducer_.allreduce(m2, sum);
+
+    return {m, m2};
   }
 
   Reducer reducer_;

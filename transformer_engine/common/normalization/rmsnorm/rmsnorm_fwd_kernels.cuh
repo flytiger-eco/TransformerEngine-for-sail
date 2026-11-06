@@ -96,29 +96,26 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_ke
   for (int row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA) {
     Ivec x[LDGS];
     index_t idx = row * Ktraits::VEC_COLS + c;
-    // RMSNorm never needs the mean, so one pass over the row suffices: fold each
-    // element into the sum of squares as it is converted. That removes the fp32
-    // materialization of the whole row (LDGS * NUM_ELTS live floats, e.g. 64
-    // registers at h=8192), which existed only so the second stats pass could
-    // revisit the values. The output phase below reconverts from the packed x[];
-    // that is exact, since compute_t is at least as wide as input_t.
-    compute_t local_sum_squares = Zeros<compute_t>::get();
 #pragma unroll
     for (int it = 0; it < LDGS; it++) {
       x[it].load_from(params.x, idx);
-#pragma unroll
-      for (int jt = 0; jt < NUM_ELTS; jt++) {
-        compute_t x_ij = compute_t(x[it].data.elt[jt]);
-        local_sum_squares += x_ij * x_ij;
-      }
       idx += VEC_COLS_PER_LDG;
     }
 
-    stats_t s = stats.template compute_sum_squares<LDGS * NUM_ELTS>(local_sum_squares);
+    // 保持基线的两趟统计和归约顺序，不能用代数等价替代逐字节一致。
+    // 每趟从 packed x[] 精确转换，避免额外保留整行 FP32 中间数组。
+    stats_t s = stats.template compute_from<LDGS, NUM_ELTS>(
+        [&](int it, compute_t (&v)[NUM_ELTS]) {
+#pragma unroll
+          for (int jt = 0; jt < NUM_ELTS; jt++) {
+            v[jt] = compute_t(x[it].data.elt[jt]);
+          }
+        },
+        rn);
 
+    compute_t mu = Get<0>::of<stats_t, compute_t>(s);
     compute_t m2 = Get<1>::of<stats_t, compute_t>(s);
-    // reciprocal of root mean square; m2 is already sum(x^2) over the row
-    compute_t rs = rsqrtf(rn * m2 + params.epsilon);
+    compute_t rs = rsqrtf(rn * m2 + mu * mu + params.epsilon);
 
     if (bidn == 0 && warp_n == 0 && lane == 0) {
       rs_ptr[row] = rs;
@@ -343,9 +340,9 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_general_
 // amount of memory traffic kept in flight per CTA.
 //
 //   STAGES == 1 : no pipeline; x stays packed in registers.
-//   STAGES >= 2 : each row is staged in smem via cp.async and read twice
-//                 (sum of squares, then output), so no row data lives in
-//                 registers across the reduction. One commit_group is issued
+//   STAGES >= 2：cp.async 将行数据暂存到 smem，按基线顺序读取三次
+//               （均值、中心化平方和、输出），无需跨归约保留整行寄存器。
+//                 One commit_group is issued
 //                 per row even when the row is out of range, which keeps the
 //                 wait_group<STAGES-1> accounting aligned for every thread.
 // ---------------------------------------------------------------------------
@@ -449,25 +446,23 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_pipe_ker
       }
     }
 
-    compute_t local_sum_squares = Zeros<compute_t>::get();
+    stats_t s = stats.template compute_from<LDGS, NUM_ELTS>(
+        [&](int it, compute_t (&v)[NUM_ELTS]) {
+          Ivec xv;
+          if (STAGES > 1) {
+            xv.load_from(src, size_t(it) * THREADS + tidx);
+          } else {
+            xv = x[it];
+          }
 #pragma unroll
-    for (int it = 0; it < LDGS; it++) {
-      Ivec xv;
-      if (STAGES > 1) {
-        xv.load_from(src, size_t(it) * THREADS + tidx);
-      } else {
-        xv = x[it];
-      }
-#pragma unroll
-      for (int jt = 0; jt < NUM_ELTS; jt++) {
-        compute_t x_ij = compute_t(xv.data.elt[jt]);
-        local_sum_squares += x_ij * x_ij;
-      }
-    }
-
-    stats_t s = stats.template compute_sum_squares<LDGS * NUM_ELTS>(local_sum_squares);
+          for (int jt = 0; jt < NUM_ELTS; jt++) {
+            v[jt] = compute_t(xv.data.elt[jt]);
+          }
+        },
+        rn);
+    compute_t mu = Get<0>::of<stats_t, compute_t>(s);
     compute_t m2 = Get<1>::of<stats_t, compute_t>(s);
-    compute_t rs = rsqrtf(rn * m2 + params.epsilon);
+    compute_t rs = rsqrtf(rn * m2 + mu * mu + params.epsilon);
 
     if (warp_n == 0 && lane == 0) {
       static_cast<compute_t *>(params.rs)[row] = rs;

@@ -220,43 +220,9 @@ REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 768, fp32, fp32, fp32, fp32, 1,
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 768, fp16, fp16, fp16, fp32, 1, 4, 1, 16, 4);
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 768, bf16, bf16, bf16, fp32, 1, 4, 1, 16, 4);
 
-// Backward tuned launch geometry, retuned on ZW-M890P (39 SM, 131072 regs/SM).
-//
-// The backward kernel keeps dy[], y[], dzy_sum[] and gamma[] live per thread, so
-// WARPS_N fixes the register footprint through
-//   LDGS = h * sizeof(input) / BYTES_PER_LDG / (WARPS_N * 32).
-// At h=8192 the factory (1,4) needs LDGS=8 and spills: 256 regs + 224 B/thread
-// under hgrtc, 256 regs + 348 B/thread under hgcc. Widening WARPS_N removes the
-// spill entirely ((1,8): 184 regs / 0 B, (1,16): 104 regs / 0 B).
-//
-// Every ratio below is END-TO-END through the public C API (main + finalize),
-// which matters: WARPS_M/WARPS_N set the persistent grid, the grid sets the
-// number of dgamma_part partials, and that sets the finalize kernel's work. A
-// main-kernel-only measurement ranks h=1024 backwards -- it prefers (1,2) by
-// +11%, but (1,2) runs 64 threads/CTA, which raises occupancy ~5x, which makes
-// finalize ~2x more expensive and the pair 13% slower overall.
-//
-// Measured with cudaGraph replay (adaptive L so a replay is >=400us, median of
-// 15), 2 passes in opposite candidate order, rows=4096 and 16384, at 72-95% of
-// the 2395 GB/s D2D roofline after the change:
-//   h=8192 bf16  (1,4)->(1,16)  2.47x / 2.51x
-//   h=8192 fp16  (1,4)->(1,16)  3.81x / 4.28x
-//   h=8192 fp32  (1,4)->(1,8)   1.62x / 1.54x
-//   h=4096 bf16  (1,4)->(1,8)   +2.9% / +2.2%
-//   h=4096 fp16  (1,4)->(1,8)   +4.1% / +3.2%
-//   h=1024 fp32  (4,1)->(4,4)   +5.3% / +5.7%
-// Rejected because they did not survive the end-to-end measurement: h=1024
-// bf16/fp16 (every candidate <= factory; (1,2) is 0.87x), h=4096 fp32 (best
-// candidate +0.5%, inside noise), and h<=768 / h=2048 (left at factory).
-// WARPS_M stays <=4 everywhere, matching the factory maximum, so the existing
-// rows%4 tuned gate still bounds every row-loop trip count.
-//
-// Numerics: changing WARPS_N reassociates the fp32 row sums, so dx differs from
-// the factory tree at the ulp level and ~0.006% of bf16/fp16 dx elements flip by
-// 1 ulp. The final dgamma is bit-identical for bf16/fp16 (the output rounding
-// absorbs it) and ulp-level for fp32.
-// Evidence: TE_v218/rmsnorm_optimization.md, bench_rmsnorm/lib_ab/sweep_out/.
-REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 1024, fp32, fp32, fp32, fp32, 1, 4, 4, 16, 4);
+// 保留基线 WARPS_M/WARPS_N：改变归约几何会重排浮点求和，不能通过逐字节验收。
+// 性能优化只能在不改变 dx/dgamma 计算顺序的前提下进行。
+REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 1024, fp32, fp32, fp32, fp32, 1, 4, 1, 16, 4);
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 1024, fp16, fp16, fp16, fp32, 1, 4, 1, 16, 4);
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 1024, bf16, bf16, bf16, fp32, 1, 4, 1, 16, 4);
 
@@ -265,12 +231,12 @@ REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 2048, fp16, fp16, fp16, fp32, 1
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 2048, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4);
 
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 4096, fp32, fp32, fp32, fp32, 1, 1, 4, 16, 4);
-REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 4096, fp16, fp16, fp16, fp32, 1, 1, 8, 16, 4);
-REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 4096, bf16, bf16, bf16, fp32, 1, 1, 8, 16, 4);
+REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 4096, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 4);
+REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 4096, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4);
 
-REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, fp32, fp32, fp32, fp32, 1, 1, 8, 16, 4);
-REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, fp16, fp16, fp16, fp32, 1, 1, 16, 16, 4);
-REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, bf16, bf16, bf16, fp32, 1, 1, 16, 16, 4);
+REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, fp32, fp32, fp32, fp32, 1, 1, 4, 16, 4);
+REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 4);
+REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4);
 
 // Create rmsnorm bwd general launch function and register. Macro signature:
 //  HIDDEN_SIZE, WTYPE, ITYPE, OTYPE, CTYPE, ...
@@ -345,21 +311,12 @@ REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 4096, fp16, fp16, fp16, fp32
 REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 4096, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4,
                        true);
 
-// BackwardAdd h=8192: the fused `add` operand keeps a second full row live, so
-// the factory (1,4) spills harder here than in plain backward (1935us vs 1040us
-// at rows=16384 bf16). (1,8) removes the spill and is the best worst-case pick
-// at every dtype, end-to-end through the public API:
-//   bf16 (1,4)->(1,8)  3.68x / 3.73x   (rows=4096 / 16384)
-//   fp16 (1,4)->(1,8)  4.31x / 4.38x
-//   fp32 (1,4)->(1,8)  2.94x / 2.80x
-// (1,16) is within 0.7% of (1,8) at fp32 and behind it at bf16/fp16, so (1,8)
-// is used for all three. h<=4096 BackwardAdd stays at the factory geometry: no
-// candidate showed an end-to-end win there. Same ulp-level numerics as above.
-REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 8192, fp32, fp32, fp32, fp32, 1, 1, 8, 16, 4,
+// BackwardAdd 同样保留基线归约几何，不以输出 ULP 变化换取速度。
+REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 8192, fp32, fp32, fp32, fp32, 1, 1, 4, 16, 4,
                        true);
-REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 8192, fp16, fp16, fp16, fp32, 1, 1, 8, 16, 4,
+REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 8192, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 4,
                        true);
-REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 8192, bf16, bf16, bf16, fp32, 1, 1, 8, 16, 4,
+REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 8192, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4,
                        true);
 
 // Create fused rmsnorm bwd + add general launch function and register. Macro signature:
