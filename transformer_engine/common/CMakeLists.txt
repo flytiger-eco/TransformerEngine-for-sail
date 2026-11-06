@@ -505,6 +505,8 @@ target_link_libraries(transformer_engine PUBLIC
                       CUDA::cublas
                       CUDA::cudart
                       CUDNN::cudnn_all)
+# util/rtc.cpp 直接调用 NVRTC API，共享库需显式记录依赖。
+target_link_libraries(transformer_engine PRIVATE CUDA::nvrtc)
 
 target_include_directories(transformer_engine PRIVATE
                            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -698,8 +700,18 @@ make_string_header_from_file(transpose/rtc/cast_transpose_fusion.cu
                              string_code_transpose_rtc_cast_transpose_fusion_cu)
 make_string_header_from_file(transpose/rtc/cast_transpose.cu
                              string_code_transpose_rtc_cast_transpose_cu)
+# RTC 源码通过 file(READ) 嵌入，修改内核时必须重新生成字符串头文件。
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/transpose/rtc/cast_transpose.cu"
+             "${CMAKE_CURRENT_SOURCE_DIR}/transpose/rtc/cast_transpose_pipeline.cu")
+make_string_header_from_file(transpose/rtc/cast_transpose_pipeline.cu
+                             string_code_transpose_rtc_cast_transpose_pipeline_cu)
 make_string_header_from_file(transpose/rtc/transpose.cu
                              string_code_transpose_rtc_transpose_cu)
+make_string_header_from_file(transpose/rtc/transpose_pipeline.cu
+                             string_code_transpose_rtc_transpose_pipeline_cu)
+make_string_header_from_file(transpose/rtc/transpose_sync2.cu
+                             string_code_transpose_rtc_transpose_sync2_cu)
 make_string_header_from_file(transpose/rtc/swap_first_dims.cu
                              string_code_transpose_rtc_swap_first_dims_cu)
 make_string_header_from_file(fused_softmax/scaled_masked_softmax.cu

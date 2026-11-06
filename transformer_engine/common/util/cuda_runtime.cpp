@@ -8,9 +8,12 @@
 
 #include <cublasLt.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
+#include <tuple>
 
 #include "../common.h"
 #include "../util/cuda_driver.h"
@@ -82,6 +85,63 @@ int sm_count(int device_id) {
   };
   std::call_once(flags[device_id], init);
   return cache[device_id];
+}
+
+const DeviceProps &device_props(int device_id) {
+  static std::vector<DeviceProps> cache(num_devices());
+  static std::vector<std::once_flag> flags(num_devices());
+  if (device_id < 0) {
+    device_id = current_device();
+  }
+  NVTE_CHECK(0 <= device_id && device_id < num_devices(), "invalid CUDA device ID");
+  auto init = [&]() {
+    cudaDeviceProp prop;
+    NVTE_CHECK_CUDA(cudaGetDeviceProperties(&prop, device_id));
+    cache[device_id] =
+        DeviceProps{prop.multiProcessorCount, prop.regsPerMultiprocessor,
+                    prop.maxThreadsPerMultiProcessor, prop.sharedMemPerMultiprocessor};
+  };
+  std::call_once(flags[device_id], init);
+  return cache[device_id];
+}
+
+int kernel_blocks_per_sm(const void *kernel_func, int block_size, int device_id) {
+  if (device_id < 0) {
+    device_id = current_device();
+  }
+  NVTE_CHECK(0 <= device_id && device_id < num_devices(), "invalid CUDA device ID");
+
+  // Keyed on the kernel pointer so that each distinct instantiation, which has
+  // its own register and shared memory footprint, gets its own entry.
+  using Key = std::tuple<const void *, int, int>;
+  static std::map<Key, int> cache;
+  static std::mutex mutex;
+
+  const Key key{kernel_func, block_size, device_id};
+  std::lock_guard<std::mutex> lock(mutex);
+  const auto cached = cache.find(key);
+  if (cached != cache.end()) {
+    return cached->second;
+  }
+
+  const int ori_dev = current_device();
+  if (device_id != ori_dev) NVTE_CHECK_CUDA(cudaSetDevice(device_id));
+
+  int blocks_per_sm = 0;
+  cudaFuncAttributes attr;
+  int blocks = 0;
+  if (cudaFuncGetAttributes(&attr, kernel_func) == cudaSuccess && attr.localSizeBytes == 0 &&
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel_func, block_size, 0) ==
+          cudaSuccess) {
+    blocks_per_sm = std::max(blocks, 0);
+  } else {
+    // Clear any error left behind by the failed queries.
+    cudaGetLastError();
+  }
+
+  if (device_id != ori_dev) NVTE_CHECK_CUDA(cudaSetDevice(ori_dev));
+  cache.emplace(key, blocks_per_sm);
+  return blocks_per_sm;
 }
 
 void stream_priority_range(int *low_priority, int *high_priority, int device_id) {
