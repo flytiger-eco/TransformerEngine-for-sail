@@ -466,7 +466,7 @@ void te_atomic_gemm(at::Tensor A, at::Tensor A_scale_inverse, DType A_type,
 }
 
 std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
-    std::vector<py::handle> A, bool transa, py::handle B, bool transb,
+    std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
     std::optional<std::vector<at::Tensor>> D, DType D_type, std::vector<int64_t> m_splits,
     std::vector<at::Tensor> bias, DType bias_type, bool single_output,
     std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
@@ -486,58 +486,15 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
   }
 
   const auto none = py::none();
-  const auto dtype = GetATenDType(D_type);
-  const DType te_D_dtype = GetTransformerEngineDType(dtype);
   std::vector<TensorWrapper> te_A_wrappers, te_B_wrappers, te_D_wrappers, te_bias_wrappers,
       te_pre_gelu_out_wrappers;
-  std::vector<NVTETensor> te_bias_vector, te_pre_gelu_out_vector;
-  for (auto* v : {&te_A_wrappers, &te_B_wrappers, &te_D_wrappers}) v->reserve(A.size());
-  te_bias_vector.reserve(A.size());
-  te_pre_gelu_out_vector.reserve(A.size());
-  // Python passes one shared empty tensor for every unused bias / pre-GELU slot. A slot that
-  // holds the same tensor as the previous GEMM's reuses its NVTETensor instead of a new one.
-  const at::Tensor* prev_bias = nullptr;
-  const at::Tensor* prev_pre_gelu_out = nullptr;
-  const bool single_input = THPVariable_Check(B.ptr());
-  at::Tensor input;
-  std::vector<py::handle> input_parts;
-  int64_t input_offset = 0;
-  DType input_dtype = DType::kBFloat16;
-  if (single_input) {
-    input = B.cast<at::Tensor>();
-    NVTE_CHECK(single_output && !transb && input.is_cuda() && input.dim() == 2 &&
-                   input.is_contiguous() && input.device() == workspace[0].device() &&
-                   (input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf),
-               "Single input requires a contiguous BF16/FP16 CUDA matrix and single output.");
-    NVTE_CHECK(m_splits.size() == A.size(), "Invalid number of input splits.");
-    int64_t rows = 0;
-    for (int64_t n : m_splits) {
-      NVTE_CHECK(n >= 0 && n <= input.size(0) - rows, "Invalid input split size.");
-      rows += n;
-    }
-    NVTE_CHECK(rows == input.size(0), "Input splits must cover all rows.");
-    input_dtype = GetTransformerEngineDType(input.scalar_type());
-  } else {
-    input_parts = B.cast<std::vector<py::handle>>();
-  }
   std::vector<at::Tensor> D_vectors;
   for (size_t i = 0; i < A.size(); i++) {
     auto te_A = makeTransformerEngineTensor(A[i], none);
-    // Describe the row slice directly instead of building a per-expert torch view.
-    auto te_B = single_input
-                    ? makeTransformerEngineTensor(
-                          input.numel() == 0 ? nullptr : static_cast<char*>(input.data_ptr()) +
-                              input_offset * input.size(1) * input.element_size(),
-                          std::vector<size_t>{static_cast<size_t>(m_splits[i]),
-                                              static_cast<size_t>(input.size(1))}, input_dtype)
-                    : makeTransformerEngineTensor(input_parts[i], none);
-    if (single_input) input_offset += m_splits[i];
+    auto te_B = makeTransformerEngineTensor(B[i], none);
 
     // if there is single output
     at::Tensor out_tensor;
-    // Describe the output slice directly: no per-expert torch tensor, hence no
-    // cudaPointerGetAttributes to recover the device from the raw pointer.
-    void* out_slice_ptr = nullptr;
     auto size_t_shape =
         pytorch::detail::getGemmOutputShape(te_A.shape(), transa, te_B.shape(), transb);
     bool D_numel_is_zero = false;
@@ -548,21 +505,23 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
         D_numel_is_zero = true;
       }
     }
+    auto dtype = GetATenDType(D_type);
     auto opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
     if (single_output) {
       if (output_data_ptr == nullptr) {
         out_tensor = at::empty(D_shape, opts);
-        D_vectors.emplace_back(out_tensor);
       } else {
         // We need to check !D_numel_is_zero because if the final input portion has zero elements,
-        // output_data_ptr would point beyond the allocated memory of D.
+        // output_data_ptr would point beyond the allocated memory of D. This would cause
+        // at::from_blob to fail as it would reference memory not allocated by CUDA.
         if (!D_numel_is_zero) {
-          out_slice_ptr = output_data_ptr;
+          out_tensor = at::from_blob(output_data_ptr, D_shape, opts);
         }
       }
       char* char_ptr = reinterpret_cast<char*>(output_data_ptr);
       char_ptr += D_shape[0] * D_shape[1] * (*D)[0].element_size();
       output_data_ptr = reinterpret_cast<void*>(char_ptr);
+      D_vectors.emplace_back(out_tensor);
     } else {
       if (D == std::nullopt) {
         auto opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
@@ -574,18 +533,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     }
 
     if (te_A.numel() == 0 || te_B.numel() == 0) {
-      if (!accumulate) {
-        if (out_slice_ptr != nullptr) {
-          // The slice lies inside (*D)[0], so pin the device instead of querying the pointer.
-          at::for_blob(out_slice_ptr, D_shape)
-              .options(opts)
-              .target_device((*D)[0].device())
-              .make_tensor()
-              .zero_();
-        } else if (out_tensor.numel() != 0) {
-          out_tensor.zero_();
-        }
-      }
+      if (out_tensor.numel() != 0 && !accumulate) out_tensor.zero_();
       if (bias[i].numel() != 0 && grad) {
         bias[i].zero_();
       }
@@ -593,36 +541,24 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       continue;
     }
 
-    auto te_D = out_slice_ptr != nullptr
-                    ? makeTransformerEngineTensor(out_slice_ptr, size_t_shape, te_D_dtype)
-                    : makeTransformerEngineTensor(out_tensor);
+    auto te_D = makeTransformerEngineTensor(out_tensor);
+    auto te_bias = makeTransformerEngineTensor(bias[i]);
+    auto te_pre_gelu_out = makeTransformerEngineTensor(pre_gelu_out[i]);
 
-    if (prev_bias != nullptr && bias[i].is_same(*prev_bias)) {
-      te_bias_vector.emplace_back(te_bias_vector.back());
-    } else {
-      te_bias_wrappers.emplace_back(makeTransformerEngineTensor(bias[i]));
-      te_bias_vector.emplace_back(te_bias_wrappers.back().data());
-      prev_bias = &bias[i];
-    }
+    const auto gelu_shape = pre_gelu_out[i].data_ptr() == nullptr
+                                ? std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0))}
+                                : std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0)),
+                                                      static_cast<size_t>(te_pre_gelu_out.size(1))};
 
-    if (prev_pre_gelu_out != nullptr && pre_gelu_out[i].is_same(*prev_pre_gelu_out)) {
-      te_pre_gelu_out_vector.emplace_back(te_pre_gelu_out_vector.back());
-    } else {
-      const auto gelu_shape =
-          pre_gelu_out[i].data_ptr() == nullptr
-              ? std::vector<size_t>{static_cast<size_t>(pre_gelu_out[i].size(0))}
-              : std::vector<size_t>{static_cast<size_t>(pre_gelu_out[i].size(0)),
-                                    static_cast<size_t>(pre_gelu_out[i].size(1))};
-
-      te_pre_gelu_out_wrappers.emplace_back(
-          makeTransformerEngineTensor(get_data_ptr(pre_gelu_out[i]), gelu_shape, bias_type));
-      te_pre_gelu_out_vector.emplace_back(te_pre_gelu_out_wrappers.back().data());
-      prev_pre_gelu_out = &pre_gelu_out[i];
-    }
+    DType gelu_type = bias_type;
+    te_pre_gelu_out =
+        makeTransformerEngineTensor(get_data_ptr(pre_gelu_out[i]), gelu_shape, gelu_type);
 
     te_A_wrappers.emplace_back(std::move(te_A));
     te_B_wrappers.emplace_back(std::move(te_B));
     te_D_wrappers.emplace_back(std::move(te_D));
+    te_bias_wrappers.emplace_back(std::move(te_bias));
+    te_pre_gelu_out_wrappers.emplace_back(std::move(te_pre_gelu_out));
   }
 
   if (te_A_wrappers.empty()) {
@@ -671,14 +607,14 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     }
   }
 
-  std::vector<NVTETensor> te_A_vector, te_B_vector, te_D_vector;
-  te_A_vector.reserve(te_A_wrappers.size());
-  te_B_vector.reserve(te_A_wrappers.size());
-  te_D_vector.reserve(te_A_wrappers.size());
+  std::vector<NVTETensor> te_A_vector, te_B_vector, te_D_vector, te_bias_vector,
+      te_pre_gelu_out_vector;
   for (size_t i = 0; i < te_A_wrappers.size(); i++) {
     te_A_vector.emplace_back(te_A_wrappers[i].data());
     te_B_vector.emplace_back(te_B_wrappers[i].data());
     te_D_vector.emplace_back(te_D_wrappers[i].data());
+    te_bias_vector.emplace_back(te_bias_wrappers[i].data());
+    te_pre_gelu_out_vector.emplace_back(te_pre_gelu_out_wrappers[i].data());
   }
 
   std::vector<NVTETensor> te_workspace_vector;

@@ -1509,22 +1509,6 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
   constexpr bool out_fp32 =
       std::is_same_v<typename Traits::ElementD, float>;
 
-  // The memo borrows entries from kernel_cache(), which are never erased. The
-  // compile options below are sampled per key on first use:
-  // NVTE_GG_EXTRA_DEFINES / NVTE_GG_NO_EXTRA_NVRTC_FLAGS / NVTE_GG_RTC_LINEINFO.
-  // NVTE_GG_DISABLE_RTC_CACHE bypasses the lookup but does not clear the memo.
-  const int device = current_device_ordinal();
-  const auto memo_key =
-      std::make_tuple(device, sm_arch, trans_a, trans_b, cfg.tile_m, cfg.tile_n,
-                      cfg.tile_k, cfg.stages, cfg.with_C);
-  static std::map<std::decay_t<decltype(memo_key)>, const CompiledKernel*> memo;
-  const bool disable_cache = getenv<bool>("NVTE_GG_DISABLE_RTC_CACHE", false);
-  if (!disable_cache) {
-    std::lock_guard<std::mutex> lk(cache_mutex());
-    auto it = memo.find(memo_key);
-    if (it != memo.end()) return *it->second;
-  }
-
   const std::vector<std::string> opts = make_nvrtc_options(
       sm_arch, trans_a, trans_b, cfg, dtype_id, out_fp32);
 
@@ -1550,17 +1534,16 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
   // The in-process cache holds driver handles, so it is keyed by device as
   // well; the on-disk cubin path stays device-independent (the cubin is
   // selected by sm_arch, not by ordinal).
+  const int device = current_device_ordinal();
   const auto mem_key = std::make_pair(device, cache_key);
 
   std::lock_guard<std::mutex> lk(cache_mutex());
   auto& cache = kernel_cache();
 
+  const bool disable_cache = getenv<bool>("NVTE_GG_DISABLE_RTC_CACHE", false);
   if (!disable_cache) {
     auto it = cache.find(mem_key);
-    if (it != cache.end()) {
-      memo.emplace(memo_key, &it->second);
-      return it->second;
-    }
+    if (it != cache.end()) return it->second;
   }
 
   // Try the filesystem cache first (unless disabled). A cubin loaded from
@@ -1629,7 +1612,6 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
   }
 
   auto [iter, _] = cache.emplace(mem_key, ck);
-  if (!disable_cache) memo.emplace(memo_key, &iter->second);
   return iter->second;
 }
 
@@ -2012,6 +1994,11 @@ void launch_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
   const CompiledKernel& kernel =
       get_or_compile<Traits>(sm_arch, trans_a, trans_b, cfg);
 
+  if (kernel.smem_size >= (48 << 10)) {
+    NVTE_CALL_CHECK_CUDA_DRIVER(cuFuncSetAttribute, kernel.function,
+                                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                kernel.smem_size);
+  }
   // Grid MUST come from the scheduler. The GroupScheduler linearizes every
   // group's tiles into problem_blocks=(total_ctas,1,1), so its rasterization
   // heuristic picks AlongN (tiles_n=1 is not > tiles_m), and for AlongN with
