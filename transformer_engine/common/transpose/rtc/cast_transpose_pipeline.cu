@@ -33,6 +33,18 @@ static_assert(store_size > 0 && store_size % sizeof(OType) == 0,
               "Store vector must contain whole output elements");
 static_assert(16 % sizeof(IType) == 0, "Input elements must divide cp.async chunks");
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+template <typename T>
+__device__ __forceinline__ Vec<T, 2> cast_e4m3_pair(const CType first, const CType second) {
+  Vec<T, 2> out;
+  // 低字节对应 first，高字节对应 second；FP32 缩放结果直接量化。
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
+      : "=h"(out.data.vec)
+      : "f"(second), "f"(first));
+  return out;
+}
+#endif
+
 __device__ __forceinline__ void cp_async16(void *smem_dst, const void *gmem_src) {
   const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(smem_dst));
   asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(gmem_src));
@@ -141,14 +153,34 @@ __global__ void __launch_bounds__(block_size) cast_transpose_pipeline_kernel(
         IVec local_input;
         OVecC local_output_c;
         local_input.load_from(stage + r * kRowElts + tidx * nvec_in);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+        if constexpr (detail::is_same_v<OType, fp8e4m3> && nvec_in % 2 == 0) {
 #pragma unroll
-        for (size_t j2 = 0; j2 < nvec_in; ++j2) {
-          const CType in = static_cast<CType>(local_input.data.elt[j2]);
-          const OType out = OType(in * scale);
-          __builtin_assume(amax >= 0);
-          amax = fmaxf(fabsf(in), amax);
-          local_output_c.data.elt[j2] = out;
-          local_output_t[j2][iter].data.elt[i2] = out;
+          for (size_t j2 = 0; j2 < nvec_in; j2 += 2) {
+            const CType first = static_cast<CType>(local_input.data.elt[j2]);
+            const CType second = static_cast<CType>(local_input.data.elt[j2 + 1]);
+            // 保持 amax 的输入值和归约顺序不变。
+            __builtin_assume(amax >= 0);
+            amax = fmaxf(fabsf(first), amax);
+            amax = fmaxf(fabsf(second), amax);
+            const auto out = cast_e4m3_pair<OType>(first * scale, second * scale);
+            local_output_c.data.elt[j2] = out.data.elt[0];
+            local_output_c.data.elt[j2 + 1] = out.data.elt[1];
+            local_output_t[j2][iter].data.elt[i2] = out.data.elt[0];
+            local_output_t[j2 + 1][iter].data.elt[i2] = out.data.elt[1];
+          }
+        } else
+#endif
+        {
+#pragma unroll
+          for (size_t j2 = 0; j2 < nvec_in; ++j2) {
+            const CType in = static_cast<CType>(local_input.data.elt[j2]);
+            const OType out = OType(in * scale);
+            __builtin_assume(amax >= 0);
+            amax = fmaxf(fabsf(in), amax);
+            local_output_c.data.elt[j2] = out;
+            local_output_t[j2][iter].data.elt[i2] = out;
+          }
         }
         local_output_c.store_to(&output_c[static_cast<IndexType>(row) * row_length + col]);
       }

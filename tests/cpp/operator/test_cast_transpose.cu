@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <transformer_engine/cast.h>
+#include <transformer_engine/transpose.h>
 #include "../test_common.h"
 
 using namespace transformer_engine;
@@ -78,6 +79,37 @@ void performTest(const size_t N, const size_t H) {
 }
 
 
+template <typename InputType>
+void performPackedBytewiseTest(const size_t N, const size_t H) {
+  using namespace test;
+  Tensor input("input", std::vector<size_t>{N, H}, TypeInfo<InputType>::dtype);
+  Tensor output("output", std::vector<size_t>{N, H}, DType::kFloat8E4M3, true, true);
+  // 相邻值不同，用于检测 packed 字节顺序；包含舍入边界、符号零和饱和输入。
+  const std::array<float, 12> values = {
+      1.0f, -2.0f, 1.0625f, -1.1875f, 0.0f, -0.0f,
+      0.0009765625f, -0.001953125f, 448.0f, -512.0f, 1.0627f, -1.0627f};
+  auto *host_input = input.rowwise_cpu_dptr<InputType>();
+  for (size_t i = 0; i < N * H; ++i) {
+    host_input[i] = InputType(values[i % values.size()]);
+  }
+  input.from_cpu();
+  std::vector<fp8e4m3> ref_c(N * H), ref_t(N * H);
+  for (float scale : {1.0f, 1.25f, 1.0627f, -1.25f, 0.0f, 0.001f}) {
+    SCOPED_TRACE(::testing::Message() << "N=" << N << ", H=" << H << ", scale=" << scale);
+    output.set_scale(scale);
+    output.set_amax(0.0f);
+    float ref_amax;
+    compute_ref<InputType, fp8e4m3>(host_input, ref_c.data(), ref_t.data(), N, H,
+                                   &ref_amax, scale);
+    nvte_cast_transpose(input.data(), output.data(), 0);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    output.to_cpu();
+    EXPECT_EQ(std::memcmp(output.rowwise_cpu_dptr<fp8e4m3>(), ref_c.data(), N * H), 0);
+    EXPECT_EQ(std::memcmp(output.columnwise_cpu_dptr<fp8e4m3>(), ref_t.data(), N * H), 0);
+    EXPECT_FLOAT_EQ(output.amax(), ref_amax);
+  }
+}
+
 std::vector<std::pair<size_t, size_t>> test_cases = {{2048, 12288},
                                                      {768, 1024},
                                                      {256, 65536},
@@ -89,6 +121,16 @@ std::vector<std::pair<size_t, size_t>> test_cases = {{2048, 12288},
                                                      {2333, 1},       // Prime 345
                                                      {1481, 677}};    // Primes 234, 123
 }  // namespace
+
+TEST(CastTransposePackedTest, E4M3Bytewise) {
+  // 覆盖普通 RTC、静态尾部、双阶段窄 pipeline 和单阶段宽 pipeline。
+  for (const auto &shape : std::vector<std::pair<size_t, size_t>>{
+           {512, 512}, {512, 32}, {32, 32}, {127, 255}, {1024, 4096}, {8192, 4096}}) {
+    performPackedBytewiseTest<float>(shape.first, shape.second);
+    performPackedBytewiseTest<half>(shape.first, shape.second);
+    performPackedBytewiseTest<nv_bfloat16>(shape.first, shape.second);
+  }
+}
 
 class CTTestSuite : public ::testing::TestWithParam<std::tuple<transformer_engine::DType,
                                                                transformer_engine::DType,
