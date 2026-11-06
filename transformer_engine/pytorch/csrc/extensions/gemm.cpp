@@ -127,6 +127,22 @@ inline NVTEShape make_nvte_shape2(size_t d0, size_t d1) {
   return shape;
 }
 
+// The shape a cached descriptor was built with. Object address and data pointer
+// are not enough to identify a tensor: a view can be freed and a new view of the
+// same buffer handed out with a different shape, so the shape must be compared
+// too. Host-side only, no device query.
+inline bool shape_matches(const NVTEShape& cached, at::IntArrayRef sizes) {
+  if (cached.ndim != static_cast<size_t>(sizes.size())) {
+    return false;
+  }
+  for (size_t i = 0; i < cached.ndim; ++i) {
+    if (cached.data[i] != static_cast<size_t>(sizes[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Off switch for the descriptor cache, used to A/B the host cost of building
 // every NVTETensor from scratch.
 inline bool reuse_grouped_descriptors() {
@@ -664,7 +680,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
         scratch.a_ptr[used] = dptr;
         scratch.a_dtype[used] = dtype_id;
       } else if (scratch.a_obj[used] != A[i].ptr() || scratch.a_ptr[used] != dptr ||
-                 scratch.a_dtype[used] != dtype_id) {
+                 scratch.a_dtype[used] != dtype_id ||
+                 !shape_matches(te_A->shape(), a_tensor.sizes())) {
         te_A->set_rowwise_data(dptr, GetTransformerEngineDType(a_tensor.scalar_type()),
                                make_nvte_shape(a_tensor.sizes()));
         scratch.a_obj[used] = A[i].ptr();
@@ -708,7 +725,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
         scratch.b_ptr[used] = dptr;
         scratch.b_dtype[used] = dtype_id;
       } else if (scratch.b_obj[used] != input_parts[i].ptr() ||
-                 scratch.b_ptr[used] != dptr || scratch.b_dtype[used] != dtype_id) {
+                 scratch.b_ptr[used] != dptr || scratch.b_dtype[used] != dtype_id ||
+                 !shape_matches(te_B->shape(), b_tensor.sizes())) {
         te_B->set_rowwise_data(dptr, GetTransformerEngineDType(b_tensor.scalar_type()),
                                make_nvte_shape(b_tensor.sizes()));
         scratch.b_obj[used] = input_parts[i].ptr();
