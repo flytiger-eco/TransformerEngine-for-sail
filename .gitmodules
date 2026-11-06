@@ -1,6 +1,7 @@
 [submodule "3rdparty/actlize"]
 	path = 3rdparty/actlize
 	url = https://github.com/t-head/actlize.git
+	branch = 1.0.0+v0.2.0
 [submodule "3rdparty/cudafy-for-sail"]
 	path = 3rdparty/cudafy-for-sail
 	url = https://github.com/flytiger-eco/cudafy-for-sail.git
