@@ -349,14 +349,49 @@ void register_rmsnorm_fwd_pipe(DType wt, DType it, DType ot, DType ct, int hidde
                      ", ", stages, ", ", (gamma_smem ? "true" : "false"), ">");
   const int threads_per_cta = wm * wn * 32;
   // FwdPipeSmem<Ktraits, STAGES, GAMMA_SMEM>::BYTES, in host terms.
-  const int smem_bytes = stages * wm * hidden * byte_size_of(it) +
+  const int smem_bytes = (stages > 1 ? stages : 0) * wm * hidden * byte_size_of(it) +
                          (gamma_smem ? hidden * byte_size_of(wt) : 0) +
                          stats_smem_bytes(ct, wm, wn);
-  register_launcher<ForwardKernelParams>(
-      label, kernel_expr, string_code_normalization_rmsnorm_rtc_rmsnorm_fwd_kernel_cu,
-      "rmsnorm_fwd_kernel.cu", key, threads_per_cta, smem_bytes, cr, /*needs_cooperative=*/cr > 1,
-      /*barrier_bytes_per_col=*/0, /*workspace_bytes_per_col=*/0,
-      /*dgamma_part_bytes_per_col=*/0, static_fallback);
+  const std::string legacy_label = label + ",fp16_small_s3";
+  const std::string legacy_expr =
+      concat_strings("&::transformer_engine::normalization::rmsnorm_fwd_pipe_kernel<",
+                     traits_expr, ", 3, false>");
+  const int legacy_smem = 3 * wm * hidden * byte_size_of(it) + stats_smem_bytes(ct, wm, wn);
+  const std::string direct_label = label + ",direct";
+  const std::string direct_expr =
+      concat_strings("&::transformer_engine::normalization::rmsnorm_fwd_tuned_kernel<",
+                     traits_expr, ">");
+  auto closure = [label, kernel_expr, legacy_label, legacy_expr, legacy_smem,
+                  direct_label, direct_expr, threads_per_cta,
+                  smem_bytes, hidden, it, ct, wm, wn, cr, static_fallback](
+                     LaunchParams<ForwardKernelParams>& p, const bool configure) {
+    if (try_static_fallback(static_fallback, p, configure)) return;
+    const bool legacy = hidden == 4096 && it == DType::kFloat16 && p.params.rows <= 1024;
+    const bool direct = !legacy && p.params.rows <= 128;
+    const std::string& selected_label = legacy ? legacy_label : (direct ? direct_label : label);
+    const std::string& selected_expr = legacy ? legacy_expr : (direct ? direct_expr : kernel_expr);
+    const int selected_smem = legacy ? legacy_smem : (direct ? stats_smem_bytes(ct, wm, wn) : smem_bytes);
+    auto& mgr = rtc::KernelManager::instance();
+    if (!mgr.is_compiled(selected_label)) {
+      compile_norm_kernel(mgr, selected_label, selected_expr,
+                          string_code_normalization_rmsnorm_rtc_rmsnorm_fwd_kernel_cu,
+                          "rmsnorm_fwd_kernel.cu");
+    }
+    if (selected_smem >= 48 * 1024) {
+      mgr.set_function_attribute(selected_label, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                 selected_smem);
+    }
+    if (configure) {
+      const int occupancy = mgr.occupancy_max_active_blocks_per_sm(
+          selected_label, threads_per_cta, selected_smem);
+      p.params.ctas_per_row = cr;
+      p.params.ctas_per_col = p.multiprocessorCount * occupancy / cr;
+      return;
+    }
+    mgr.launch(selected_label, dim3(p.params.ctas_per_col), dim3(threads_per_cta),
+               selected_smem, p.stream, p.params);
+  };
+  TeNormalizationRegistry<ForwardKernelParams>::registerFunction(key, std::move(closure));
 }
 
 void register_rmsnorm_fwd_general(DType wt, DType it, DType ot, DType ct, int hidden, int wm,

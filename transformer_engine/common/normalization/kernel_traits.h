@@ -146,7 +146,7 @@ struct Kernel_traits : public Base {
 template <typename Ktraits, int STAGES, bool GAMMA_SMEM>
 struct FwdPipeSmem {
   enum {
-    BYTES = STAGES * Ktraits::ROWS_PER_CTA * Ktraits::COLS *
+    BYTES = (STAGES > 1 ? STAGES : 0) * Ktraits::ROWS_PER_CTA * Ktraits::COLS *
                 static_cast<int>(sizeof(typename Ktraits::input_t)) +
             (GAMMA_SMEM ? Ktraits::COLS * static_cast<int>(sizeof(typename Ktraits::weight_t)) : 0) +
             Ktraits::SMEM_BYTES_FWD

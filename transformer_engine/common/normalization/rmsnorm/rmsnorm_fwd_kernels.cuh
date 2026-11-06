@@ -375,7 +375,9 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_pipe_ker
   extern __shared__ char smem_[];
   constexpr size_t ROWGROUP = size_t(WARPS_M) * COLS;  // elements per staged row group
   input_t *stage = reinterpret_cast<input_t *>(smem_);
-  weight_t *gsmem = reinterpret_cast<weight_t *>(stage + size_t(STAGES) * ROWGROUP);
+  // S1 直接使用 packed 寄存器，不需要占用行暂存区。
+  constexpr size_t STAGED_ELTS = STAGES > 1 ? size_t(STAGES) * ROWGROUP : 0;
+  weight_t *gsmem = reinterpret_cast<weight_t *>(stage + STAGED_ELTS);
   char *stats_smem = reinterpret_cast<char *>(gsmem + (GAMMA_SMEM ? COLS : 0));
 
   const index_t tidx = threadIdx.x;

@@ -66,6 +66,23 @@ void launch_rmsnorm_fwd_pipe_(LaunchParams<ForwardKernelParams> &launch_params,
   static_assert(CTAS_PER_ROW == 1, "rmsnorm_fwd_pipe_kernel is single-CTA per row group");
   using Kernel_traits = Kernel_traits<weight_t, input_t, output_t, compute_t, index_t, HIDDEN_SIZE,
                                       CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG>;
+  // 与RTC路径采用同一分派，保留相同计算公式。
+  constexpr bool fp16_h4096 = HIDDEN_SIZE == 4096 &&
+      transformer_engine::detail::is_same<input_t, __half>::value;
+  if constexpr (fp16_h4096 && STAGES == 1 && GAMMA_SMEM) {
+    if (launch_params.params.rows <= 1024) {
+      launch_rmsnorm_fwd_pipe_<weight_t, input_t, output_t, compute_t, index_t,
+                              HIDDEN_SIZE, CTAS_PER_ROW, WARPS_M, WARPS_N,
+                              BYTES_PER_LDG, 3, false>(launch_params, configure_params);
+      return;
+    }
+  }
+  if (!fp16_h4096 && launch_params.params.rows <= 128) {
+    launch_rmsnorm_fwd_tuned_<weight_t, input_t, output_t, compute_t, index_t,
+                             HIDDEN_SIZE, CTAS_PER_ROW, WARPS_M, WARPS_N,
+                             BYTES_PER_LDG>(launch_params, configure_params);
+    return;
+  }
   using Smem = FwdPipeSmem<Kernel_traits, STAGES, GAMMA_SMEM>;
   auto kernel = &rmsnorm_fwd_pipe_kernel<Kernel_traits, STAGES, GAMMA_SMEM>;
 
@@ -229,8 +246,8 @@ REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 4096, bf16, bf16, fp8e4m3, fp32,
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 4096, fp16, fp16, fp8e4m3, fp32, 1, 1, 4, 16);
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 4096, fp32, fp32, fp8e4m3, fp32, 1, 1, 4, 16);
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 4096, fp32, fp32, fp32, fp32, 1, 1, 4, 16);
-REGISTER_NORM_LAUNCHER(RMSNorm, Forward, pipe, 4096, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 3, 0);
-REGISTER_NORM_LAUNCHER(RMSNorm, Forward, pipe, 4096, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 2, 1);
+REGISTER_NORM_LAUNCHER(RMSNorm, Forward, pipe, 4096, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 1, 1);
+REGISTER_NORM_LAUNCHER(RMSNorm, Forward, pipe, 4096, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 1, 1);
 
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 8192, bf16, bf16, fp8e4m3, fp32, 1, 1, 4, 16);
 REGISTER_NORM_LAUNCHER(RMSNorm, Forward, tuned, 8192, fp16, fp16, fp8e4m3, fp32, 1, 1, 4, 16);
