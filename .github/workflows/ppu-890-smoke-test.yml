@@ -23,7 +23,7 @@ env:
   NAMESPACE: "ppu-sched"
   NODE_SELECTOR: "board-type=ZW-M890P"
   HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
-  ARTIFACT_SUBDIR: "te-ci/${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}"
+  # wheel 由 ppu-890-build 写在 NAS 上，与 build 的 run id 对齐；此处只读不改。
   ARTIFACT_DIR: "/mnt/wl_nas/te-ci/${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}"
   TE_REPO: "https://github.com/flytiger-eco/TransformerEngine-for-sail.git"
   PCCL_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
@@ -51,6 +51,9 @@ env:
     git remote add origin "${TE_REPO}"
     git fetch -q --depth=1 origin "$(cat "${ARTIFACT_DIR}/commit")"
     git checkout -q FETCH_HEAD
+
+    pip3 install -U packaging==24.2 pybind11==3.1.0
+    pip3 install nvidia-cudnn-frontend
 
     pip3 install "${ARTIFACT_DIR}"/transformer_engine*.whl
     pip3 install nvdlfw_inspect pydantic onnxscript einops psutil transformers scipy==1.18.1 pytest==8.2.1
@@ -106,7 +109,3 @@ jobs:
             ${{ env.ENV_SETUP }}
             ${{ env.TEST_SETUP }}
             ${{ env.SMOKE_TEST }}
-
-      - name: "清理 NAS 产物"
-        if: always()
-        run: rm -rf "/wl_nas/${{ env.ARTIFACT_SUBDIR }}"

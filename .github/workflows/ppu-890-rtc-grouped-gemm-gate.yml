@@ -75,6 +75,8 @@ jobs:
     timeout-minutes: 300
     permissions:
       contents: read
+      # 只读查询 ppu-890-build 在同一个 head commit 上的构建产物。
+      actions: read
     outputs:
       run: ${{ steps.scope.outputs.run }}
       report_id: ${{ steps.report_artifact.outputs.artifact-id }}
@@ -140,6 +142,69 @@ jobs:
           print(f'::notice::RTC GroupGemm: run={run}, policy={policy}, base={base}, head={head}')
           PY
 
+      # ppu-890-build 已在同一个 head commit 上编译出 wheel；等它出包直接复用，
+      # 省掉 gate pod 里的 head 编译。查不到、失败或超时都回退本地编译。
+      - name: 复用 ppu-890-build 的 head wheel
+        id: headwheel
+        if: steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.scope.outputs.head_sha }}
+          WAIT_SECONDS: '2700'
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + WAIT_SECONDS ))
+          found=''
+          fails=0
+          while :; do
+            response=$(curl -fsS --retry 2 --retry-delay 5 \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "$API_URL/repos/$REPO/actions/workflows/ppu-build-890.yml/runs?event=pull_request&per_page=100" \
+              ) || response=''
+            if [[ -z "$response" ]]; then
+              fails=$(( fails + 1 ))
+              if (( fails >= 3 )); then
+                echo "::warning::无法查询 ppu-890-build 的运行，改为本地编译 head"
+                exit 0
+              fi
+            else
+              fails=0
+              found=$(printf '%s' "$response" | HEAD_SHA="$HEAD_SHA" python3 -c 'import json,os,sys; h=os.environ["HEAD_SHA"]; runs=[r for r in json.load(sys.stdin).get("workflow_runs", []) if r.get("head_sha") == h]; done=[r for r in runs if r.get("status") == "completed"]; ok=[r for r in done if r.get("conclusion") == "success"]; print("%s %s" % (ok[0]["id"], ok[0]["run_attempt"]) if ok else ("FAILED" if done else ""))' 2>/dev/null) || found=''
+              case "$found" in
+                '') ;;
+                FAILED)
+                  echo "::warning::ppu-890-build 在 $HEAD_SHA 上没有成功产物，改为本地编译 head"
+                  exit 0
+                  ;;
+                *) break ;;
+              esac
+            fi
+            if (( $(date +%s) >= deadline )); then
+              echo "::warning::等待 ppu-890-build 产物超时，改为本地编译 head"
+              exit 0
+            fi
+            # 查询失败时快速重试，正常等待上游编译才用长间隔。
+            if (( fails > 0 )); then sleep 5; else sleep 30; fi
+          done
+          read -r run_id run_attempt <<< "$found"
+          # 路径格式与 ppu-build-890.yml 的 ARTIFACT_SUBDIR 一致；先拷贝到本次 run 的
+          # 目录，产物生命周期由本 run 掌控，不依赖上游目录是否被保留。
+          src="/wl_nas/te-ci/$run_id-$run_attempt"
+          dest="$NAS_OUT/head-wheel"
+          mkdir -p "$dest"
+          if ! cp -f "$src"/transformer_engine*.whl "$dest"/; then
+            rmdir "$dest" 2>/dev/null || true
+            echo "::warning::拷贝 ppu-890-build 产物失败，改为本地编译 head"
+            exit 0
+          fi
+          echo "::notice::复用 ppu-890-build 产物 te-ci/$run_id-$run_attempt"
+          echo "dir=$POD_OUT/head-wheel" >> "$GITHUB_OUTPUT"
+
       - name: 同一 890P 上构建和配对测试 base/head
         if: steps.scope.outputs.run == 'true'
         # 发布步骤根据实际测量强制判定；调度/构建失败不能丢失报告。
@@ -172,7 +237,8 @@ jobs:
             git -C "$SRC" fetch --no-tags origin '${{ steps.scope.outputs.head_sha }}' '${{ steps.scope.outputs.base_sha }}'
             git -C "$SRC" checkout --detach '${{ steps.scope.outputs.head_sha }}'
             bash "$SRC/qa/L0_pytorch_grouped_gemm_rtc/test.sh" "$SRC" \
-              '${{ steps.scope.outputs.base_sha }}' "$OUT" 2>&1 | tee "$OUT/campaign.log"
+              '${{ steps.scope.outputs.base_sha }}' "$OUT" \
+              '${{ steps.headwheel.outputs.dir }}' 2>&1 | tee "$OUT/campaign.log"
 
       - name: 判定并生成报告
         if: always() && steps.scope.outputs.run == 'true'
