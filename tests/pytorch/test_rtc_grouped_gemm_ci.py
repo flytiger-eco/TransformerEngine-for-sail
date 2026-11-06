@@ -406,6 +406,75 @@ def test_build_bootstrap_before_frontend(tmp_path, failure):
             compile(call["code"], str(ROOT / "qa/L0_pytorch_grouped_gemm_rtc/test.sh"), "exec")
 
 
+def test_reuse_prebuilt_wheel_skips_compile(tmp_path):
+    script = (ROOT / "qa/L0_pytorch_grouped_gemm_rtc/test.sh").read_text()
+    function = re.search(r"(?ms)^build_arm\(\) \{.*?^\}", script).group()
+    calls = tmp_path / "calls.jsonl"
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "args = sys.argv[1:]\n"
+        "if args == ['-']:\n"
+        "    sys.stdin.read()\n"
+        "with open(os.environ['CALLS'], 'a') as stream:\n"
+        "    stream.write(json.dumps({'args': args}) + '\\n')\n"
+    )
+    fake_python.chmod(0o755)
+    tree, prebuilt = tmp_path / "tree", tmp_path / "prebuilt"
+    tree.mkdir()
+    prebuilt.mkdir()
+    (prebuilt / "transformer_engine-reused.whl").touch()
+    shell = (
+        "set -euo pipefail\n"
+        "git() { :; }\n"
+        "python3() {\n"
+        '  [[ "$*" == "-m venv --system-site-packages $SCRATCH/head-venv" ]]\n'
+        '  mkdir -p "$SCRATCH/head-venv/bin"\n'
+        '  ln -s "$FAKE_PYTHON" "$SCRATCH/head-venv/bin/python"\n'
+        "}\n" + function + '\nbuild_arm head "$TREE" "$PREBUILT"\n'
+    )
+    result = subprocess.run(
+        ["bash"],
+        input=shell,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "SCRATCH": str(tmp_path),
+            "TREE": str(tree),
+            "PREBUILT": str(prebuilt),
+            "FAKE_PYTHON": str(fake_python),
+            "CALLS": str(calls),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "复用已构建 wheel" in result.stdout
+    recorded = [json.loads(line)["args"] for line in calls.read_text().splitlines()]
+    # 复用后不得再执行 pip wheel，也不得触发 submodule 初始化之外的编译路径。
+    assert not any(args[:3] == ["-m", "pip", "wheel"] for args in recorded)
+    install = [args for args in recorded if "--ignore-installed" in args]
+    assert len(install) == 1
+    assert install[0][-1] == str(prebuilt / "transformer_engine-reused.whl")
+
+
+def test_workflow_reuses_build_890_wheel():
+    workflow = workflow_config()
+    steps = workflow["jobs"]["gate"]["steps"]
+    step = next(s for s in steps if s.get("id") == "headwheel")
+    # 只在 PR 上等上游产物；手动触发没有对应 build 运行，直接本地编译。
+    assert "github.event_name == 'pull_request'" in step["if"]
+    assert step["continue-on-error"] == "true"
+    assert "actions/workflows/ppu-build-890.yml/runs" in step["run"]
+    assert "::warning::" in step["run"] and "exit 0" in step["run"]
+    # 产物先落到本次 run 的 NAS 目录，pod 通过 /mnt/wl_nas 读取。
+    assert 'echo "dir=$POD_OUT/head-wheel"' in step["run"]
+    pod = next(
+        s for s in steps if "qa/L0_pytorch_grouped_gemm_rtc/test.sh" in s.get("with", {}).get("command", "")
+    )
+    assert "${{ steps.headwheel.outputs.dir }}" in pod["with"]["command"]
+
+
 def test_runtime_dependencies_match_project():
     import ast
 
@@ -584,7 +653,8 @@ def test_report_paths_after_failed_step(tmp_path, missing):
 def test_workflow_publisher_isolated():
     workflow = workflow_config()
     gate, publisher = workflow["jobs"]["gate"], workflow["jobs"]["publish"]
-    assert gate["permissions"] == {"contents": "read"}
+    # actions: read 仅用于只读查询 ppu-890-build 在同一 commit 上的产物。
+    assert gate["permissions"] == {"contents": "read", "actions": "read"}
     assert publisher["permissions"] == {"contents": "write", "pull-requests": "write"}
     assert publisher["needs"] == "gate"
     assert "always()" in publisher["if"] and "!cancelled()" in publisher["if"]
