@@ -1012,8 +1012,12 @@ class FlashAttention(torch.nn.Module):
         use_flash_attn_4 = (
             flash_attention_backend is not None and flash_attention_backend.major == 4
         )
-        use_flash_attn_3 = (
-            flash_attention_backend is not None and flash_attention_backend.major == 3
+        use_flash_attn_3 = flash_attention_backend is not None and (
+            flash_attention_backend.major == 3
+            or (
+                flash_attention_backend.major < 3
+                and flash_attention_backend >= PkgVersion("2.8.2")
+            )
         )
         if (
             use_flash_attn_4
