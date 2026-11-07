@@ -14,6 +14,7 @@
 
 #include "common/common.h"
 #include "common/recipe/recipe_common.cuh"
+#include "common/util/cuda_runtime.h"
 #include "common/util/ptx.cuh"
 #include "common/utils.cuh"
 
