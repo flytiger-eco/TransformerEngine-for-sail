@@ -20,7 +20,11 @@ constexpr size_t store_size = __STORE_SIZE__;
 constexpr size_t warps_per_tile = __WARPS_PER_TILE__;
 constexpr size_t block_size = __BLOCK_SIZE__;
 constexpr size_t stages = __STAGES__;
+constexpr int prefetch_mode = __PREFETCH_MODE__;
 
+static_assert(prefetch_mode >= 0 && prefetch_mode <= 2, "Invalid prefetch mode");
+static_assert(prefetch_mode == 0 || (stages == 1 && combine_components),
+              "Single-slot prefetch requires combined transpose staging");
 static_assert(stages >= 1 && stages <= 3, "Pipeline supports one to three stages");
 static_assert(warps_per_tile > 0 && warps_per_tile <= THREADS_PER_WARP &&
                   THREADS_PER_WARP % warps_per_tile == 0,
@@ -186,6 +190,14 @@ __global__ void __launch_bounds__(block_size) cast_transpose_pipeline_kernel(
       }
     }
 
+    if constexpr (prefetch_mode == 1) {
+      // 复用输入 slot 前，确保所有 warp 都已将当前 tile 的输入读入寄存器。
+      __syncthreads();
+      const unsigned next = t + gridDim.x;
+      if (next < total_tiles) issue_tile(next, stage_base);
+      cp_async_commit();
+    }
+
     if constexpr (combine_components) {
 #pragma unroll
       for (size_t j2 = 0; j2 < nvec_in; ++j2) {
@@ -199,6 +211,12 @@ __global__ void __launch_bounds__(block_size) cast_transpose_pipeline_kernel(
       }
       // 一次填充所有分量，共享内存换取更少同步及独立读取窗口。
       __syncthreads();
+      if constexpr (prefetch_mode == 2) {
+        // 此 barrier 同时证明当前输入已读完；预取与后面的转置输出重叠。
+        const unsigned next = t + gridDim.x;
+        if (next < total_tiles) issue_tile(next, stage_base);
+        cp_async_commit();
+      }
 #pragma unroll
       for (size_t j2 = 0; j2 < nvec_in; ++j2) {
 #pragma unroll
@@ -248,9 +266,11 @@ __global__ void __launch_bounds__(block_size) cast_transpose_pipeline_kernel(
       __syncthreads();
       process_tile(t, stage_base);
       t += G;
-      if (t < total_tiles) {
-        issue_tile(t, stage_base);
-        cp_async_commit();
+      if constexpr (prefetch_mode == 0) {
+        if (t < total_tiles) {
+          issue_tile(t, stage_base);
+          cp_async_commit();
+        }
       }
     }
   } else {

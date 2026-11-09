@@ -90,7 +90,9 @@ void performPackedBytewiseTest(const size_t N, const size_t H) {
       0.0009765625f, -0.001953125f, 448.0f, -512.0f, 1.0627f, -1.0627f};
   auto *host_input = input.rowwise_cpu_dptr<InputType>();
   for (size_t i = 0; i < N * H; ++i) {
-    host_input[i] = InputType(values[i % values.size()]);
+    // 不同 tile 使用不同位模式，避免周期性输入掩盖预取错位或漏处理尾部。
+    const size_t pattern = (i * size_t{2654435761}) ^ (i >> 7) ^ (i >> 17);
+    host_input[i] = InputType(values[pattern % values.size()]);
   }
   input.from_cpu();
   std::vector<fp8e4m3> ref_c(N * H), ref_t(N * H);
@@ -126,6 +128,16 @@ TEST(CastTransposePackedTest, E4M3Bytewise) {
   // 覆盖普通 RTC、静态尾部、双阶段窄 pipeline 和单阶段宽 pipeline。
   for (const auto &shape : std::vector<std::pair<size_t, size_t>>{
            {512, 512}, {512, 32}, {32, 32}, {127, 255}, {1024, 4096}, {8192, 4096}}) {
+    performPackedBytewiseTest<float>(shape.first, shape.second);
+    performPackedBytewiseTest<half>(shape.first, shape.second);
+    performPackedBytewiseTest<nv_bfloat16>(shape.first, shape.second);
+  }
+}
+
+TEST(CastTransposePackedTest, WidePrefetchBytewise) {
+  // 覆盖两种单 slot 预取、总量阈值、非整除 persistent grid 的尾部。
+  for (const auto &shape : std::vector<std::pair<size_t, size_t>>{
+           {2048, 4096}, {8192, 4096}, {4096, 8192}, {8256, 4096}, {8192, 8192}}) {
     performPackedBytewiseTest<float>(shape.first, shape.second);
     performPackedBytewiseTest<half>(shape.first, shape.second);
     performPackedBytewiseTest<nv_bfloat16>(shape.first, shape.second);

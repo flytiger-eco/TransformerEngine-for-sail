@@ -334,6 +334,10 @@ void cast_transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cu
               const bool compact_index = wide_aligned || narrow;
               const size_t load_size = wide_aligned ? 8 : pipe_load_size;
               const size_t stages = wide_aligned ? 1 : pipe_stages;
+              // FP32 提前到量化后预取；两字节输入复用转置 barrier，避免额外同步。
+              const int prefetch_mode = wide_aligned && output.dtype() == DType::kFloat8E4M3
+                                            ? (itype_size == 4 ? 1 : 2)
+                                            : 0;
               if (pipeline_eligible(input, output, row_length, num_rows, itype_size, otype_size,
                                     load_size)) {
                 const size_t tile_m = THREADS_PER_WARP * pipe_div(pipe_store_size, otype_size);
@@ -350,7 +354,7 @@ void cast_transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cu
                     "cast_transpose_pipeline,itype=", itype_name, ",otype=", otype_name,
                     ",load_size=", load_size, ",store_size=", pipe_store_size,
                     ",warps_per_tile=", pipe_warps, ",stages=", stages,
-                    ",compact_index=", compact_index);
+                    ",compact_index=", compact_index, ",prefetch_mode=", prefetch_mode);
                 if (!rtc_manager.is_compiled(pipe_label)) {
                   std::string code = string_code_transpose_rtc_cast_transpose_pipeline_cu;
                   code = regex_replace(code, "__ITYPE__", itype_name);
@@ -360,6 +364,7 @@ void cast_transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cu
                   code = regex_replace(code, "__WARPS_PER_TILE__", pipe_warps);
                   code = regex_replace(code, "__BLOCK_SIZE__", pipe_block_size);
                   code = regex_replace(code, "__STAGES__", stages);
+                  code = regex_replace(code, "__PREFETCH_MODE__", prefetch_mode);
                   code = regex_replace(code, "__INDEX_TYPE__", compact_index ? "unsigned" : "size_t");
                   code = regex_replace(code, "__COMBINE_COMPONENTS__", compact_index ? "true" : "false");
                   rtc_manager.compile(
@@ -369,8 +374,18 @@ void cast_transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cu
                 const int blocks_per_sm = rtc_manager.occupancy_max_active_blocks_per_sm(
                     pipe_label, static_cast<int>(pipe_block_size), dyn_smem);
                 if (blocks_per_sm > 0) {
+                  // 成对 E4M3 转换降低寄存器占用后，不能把 wide 路径的访存并发随之放大。
+                  // FP32 高瘦或超大流式形状需要更多独立 warp 隐藏延迟，保留原上限。
+                  const int prefetch_grid_limit =
+                      prefetch_mode == 1 &&
+                              (row_length <= 2048 || elements >= (size_t{256} << 20))
+                          ? 8
+                          : 4;
+                  const int grid_blocks_per_sm = prefetch_mode != 0
+                                                     ? std::min(blocks_per_sm, prefetch_grid_limit)
+                                                     : blocks_per_sm;
                   const size_t num_pipe_blocks = std::min<size_t>(
-                      total_tiles, static_cast<size_t>(cuda::sm_count()) * blocks_per_sm);
+                      total_tiles, static_cast<size_t>(cuda::sm_count()) * grid_blocks_per_sm);
                   rtc_manager.launch(
                       pipe_label, num_pipe_blocks, pipe_block_size, static_cast<unsigned>(dyn_smem),
                       stream, static_cast<const InputType *>(input.data.dptr),
