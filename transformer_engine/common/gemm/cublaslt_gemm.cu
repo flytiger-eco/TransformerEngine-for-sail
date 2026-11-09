@@ -29,6 +29,13 @@
 // Grouped GEMM entry points, defined in cutlass_grouped_gemm.cu (SM90/TMA),
 // cutlass_grouped_gemm_ppu.cu (SM80/SM89), and cutlass_grouped_gemm_rtc.cu
 // (NVRTC-JIT fast path for SM80/SM89).
+namespace transformer_engine::grouped_gemm {
+// Bumped after any backend other than the RTC one writes the shared grouped
+// GEMM device workspace, so the RTC launcher does not reuse a cached
+// parameter block that the other backend overwrote.
+uint64_t workspace_epoch(int device);
+void workspace_epoch_bump(int device);
+}  // namespace transformer_engine::grouped_gemm
 void cutlass_grouped_gemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D, int num_gemms,
                           bool transa, bool transb, bool grad, NVTETensor* workspace,
                           bool accumulate, int device, int math_sm_count, cudaStream_t stream);
@@ -1055,6 +1062,8 @@ void nvte_multi_stream_cublas_gemm(const NVTETensor *A, const NVTETensor *B, NVT
 
   multi_stream_cublas_gemm(A, B, D, bias, pre_gelu_out, num_gemms, transa, transb, grad, workspace,
                            accumulate, use_split_accumulator, math_sm_count, stream);
+  transformer_engine::grouped_gemm::workspace_epoch_bump(
+      transformer_engine::cuda::current_device());
 }
 
 namespace transformer_engine {
@@ -1134,6 +1143,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
     }
     transformer_engine::te_profiling::TeHgtxGuard te_prof_guard(te_prof);
     cublas_path();
+    transformer_engine::grouped_gemm::workspace_epoch_bump(current_device);
   };
 
   // Currently only support cutlass group gemm on Hopper Arch
@@ -1307,6 +1317,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
       cutlass_grouped_gemm_ppu(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
                                current_device, math_sm_count, stream);
     }
+    transformer_engine::grouped_gemm::workspace_epoch_bump(current_device);
   } else {
     if (warn_fallback) {
       NVTE_WARN("Fallback to cuBLAS grouped GEMM.");
