@@ -2,12 +2,17 @@
 # Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # See LICENSE for license information.
 
-# 用法：bash test.sh <head 源码目录> <merge-base SHA> <结果目录>
+# 用法：bash test.sh <head 源码目录> <merge-base SHA> <结果目录> [head wheel 目录]
 # 构建两个独立 wheel/venv，在同一个 PPU pod 中以 AB/BA 顺序测量全部 case。
+# 第 4 个参数可选：ppu-890-build 已构建好的 head wheel 目录；缺省或没有 wheel 时本地编译。
 set -euo pipefail
 SOURCE=$(realpath "$1")
 BASE_SHA="$2"
 OUT=$(realpath -m "$3")
+HEAD_WHEEL_DIR=""
+if [[ -n "${4:-}" ]]; then
+    HEAD_WHEEL_DIR=$(realpath -m "$4")
+fi
 SCRATCH=$(mktemp -d /tmp/te-rtc-ci.XXXXXX)
 mkdir -p "$OUT/base" "$OUT/head"
 GATE="$SOURCE/.github/scripts/rtc_grouped_gemm_gate.py"
@@ -23,8 +28,8 @@ unset PYTHONPATH NVTE_CUTLASS3_INCLUDE_DIR
 git -C "$SOURCE" worktree add --detach "$SCRATCH/base" "$BASE_SHA"
 
 build_arm() {
-    local arm="$1" tree="$2"
-    git -C "$tree" submodule update --init --recursive
+    local arm="$1" tree="$2" prebuilt="${3:-}"
+    local wheel_dir
     python3 -m venv --system-site-packages "$SCRATCH/$arm-venv"
     local py="$SCRATCH/$arm-venv/bin/python"
     # 先完成纯 wheel 的工具安装；后续依赖生成 metadata 时必须已能使用新 packaging。
@@ -72,13 +77,21 @@ print(f"[RTC CI] 保留 SDK torch：{sdk}")
 PY
     "$py" -m pip install --only-binary=:all: --constraint "$SCRATCH/$arm-venv/rtc-ci-sdk-constraints.txt" \
         pydantic 'importlib-metadata>=1.0' einops onnx onnxscript nvdlfw-inspect
-    mkdir -p "$SCRATCH/$arm-wheel"
-    (
-        cd "$tree"
-        "$py" -m pip wheel -v --no-build-isolation --no-deps . -w "$SCRATCH/$arm-wheel"
-    )
+    if [[ -n "$prebuilt" ]]; then
+        # ppu-890-build 在同一 commit 上编译过同一份 wheel，复用它可省掉整次 head 编译。
+        wheel_dir="$prebuilt"
+        echo "[RTC CI] $arm 复用已构建 wheel：$wheel_dir"
+    else
+        git -C "$tree" submodule update --init --recursive
+        mkdir -p "$SCRATCH/$arm-wheel"
+        (
+            cd "$tree"
+            "$py" -m pip wheel -v --no-build-isolation --no-deps . -w "$SCRATCH/$arm-wheel"
+        )
+        wheel_dir="$SCRATCH/$arm-wheel"
+    fi
     # 不卸载容器预装的 TE/torch；venv 中的当前 wheel 必须优先于系统包。
-    "$py" -m pip install --ignore-installed --no-deps "$SCRATCH/$arm-wheel"/transformer_engine*.whl
+    "$py" -m pip install --ignore-installed --no-deps "$wheel_dir"/transformer_engine*.whl
     # 在源码树外完整导入；错误立即终止，不能重复运行全部必失败的 worker。
     (
         cd "$SCRATCH"
@@ -112,8 +125,14 @@ PY
     )
 }
 
+# 复用的 wheel 必须真实存在；上游产物被清理或缺失时回退本地编译，不能整条链路失败。
+if [[ -n "$HEAD_WHEEL_DIR" ]] && ! compgen -G "$HEAD_WHEEL_DIR/transformer_engine*.whl" >/dev/null; then
+    echo "[RTC CI] $HEAD_WHEEL_DIR 没有可用 wheel，改为本地编译 head"
+    HEAD_WHEEL_DIR=""
+fi
+
 build_arm base "$SCRATCH/base" 2>&1 | tee "$OUT/base-build.log"
-build_arm head "$SOURCE" 2>&1 | tee "$OUT/head-build.log"
+build_arm head "$SOURCE" "$HEAD_WHEEL_DIR" 2>&1 | tee "$OUT/head-build.log"
 
 # 固定从 head 取同一份 harness/case；不能用 base 自己的旧测试替代。
 cd "$SCRATCH"
