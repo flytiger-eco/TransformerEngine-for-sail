@@ -1074,6 +1074,133 @@ public:
   }
 #endif
 
+  // 专用连续路径只做 alpha=1、beta=0/1，不构造坐标 EVT 或指针数组。
+  template <bool WithC, class TileShapeType, class Coord, class Acc, class Mma, class Residue,
+            class AfterCPrologue>
+  CUTLASS_DEVICE static void compute_contiguous(
+      ElementD* dst, int M, int N, TileShapeType tile_shape, Coord coord,
+      Acc const& accumulators, Mma mma, Residue residue, int thread_idx,
+      char* c_pool, AfterCPrologue&& after_c_prologue) {
+    using namespace cute;
+    auto stride = make_stride(N, _1{}, _0{});
+    Tensor matrix = make_tensor(make_gmem_ptr(dst), make_shape(M, N, _1{}), stride);
+    Tensor output = local_tile(matrix, tile_shape, make_coord(_, _, _), Step<_1, _1, Underscore>{});
+    Tensor gD = output(_, _, get<0>(coord), get<1>(coord), 0);
+    auto copy_c = make_tiled_copy_C(CopyAtomR2S{}, mma);
+    auto thread = copy_c.get_thread_slice(thread_idx);
+    Tensor tAcc = thread.retile_S(accumulators);
+    Tensor tDst = thread.partition_D(gD);
+    Tensor tCoord = thread.partition_D(make_identity_tensor(shape(gD)));
+    constexpr int Frag = decltype(size(tAcc(_, 0, 0)))::value;
+    constexpr int MmaM = decltype(size<1>(tAcc))::value;
+    constexpr int MmaN = decltype(size<2>(tAcc))::value;
+    constexpr int BM = decltype(size<0>(gD))::value;
+    constexpr int BN = decltype(size<1>(gD))::value;
+    constexpr int ChunkM = BM / MmaM;
+    constexpr int CubeW = 128 / sizeof(ElementD);
+    constexpr int CubeElems = ChunkM * CubeW;
+    constexpr int ChunkElems = ChunkM * BN;
+    using ChunkLayout = Layout<Shape<Int<ChunkM>, Shape<Int<CubeW>, Int<BN / CubeW>>>,
+                               Stride<Int<CubeW>, Stride<_1, Int<CubeElems>>>>;
+    static_assert(ChunkElems * sizeof(ElementD) <= 32768);
+    auto store = [&](auto mma_m, auto mma_n, auto const& source) {
+      Tensor a = tAcc(_, mma_m, mma_n);
+      Tensor d = tDst(_, mma_m, mma_n);
+      Tensor c = tCoord(_, mma_m, mma_n);
+      bool any = false, all = true;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < Frag; ++i) {
+        bool valid = get<0>(c(i)) < get<0>(residue) && get<1>(c(i)) < get<1>(residue);
+        any |= valid;
+        all &= valid;
+      }
+      if (any) {
+        using Array = cutlass::Array<ElementAccumulator, Frag>;
+        Array combined;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < Frag; ++i) {
+          combined[i] = a(i);
+          if constexpr (WithC) combined[i] += float(source(i));
+        }
+        cutlass::NumericArrayConverter<ElementD, ElementAccumulator, Frag> convert;
+        auto converted = convert(combined);
+        Tensor result = make_tensor(converted.data(), a.layout());
+        // packed ragged 的行首不保证向量对齐；完整 fragment 也需检查地址。
+        constexpr int VectorBytes = Frag * sizeof(ElementD);
+        bool aligned = reinterpret_cast<uintptr_t>(&d(0)) % VectorBytes == 0;
+        if (all && aligned) {
+          copy(copy_c, result, d);
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < Frag; ++i) {
+            if (get<0>(c(i)) < get<0>(residue) && get<1>(c(i)) < get<1>(residue))
+              d(i) = result(i);
+          }
+        }
+      }
+    };
+    if constexpr (WithC && sizeof(ElementD) == 4) {
+      static_assert(BN % CubeW == 0 && MmaM >= 2);
+      using Load = PPU0015_AIU_LOAD<C<CubeElems * sizeof_bits<ElementD>::value>,
+                                    ElementD, false, ChunkM, CubeW, false>;
+      auto* smem = reinterpret_cast<ElementD*>(c_pool);
+      AiuDesc desc;
+      desc.init(reinterpret_cast<const uint8_t*>(dst), M, N, N);
+      auto issue = [&](int chunk, int slot) {
+        int warp = thread_idx / 32;
+        if (warp < BN / CubeW)
+          Load::copy(smem + slot * ChunkElems + warp * CubeElems, dst, desc,
+                     int(get<1>(coord)) * BN + warp * CubeW,
+                     int(get<0>(coord)) * BM + chunk * ChunkM);
+      };
+      issue(0, 0); cp_async_fence();
+      issue(1, 1); cp_async_fence();
+      // C0/C1 在 next A/B 之前提交；前两次 wait 保留 newest A/B groups。
+      bool future_ab = after_c_prologue();
+      CUTLASS_PRAGMA_UNROLL
+      for (int s = 0; s < MmaM; ++s) {
+        if (s < 2 && future_ab) {
+          cp_async_wait<3>();
+        } else if (s + 1 < MmaM) {
+          cp_async_wait<1>();
+        } else {
+          cp_async_wait<0>();
+        }
+        __syncthreads();
+        Tensor sm = make_tensor(make_smem_ptr(smem + (s % 2) * ChunkElems), ChunkLayout{});
+        Tensor tSm = thread.partition_D(sm);
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < MmaN; ++n) {
+          Tensor source = make_tensor<ElementD>(shape(tAcc(_, s, n)));
+          copy(CopyAtomR2S{}, tSm(_, 0, n), source);
+          store(s, n, source);
+        }
+        __syncthreads();
+        if (s + 2 < MmaM) { issue(s + 2, s % 2); cp_async_fence(); }
+      }
+    } else {
+      after_c_prologue();
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < MmaM; ++m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < MmaN; ++n) {
+          Tensor source = make_tensor<ElementD>(shape(tAcc(_, m, n)));
+          if constexpr (WithC) {
+            Tensor d = tDst(_, m, n);
+            Tensor c = tCoord(_, m, n);
+            clear(source);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < Frag; ++i)
+              if (get<0>(c(i)) < get<0>(residue) && get<1>(c(i)) < get<1>(residue))
+                source(i) = d(i);
+          }
+          store(m, n, source);
+        }
+      }
+      __syncthreads();
+    }
+  }
+
 private:
   Params params;
   FusionCallbacks fusion_callbacks;

@@ -471,6 +471,21 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<at::Tensor> bias, DType bias_type, bool single_output,
     std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count) {
+  if (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1") {
+    // 在索引列表或把 workspaceSize 包装为 byte 容量之前验证真实 Tensor。
+    NVTE_CHECK(!A.empty() && A.size() == B.size() && bias.size() == A.size() &&
+               pre_gelu_out.size() == A.size() && D.has_value() &&
+               D->size() == (single_output ? 1 : A.size()),
+               "NVTE_GG_CONTIGUOUS requires matching nonempty tensor lists and explicit D.");
+    NVTE_CHECK(!workspace.empty(), "NVTE_GG_CONTIGUOUS requires device workspace.");
+    for (const auto& ws : workspace) {
+      NVTE_CHECK(ws.is_cuda() && ws.scalar_type() == at::kByte && ws.dim() == 1 &&
+                 ws.is_contiguous() && ws.device() == workspace[0].device(),
+                 "NVTE_GG_CONTIGUOUS requires a contiguous rank-1 CUDA byte workspace.");
+      NVTE_CHECK(workspaceSize <= static_cast<size_t>(ws.numel()),
+                 "NVTE_GG_CONTIGUOUS workspaceSize exceeds the actual workspace capacity.");
+    }
+  }
   if (single_output && D == std::nullopt) {
     NVTE_ERROR("not implemented, D should be allocated for single output case.");
   }
@@ -532,7 +547,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       }
     }
 
-    if (te_A.numel() == 0 || te_B.numel() == 0) {
+    if ((te_A.numel() == 0 || te_B.numel() == 0) &&
+        transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1") {
       if (out_tensor.numel() != 0 && !accumulate) out_tensor.zero_();
       if (bias[i].numel() != 0 && grad) {
         bias[i].zero_();

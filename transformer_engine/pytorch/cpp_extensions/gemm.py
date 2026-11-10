@@ -274,6 +274,47 @@ def general_gemm(
     return out, bias_grad, gelu_input, extra_output
 
 
+def _validate_contiguous_grouped_gemm(A, B, out, quantization_params, layout):
+    """验证无 padding 的 expert views，不分配或重新打包操作数。"""
+    if layout not in ("TN", "NN", "NT"):
+        raise ValueError("NVTE_GG_CONTIGUOUS requires TN, NN or NT layout")
+    groups = len(A)
+    if not groups or len(B) != groups or len(out) != groups:
+        raise ValueError("NVTE_GG_CONTIGUOUS requires nonempty, equal-length A/B/out lists")
+    if len(quantization_params) != groups or any(q is not None for q in quantization_params):
+        raise ValueError("NVTE_GG_CONTIGUOUS does not support quantization")
+    operands = (("A", A, (torch.bfloat16,)),
+                ("B", B, (torch.bfloat16,)),
+                ("out", out, (torch.bfloat16, torch.float32)))
+    # 先验证类型，避免非法对象在读取 device/storage 时绕过契约错误。
+    for name, tensors, _ in operands:
+        if any(type(t) is not torch.Tensor for t in tensors):
+            raise ValueError(f"NVTE_GG_CONTIGUOUS {name} requires ordinary Tensor views")
+    device = A[0].device
+    for name, tensors, dtypes in operands:
+        storage = tensors[0].untyped_storage()
+        offset = tensors[0].storage_offset()
+        dtype = tensors[0].dtype
+        for t in tensors:
+            if (t.device != device or t.device.type != "cuda" or t.dtype != dtype
+                    or t.dtype not in dtypes or t.ndim != 2 or not t.is_contiguous()
+                    or t.untyped_storage()._cdata != storage._cdata
+                    or t.storage_offset() != offset):
+                raise ValueError(f"NVTE_GG_CONTIGUOUS {name} must be packed adjacent views "
+                                 "of one storage, with uniform device/dtype")
+            offset += t.numel()
+    shapes = []
+    for a, b, d in zip(A, B, out):
+        m, k = (b.shape[1], b.shape[0]) if layout[1] == "T" else b.shape
+        n, ak = a.shape if layout[0] == "T" else (a.shape[1], a.shape[0])
+        if ak != k or tuple(d.shape) != (m, n):
+            raise ValueError("NVTE_GG_CONTIGUOUS incompatible matrix dimensions")
+        shapes.append((m, n, k))
+    fixed = (0, 1) if layout == "NT" else (1, 2)
+    if any(any(s[i] != shapes[0][i] for i in fixed) for s in shapes):
+        raise ValueError("NVTE_GG_CONTIGUOUS requires fixed M/N for NT, fixed N/K otherwise")
+
+
 def general_grouped_gemm(
     A: List[torch.Tensor],
     B: List[torch.Tensor],
@@ -295,6 +336,10 @@ def general_grouped_gemm(
     TN layout Grouped GEMM with fp8 inputs.
     """
     num_gemms = len(A)
+    if os.getenv("NVTE_GG_CONTIGUOUS", "0") == "1":
+        if single_output or use_bias or gelu or D_dtype is not None:
+            raise ValueError("NVTE_GG_CONTIGUOUS does not support single_output or fusion")
+        _validate_contiguous_grouped_gemm(A, B, out, quantization_params, layout)
 
     transa = layout[0] == "T"
     transb = layout[1] == "T"

@@ -174,12 +174,23 @@ struct CollectiveMma<
   template <class ProblemShape>
   CUTLASS_DEVICE
   CollectiveMma(Params params, ProblemShape problem_shape_MNK, int32_t l_idx=0) {
+    init_contiguous(problem_shape_MNK,
+                    get_ab_stride<IsGroupedGemmKernel>()(params.dA, l_idx),
+                    get_ab_stride<IsGroupedGemmKernel>()(params.dB, l_idx));
+  }
+
+  template <class ProblemShape>
+  CUTLASS_DEVICE CollectiveMma(ProblemShape shape, InternalStrideA strideA,
+                               InternalStrideB strideB) {
+    init_contiguous(shape, strideA, strideB);
+  }
+
+  template <class ProblemShape>
+  CUTLASS_DEVICE void init_contiguous(ProblemShape problem_shape_MNK,
+                                      InternalStrideA strideA, InternalStrideB strideB) {
     auto M = get<0>(problem_shape_MNK);
     auto N = get<1>(problem_shape_MNK);
     auto K = get<2>(problem_shape_MNK);
-
-    auto strideA = get_ab_stride<IsGroupedGemmKernel>()(params.dA, l_idx);
-    auto strideB = get_ab_stride<IsGroupedGemmKernel>()(params.dB, l_idx);
     static constexpr bool TransA = is_static<decltype(get<1>(strideA))>::value ? false : true;
     static constexpr bool TransB = is_static<decltype(get<1>(strideB))>::value ? false : true;
 
@@ -449,6 +460,115 @@ struct CollectiveMma<
     // cp_async_wait<0>();
     // __syncthreads();
   }
+
+  // 专用 noC 四列持续 ring；普通 operator() 的生产流水保持原样。
+  template <class Acc, class TensorA, class TensorB, class AfterNTile>
+  CUTLASS_DEVICE void compute_nexpand(Acc& accum, TensorA gA, TensorB gB,
+                                      int k_tiles_per_n, int thread_idx, char* smem_buf,
+                                      AfterNTile&& after_n_tile, int n_tile_start) {
+    static_assert(DispatchPolicy::Stages == 3 && size<0>(TileShape{}) == 256 &&
+                  size<1>(TileShape{}) == 128 && size<2>(TileShape{}) == 64);
+    static_assert(is_rmem<Acc>::value);
+    int warp_idx = canonical_warp_idx_sync();
+    SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+    Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{});
+    Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{});
+    auto gmem_thr_A = gmem_tiled_copy_A.get_slice(thread_idx);
+    auto gmem_thr_B = gmem_tiled_copy_B.get_slice(thread_idx);
+    Tensor tAgA = gmem_thr_A.partition_S(gA);
+    Tensor tAsA = gmem_thr_A.partition_D(sA);
+    Tensor tBgB = gmem_thr_B.partition_S(gB);
+    Tensor tBsB = gmem_thr_B.partition_D(sB);
+    int remaining = 4 * k_tiles_per_n;
+    int load_k = 0, load_n = 0;
+    auto issue_stage = [&](int pipe) {
+      if (remaining > 0) {
+        copy_aiu<true>(
+            gmem_tiled_copy_A, tAgA(_,_,_,load_k), tAsA(_,_,_,pipe),
+            gmem_tiled_copy_B, tBgB(_,_,_,n_tile_start + load_n,load_k),
+            tBsB(_,_,_,pipe), warp_idx);
+        if (++load_k == k_tiles_per_n) { load_k = 0; ++load_n; }
+      }
+      // 最终排空仍提交空 group，保持 wait/fence 一一对应。
+      cp_async_fence();
+      --remaining;
+    };
+    CUTLASS_PRAGMA_UNROLL
+    for (int pipe = 0; pipe < DispatchPolicy::Stages; ++pipe) issue_stage(pipe);
+
+    TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
+    Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0));
+    Tensor tCrB = thr_mma.partition_fragment_B(sB(_,_,0));
+    auto smem_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+    auto smem_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+    auto smem_thr_A = smem_copy_A.get_thread_slice(warp_idx * 32);
+    auto smem_thr_B = smem_copy_B.get_thread_slice(warp_idx * 32);
+    Tensor tCsA = smem_thr_A.partition_S(make_mix_tensor_like(sA));
+    Tensor tCsB = smem_thr_B.partition_S(make_mix_tensor_like(sB));
+    Tensor tCrA_view = smem_thr_A.retile_D(tCrA);
+    Tensor tCrB_view = smem_thr_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA_view) == size<2>(tCrB_view));
+    auto K_BLOCK_MAX = size<2>(tCrA_view);
+    auto K_ATOM_PER_COPY = size<2>(tCrA) / size<2>(tCrA_view);
+    constexpr int K_ISSUE_BLOCK = K_BLOCK_MAX == 1 ? 0 : K_BLOCK_MAX - 2;
+    int read_pipe = 0;
+    Tensor tCsA_p = tCsA(_,_,_,read_pipe);
+    Tensor tCsB_p = tCsB(_,_,_,read_pipe);
+    cp_async_wait<DispatchPolicy::Stages-1>();
+    __syncthreads();
+    copy(smem_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_view(_,_,Int<0>{}));
+    copy(smem_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_view(_,_,Int<0>{}));
+
+    auto process_kblock = [&](auto k_block) {
+      if (k_block == K_BLOCK_MAX - 1) {
+        tCsA_p = tCsA(_,_,_,read_pipe);
+        tCsB_p = tCsB(_,_,_,read_pipe);
+      }
+      bool last = k_block == K_BLOCK_MAX - 1 && remaining == -DispatchPolicy::Stages;
+      if (!last) {
+        if constexpr (K_BLOCK_MAX == 1) {
+          cp_async_wait<DispatchPolicy::Stages-2>();
+          __syncthreads();
+        }
+        auto next = (k_block + Int<1>{}) % K_BLOCK_MAX;
+        copy(smem_copy_A, tCsA_p(_,_,next), tCrA_view(_,_,next));
+        copy(smem_copy_B, tCsB_p(_,_,next), tCrB_view(_,_,next));
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int atom = 0; atom < K_ATOM_PER_COPY; ++atom) {
+        auto idx = k_block * K_ATOM_PER_COPY + atom;
+        cute::transform(tCrA(_,_,idx), TransformA{});
+        cute::transform(tCrB(_,_,idx), TransformB{});
+        cute::gemm(tiled_mma, accum, tCrA(_,_,idx), tCrB(_,_,idx), accum);
+      }
+      if (k_block == K_ISSUE_BLOCK) {
+        cp_async_wait<DispatchPolicy::Stages-2>();
+        __syncthreads();
+        issue_stage(read_pipe);
+        if (++read_pipe == DispatchPolicy::Stages) read_pipe = 0;
+      }
+    };
+    int consumed_k = 0, consumed_n = 0;
+    auto finish_n_tile = [&]() {
+      if (++consumed_k == k_tiles_per_n) {
+        // 下一列已经在飞；单 acc 写回后清零，A/B stage 指针不复位。
+        after_n_tile(consumed_n++);
+        consumed_k = 0;
+      }
+    };
+    for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+      process_kblock(k_block);
+    });
+    finish_n_tile();
+    CUTLASS_PRAGMA_NO_UNROLL
+    while (remaining > -DispatchPolicy::Stages) {
+      for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+        process_kblock(k_block);
+      });
+      finish_n_tile();
+    }
+  }
 };
 
 // Specialization for stage=1
@@ -556,12 +676,23 @@ struct CollectiveMma<
   template <class ProblemShape>
   CUTLASS_DEVICE
   CollectiveMma(Params params, ProblemShape problem_shape_MNK, int32_t l_idx=0) {
+    init_contiguous(problem_shape_MNK,
+                    get_ab_stride<IsGroupedGemmKernel>()(params.dA, l_idx),
+                    get_ab_stride<IsGroupedGemmKernel>()(params.dB, l_idx));
+  }
+
+  template <class ProblemShape>
+  CUTLASS_DEVICE CollectiveMma(ProblemShape shape, InternalStrideA strideA,
+                               InternalStrideB strideB) {
+    init_contiguous(shape, strideA, strideB);
+  }
+
+  template <class ProblemShape>
+  CUTLASS_DEVICE void init_contiguous(ProblemShape problem_shape_MNK,
+                                      InternalStrideA strideA, InternalStrideB strideB) {
     auto M = get<0>(problem_shape_MNK);
     auto N = get<1>(problem_shape_MNK);
     auto K = get<2>(problem_shape_MNK);
-
-    auto strideA = get_ab_stride<IsGroupedGemmKernel>()(params.dA, l_idx);
-    auto strideB = get_ab_stride<IsGroupedGemmKernel>()(params.dB, l_idx);
     static constexpr bool TransA = is_static<decltype(get<1>(strideA))>::value ? false : true;
     static constexpr bool TransB = is_static<decltype(get<1>(strideB))>::value ? false : true;
 

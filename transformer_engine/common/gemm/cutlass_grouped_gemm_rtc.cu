@@ -52,6 +52,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -81,6 +82,7 @@
 #include "cutlass/epilogue/collective/builders/ppu_builder.inl"
 
 #include "ppu_adaptive_tile.hpp"
+#include "cutlass/gemm/kernel/nvte_contiguous_grouped.hpp"
 
 #include "../common.h"
 #include "../util/cuda_driver.h"
@@ -240,6 +242,7 @@ struct TileConfig {
   // Production launch policy associated with a tuned tile. Zero keeps the
   // architecture-independent occupancy/default grid path.
   int workers_per_cu = 0;
+  int contiguous_mode = 0;  // 0=通用，1=连续普通，2=连续 noC NExpand=4
 
   bool operator==(TileConfig const& o) const {
     return tile_m == o.tile_m && tile_n == o.tile_n && tile_k == o.tile_k &&
@@ -970,7 +973,8 @@ std::string make_kernel_symbol(int target_sm_arch, TileConfig const& cfg) {
       "_sm", target_sm_arch,
       "_tb", cfg.tile_m, "x", cfg.tile_n, "x", cfg.tile_k,
       "_s", cfg.stages,
-      "_C", cfg.with_C ? element_short<ED>() : "void");
+      "_C", cfg.with_C ? element_short<ED>() : "void",
+      cfg.contiguous_mode ? concat_strings("_contiguous", cfg.contiguous_mode) : "");
 }
 
 template <typename Traits>
@@ -1322,6 +1326,7 @@ std::vector<std::string> make_nvrtc_options(int sm_arch, bool trans_a, bool tran
       concat_strings("-DNVTE_GG_DTYPE=", dtype_id),
       concat_strings("-DNVTE_GG_OUT_FP32=", out_fp32 ? 1 : 0),
       concat_strings("-DNVTE_GG_WITH_C=", cfg.with_C ? 1 : 0),
+      concat_strings("-DNVTE_GG_CONTIGUOUS_MODE=", cfg.contiguous_mode),
       // An fp32 destination folds C in by default; a 16-bit wgrad only does so
       // under an explicit experiment switch, because the bf16 fragment and
       // prologue arms never beat the staged epilogue and the production path
@@ -1354,6 +1359,9 @@ std::vector<std::string> make_nvrtc_options(int sm_arch, bool trans_a, bool tran
   // not contribute an empty-string option: hgrtc rejects it with
   // "unrecognized option" and the whole RTC path fails.
   const std::string extra_defines = getenv<std::string>("NVTE_GG_EXTRA_DEFINES");
+  // 专用 ABI/几何不接受任意宏覆盖；优化类型通过独立模式选择。
+  NVTE_CHECK(cfg.contiguous_mode == 0 || extra_defines.empty(),
+             "NVTE_GG_CONTIGUOUS does not support NVTE_GG_EXTRA_DEFINES overrides.");
   if (!extra_defines.empty()) {
     // NVRTC parses exactly one option per array entry; several -D flags cannot
     // be packed into a single macro value.
@@ -1514,6 +1522,11 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
 
   const std::string kernel_label = make_kernel_label<Traits>(sm_arch, cfg);
   const std::string kernel_symbol = make_kernel_symbol<Traits>(sm_arch, cfg);
+  if (auto dir = getenv<std::string>("NVTE_CUTLASS_RTC_DUMP_CUBIN_DIR"); !dir.empty()) {
+    // 保存实际传给 NVRTC 的逐项 options，不用离线推导值作为身份回执。
+    std::ofstream output(dir + "/" + kernel_symbol + ".options.txt");
+    for (const auto& option : opts) output << option << '\n';
+  }
 
   // Build a cache key that includes a digest of the full RTC input (top-level
   // source + every reachable include) and the exact compiler options. This
@@ -1696,6 +1709,206 @@ HostWsRing& host_ws_ring(int device) {
   return *r;
 }
 }  // namespace
+
+// 专用 ABI 不依赖 pointer-array GemmUniversal::Params。
+template <bool TA, bool TB, bool FP32, bool WithC, int NExpand = 1>
+struct ContiguousTraits : GemmTraits<TA, TB, 89, cutlass::bfloat16_t, 256, 128, 64, 3, FP32> {
+  using Base = GemmTraits<TA, TB, 89, cutlass::bfloat16_t, 256, 128, 64, 3, FP32>;
+  using GemmKernel = cutlass::gemm::kernel::NvteContiguousGrouped<
+      typename Base::CollectiveMainloop, typename Base::CollectiveEpilogue, WithC, NExpand>;
+};
+
+template <bool TA, bool TB, bool FP32, bool WithC>
+void launch_contiguous(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+                       NVTETensor* workspace, int groups, int math_sm_count,
+                       cudaStream_t stream) {
+  using Traits = ContiguousTraits<TA, TB, FP32, WithC>;
+  using namespace cutlass::gemm::kernel::nvte_contiguous;
+  Params p{};
+  p.groups = groups;
+  p.beta = WithC;
+  p.ragged_k = TA && !TB;
+  const std::string expand_option = getenv<std::string>("NVTE_GG_CONTIGUOUS_N_EXPAND");
+  NVTE_CHECK(expand_option.empty() || expand_option == "1" || expand_option == "4",
+             "NVTE_GG_CONTIGUOUS_N_EXPAND must be 1 or 4.");
+  const bool request_expand = expand_option == "4";
+  NVTE_CHECK(!request_expand || !WithC,
+             "NVTE_GG_CONTIGUOUS_N_EXPAND=4 currently supports noC only.");
+  int eligible_groups = 0;
+  cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+  NVTE_CHECK_CUDA(cudaStreamIsCapturing(stream, &capture));
+  NVTE_CHECK(capture == cudaStreamCaptureStatusNone,
+             "NVTE_GG_CONTIGUOUS does not support CUDA graph capture.");
+  NVTE_CHECK(A != nullptr && B != nullptr && D != nullptr && groups > 0,
+             "NVTE_GG_CONTIGUOUS requires valid nonempty tensor lists.");
+  auto checked_add = [](uint64_t x, uint64_t y) {
+    NVTE_CHECK(y <= std::numeric_limits<uint64_t>::max() - x,
+               "NVTE_GG_CONTIGUOUS offset or descriptor overflow.");
+    return x + y;
+  };
+  auto checked_mul = [](uint64_t x, uint64_t y) {
+    NVTE_CHECK(x == 0 || y <= std::numeric_limits<uint64_t>::max() / x,
+               "NVTE_GG_CONTIGUOUS work or descriptor overflow.");
+    return x * y;
+  };
+  uint64_t ao = 0, bo = 0, d_o = 0, block_count = 0;
+  uintptr_t abase = 0, bbase = 0, dbase = 0;
+  auto check_pointer = [](const Tensor* t, uint64_t offset, uint64_t count,
+                          size_t bytes, uintptr_t& base) {
+    if (count == 0) return;
+    constexpr auto limit = std::numeric_limits<uintptr_t>::max();
+    NVTE_CHECK(offset <= limit / bytes && count <= limit / bytes,
+               "NVTE_GG_CONTIGUOUS pointer displacement overflow.");
+    uintptr_t displacement = static_cast<uintptr_t>(offset) * bytes;
+    uintptr_t ptr = reinterpret_cast<uintptr_t>(t->data.dptr);
+    NVTE_CHECK(ptr != 0, "NVTE_GG_CONTIGUOUS requires valid packed pointers.");
+    if (base == 0) {
+      NVTE_CHECK(ptr > displacement, "NVTE_GG_CONTIGUOUS pointer base underflow.");
+      base = ptr - displacement;
+    }
+    NVTE_CHECK(displacement <= limit - base && count * bytes <= limit - ptr,
+               "NVTE_GG_CONTIGUOUS pointer range overflow.");
+    NVTE_CHECK(ptr == base + displacement,
+               "NVTE_GG_CONTIGUOUS expert pointers are not adjacent.");
+  };
+  // 先完整验证尺寸/偏移并计数，再按已检查的 workspace 容量分配描述。
+
+  for (int i = 0; i < groups; ++i) {
+    const Tensor* a = convertNVTETensorCheck(A[i]);
+    const Tensor* b = convertNVTETensorCheck(B[i]);
+    const Tensor* d = convertNVTETensorCheck(D[i]);
+    NVTE_CHECK(a->data.shape.size() == 2 && b->data.shape.size() == 2 &&
+               d->data.shape.size() == 2, "NVTE_GG_CONTIGUOUS requires rank-2 tensors.");
+    NVTE_CHECK(a->data.dtype == DType::kBFloat16 && b->data.dtype == DType::kBFloat16 &&
+               d->data.dtype == (FP32 ? DType::kFloat32 : DType::kBFloat16),
+               "NVTE_GG_CONTIGUOUS requires uniform bf16 A/B and bf16 or fp32 D.");
+    for (auto* t : {a, b, d})
+      for (size_t dim : t->data.shape)
+        NVTE_CHECK(dim <= INT_MAX - 256, "NVTE_GG_CONTIGUOUS dimension overflow.");
+    int m = a->data.shape[TA ? 1 : 0];
+    int k = a->data.shape[TA ? 0 : 1];
+    int n = b->data.shape[TB ? 0 : 1];
+    int bk = b->data.shape[TB ? 1 : 0];
+    NVTE_CHECK(bk == k && d->data.shape[0] == size_t(m) && d->data.shape[1] == size_t(n),
+               "NVTE_GG_CONTIGUOUS incompatible matrix dimensions.");
+    if (i == 0) { p.m = m; p.n = n; p.k = k; }
+    if (m > 0 && k > 0 && k <= 512 && n > 0 && n % 512 == 0) ++eligible_groups;
+    NVTE_CHECK(n == p.n && (p.ragged_k ? m == p.m : k == p.k),
+               "NVTE_GG_CONTIGUOUS requires fixed N/K or fixed M/N.");
+    uint64_t a_count = checked_mul(m, k);
+    uint64_t b_count = checked_mul(n, k);
+    uint64_t d_count = checked_mul(m, n);
+    check_pointer(a, ao, a_count, 2, abase);
+    check_pointer(b, bo, b_count, 2, bbase);
+    check_pointer(d, d_o, d_count, FP32 ? 4 : 2, dbase);
+    if (!p.ragged_k) block_count = checked_add(block_count, (m + 255) / 256);
+    ao = checked_add(ao, a_count);
+    bo = checked_add(bo, b_count);
+    d_o = checked_add(d_o, d_count);
+  }
+  const int n_expand = request_expand && eligible_groups > 0 ? 4 : 1;
+  // mode2 的一个 work 是同 M tile 的四个相邻 N 子块；POD 布局保持 80B。
+  p.n_tiles = (p.n + 127) / 128 / n_expand;
+  p.m_tiles = (p.m + 255) / 256;
+  p.work_count = p.ragged_k ? checked_mul(checked_mul(groups, p.m_tiles), p.n_tiles)
+                            : checked_mul(block_count, p.n_tiles);
+  p.a = reinterpret_cast<void*>(abase);
+  p.b = reinterpret_cast<void*>(bbase);
+  p.d = reinterpret_cast<void*>(dbase);
+  if (p.work_count == 0) return;
+  auto aligned_bytes = [&](uint64_t count, size_t element_size) {
+    uint64_t padded = checked_add(checked_mul(count, element_size), 127) & ~uint64_t(127);
+    NVTE_CHECK(padded <= std::numeric_limits<size_t>::max(),
+               "NVTE_GG_CONTIGUOUS descriptor size overflow.");
+    return static_cast<size_t>(padded);
+  };
+  size_t expert_bytes = aligned_bytes(groups, sizeof(Expert));
+  uint64_t total_bytes = checked_add(expert_bytes, aligned_bytes(block_count, sizeof(MBlock)));
+  NVTE_CHECK(total_bytes <= std::numeric_limits<size_t>::max(),
+             "NVTE_GG_CONTIGUOUS workspace size overflow.");
+  size_t bytes = static_cast<size_t>(total_bytes);
+  NVTE_CHECK(workspace != nullptr, "NVTE_GG_CONTIGUOUS requires device workspace.");
+  Tensor* ws = convertNVTETensorCheck(workspace[0]);
+  NVTE_CHECK(ws->data.dtype == DType::kByte && ws->data.shape.size() == 1 &&
+             ws->data.dptr != nullptr,
+             "NVTE_GG_CONTIGUOUS requires a valid rank-1 byte workspace.");
+  NVTE_CHECK(bytes <= ws->data.shape[0], "NVTE_GG_CONTIGUOUS insufficient device workspace.");
+  NVTE_CHECK(reinterpret_cast<uintptr_t>(ws->data.dptr) % 128 == 0,
+             "NVTE_GG_CONTIGUOUS requires 128-byte aligned workspace.");
+  std::vector<Expert> experts;
+  std::vector<MBlock> blocks;
+  NVTE_CHECK(static_cast<uint64_t>(groups) <= experts.max_size() && block_count <= blocks.max_size(),
+             "NVTE_GG_CONTIGUOUS descriptor allocation overflow.");
+  experts.reserve(groups);
+  blocks.reserve(static_cast<size_t>(block_count));
+  ao = bo = d_o = 0;
+  for (int i = 0; i < groups; ++i) {
+    const Tensor* a = convertNVTETensorCheck(A[i]);
+    int m = a->data.shape[TA ? 1 : 0];
+    int k = a->data.shape[TA ? 0 : 1];
+    experts.push_back({m, k, ao, bo, d_o});
+    if (!p.ragged_k)
+      for (int row = 0; row < m; row += 256)
+        blocks.push_back({i, row, std::min(256, m - row), m, ao, bo, d_o});
+    ao += uint64_t(m) * k;
+    bo += uint64_t(p.n) * k;
+    d_o += uint64_t(m) * p.n;
+  }
+  char* dev = reinterpret_cast<char*>(ws->data.dptr);
+  p.experts = reinterpret_cast<Expert*>(dev);
+  p.m_blocks = reinterpret_cast<MBlock*>(dev + expert_bytes);
+  HostWsRing& ring = host_ws_ring(current_device_ordinal());
+  // 持锁至 event record，防止多线程同时取得尚未发布的新 slot。
+  std::unique_lock<std::mutex> lock(ring.mutex);
+  std::vector<char> heap;
+  char* host;
+  int slot = -1;
+  if (ring.base && bytes <= kHostWsSlotSize) {
+    slot = ring.next;
+    ring.next = (ring.next + 1) % kHostWsSlots;
+    if (ring.recorded[slot]) NVTE_CHECK_CUDA(cudaEventSynchronize(ring.events[slot]));
+    host = ring.base + slot * kHostWsSlotSize;
+  } else {
+    heap.resize(bytes);
+    host = heap.data();
+  }
+  std::memcpy(host, experts.data(), experts.size() * sizeof(Expert));
+  if (!blocks.empty()) std::memcpy(host + expert_bytes, blocks.data(), blocks.size() * sizeof(MBlock));
+  NVTE_CHECK_CUDA(cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, stream));
+  if (slot >= 0) {
+    NVTE_CHECK_CUDA(cudaEventRecord(ring.events[slot], stream));
+    ring.recorded[slot] = true;
+  } else {
+    // 非 pinned 临时 staging 不得在异步拷贝消费完成之前释放。
+    NVTE_CHECK_CUDA(cudaStreamSynchronize(stream));
+  }
+  lock.unlock();
+  TileConfig cfg{256, 128, 64, 3, WithC};
+  cfg.contiguous_mode = n_expand == 4 ? 2 : 1;
+  const auto& kernel = [&]() -> const CompiledKernel& {
+    if constexpr (!WithC) {
+      if (n_expand == 4) {
+        using ExpandedTraits = ContiguousTraits<TA, TB, FP32, false, 4>;
+        return get_or_compile<ExpandedTraits>(89, TA, TB, cfg);
+      }
+    }
+    return get_or_compile<Traits>(89, TA, TB, cfg);
+  }();
+  int cus = math_sm_count > 0 ? math_sm_count : cuda::sm_count();
+  if (cus <= 0) cus = 39;
+  unsigned grid = unsigned(std::min<uint64_t>(cus, p.work_count));
+  void* args[] = {&p};
+  NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchKernel, kernel.function, grid, 1, 1,
+                              kernel.thread_count, 1, 1, kernel.smem_size,
+                              static_cast<CUstream>(stream), args, nullptr);
+  if (verbose_tile_debug()) {
+    NVTE_WARN("NVTE_GG_CONTIGUOUS LAUNCHED symbol=", make_kernel_symbol<Traits>(89, cfg),
+              " work=", p.work_count, " grid=", grid, " smem=", kernel.smem_size,
+              " threads=", kernel.thread_count, " n_expand=", n_expand,
+              " ring_groups=", n_expand == 4 ? eligible_groups : 0,
+              " params_bytes=", sizeof(p), " descriptor_bytes=", bytes);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Core launcher
@@ -2127,6 +2340,31 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
               int num_gemms, bool transa, bool transb, NVTETensor* workspace,
               bool accumulate, int device, int math_sm_count,
               cudaStream_t stream) {
+  if (getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1") {
+    NVTE_CHECK(num_gemms > 0 && cuda::sm_arch(device) == 89 && !(transa && transb),
+               "NVTE_GG_CONTIGUOUS requires nonempty lists, sm89, and TN/NN/NT layout.");
+    NVTE_CHECK(getenv<std::string>("NVTE_GG_FORCE_TILE").empty() ||
+               getenv<std::string>("NVTE_GG_FORCE_TILE") == "256,128,64,3",
+               "NVTE_GG_CONTIGUOUS fixes tile=256,128,64,3.");
+    auto run_contiguous = [&](auto ta, auto tb, auto fp32, auto with_c) {
+      launch_contiguous<decltype(ta)::value, decltype(tb)::value,
+                        decltype(fp32)::value, decltype(with_c)::value>(
+          B, A, D, workspace, num_gemms, math_sm_count, stream);
+    };
+    auto layout_contiguous = [&](auto fp32, auto with_c) {
+      using T = std::true_type;
+      using F = std::false_type;
+      if (transa) run_contiguous(F{}, T{}, fp32, with_c);
+      else if (transb) run_contiguous(T{}, F{}, fp32, with_c);
+      else run_contiguous(F{}, F{}, fp32, with_c);
+    };
+    bool fp32 = convertNVTETensorCheck(D[0])->data.dtype == DType::kFloat32;
+    if (fp32 && accumulate) layout_contiguous(std::true_type{}, std::true_type{});
+    else if (fp32) layout_contiguous(std::true_type{}, std::false_type{});
+    else if (accumulate) layout_contiguous(std::false_type{}, std::true_type{});
+    else layout_contiguous(std::false_type{}, std::false_type{});
+    return true;
+  }
   const Tensor* inputA = convertNVTETensorCheck(A[0]);
   const bool is_bf16 = (inputA->data.dtype == DType::kBFloat16);
   const bool is_fp16 = (inputA->data.dtype == DType::kFloat16);
@@ -2362,6 +2600,7 @@ bool cutlass_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
         A, B, D, num_gemms, transa, transb, workspace, accumulate, device,
         math_sm_count, stream);
   } catch (const std::exception& e) {
+    if (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1") throw;
     if (transformer_engine::getenv<bool>(
             "NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", false)) {
       NVTE_WARN("CUTLASS RTC grouped GEMM failed: ", e.what());
