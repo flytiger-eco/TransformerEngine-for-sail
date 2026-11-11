@@ -6,6 +6,7 @@
 
 #include <pybind11/pybind11.h>
 
+#include <cstdlib>
 #include <optional>
 #include <string>
 
@@ -26,6 +27,142 @@ void* get_data_ptr(transformer_engine::pytorch::MaybeTensor tensor) {
 size_t get_size(transformer_engine::pytorch::MaybeTensor tensor, int dim) {
   if (tensor.has_value()) return static_cast<size_t>(tensor->size(dim));
   return 0;
+}
+
+// Reusable host-side storage for the per-expert GEMM descriptors. Rebuilding
+// every NVTETensor on every launch costs about a microsecond per expert, so
+// keep the objects and the arrays handed to nvte_multi_tensor_gemm alive in
+// thread-local storage. A plain torch tensor only needs its data pointer
+// refreshed when the caller passes a different tensor object; quantized
+// tensors embed scale/amax pointers that may change per call, so they are
+// rebuilt on every launch.
+struct GroupedGemmHostScratch {
+  std::vector<transformer_engine::TensorWrapper> a, b, d;
+  std::vector<NVTETensor> a_v, b_v, d_v;
+  // Identity of the torch tensor each slot was last built from.
+  std::vector<const void*> a_obj, b_obj;
+  std::vector<void*> a_ptr, b_ptr;
+  std::vector<int> a_dtype, b_dtype;
+  // Non-zero when the slot currently holds a quantized descriptor, which
+  // cannot be turned back into a plain one by refreshing the data pointer.
+  std::vector<uint8_t> a_quantized, b_quantized;
+
+  void begin(size_t num_gemms) {
+    if (a.size() < num_gemms) {
+      a.resize(num_gemms);
+      b.resize(num_gemms);
+      d.resize(num_gemms);
+      a_quantized.resize(num_gemms, 0);
+      b_quantized.resize(num_gemms, 0);
+    }
+    if (a_v.capacity() < num_gemms) {
+      a_v.reserve(num_gemms);
+      b_v.reserve(num_gemms);
+      d_v.reserve(num_gemms);
+    }
+    a_v.clear();
+    b_v.clear();
+    d_v.clear();
+    if (a_obj.size() < num_gemms) {
+      a_obj.resize(num_gemms, nullptr);
+      b_obj.resize(num_gemms, nullptr);
+      a_ptr.resize(num_gemms, nullptr);
+      b_ptr.resize(num_gemms, nullptr);
+      a_dtype.resize(num_gemms, -1);
+      b_dtype.resize(num_gemms, -1);
+    }
+  }
+
+  void finish(size_t used) {
+    a.resize(used);
+    b.resize(used);
+    d.resize(used);
+    a_quantized.resize(used);
+    b_quantized.resize(used);
+    // Descriptors of the trimmed slots are gone, so their recorded identities
+    // must go too. Otherwise a later call that re-grows the arrays could see a
+    // matching tensor object, skip the refresh, and hand the kernel a
+    // default-constructed (empty) descriptor.
+    a_obj.resize(used);
+    b_obj.resize(used);
+    a_ptr.resize(used);
+    b_ptr.resize(used);
+    a_dtype.resize(used);
+    b_dtype.resize(used);
+  }
+};
+
+GroupedGemmHostScratch& grouped_gemm_host_scratch() {
+  static thread_local GroupedGemmHostScratch scratch;
+  return scratch;
+}
+
+inline NVTEShape make_nvte_shape(const size_t* dims, size_t ndim) {
+  NVTEShape shape;
+  shape.ndim = ndim;
+  for (size_t i = 0; i < ndim; ++i) {
+    shape.data[i] = dims[i];
+  }
+  return shape;
+}
+
+inline NVTEShape make_nvte_shape(at::IntArrayRef sizes) {
+  NVTEShape shape;
+  shape.ndim = static_cast<size_t>(sizes.size());
+  for (size_t i = 0; i < shape.ndim; ++i) {
+    shape.data[i] = static_cast<size_t>(sizes[i]);
+  }
+  return shape;
+}
+
+inline NVTEShape make_nvte_shape(const std::vector<size_t>& sizes) {
+  return make_nvte_shape(sizes.data(), sizes.size());
+}
+
+inline NVTEShape make_nvte_shape2(size_t d0, size_t d1) {
+  NVTEShape shape;
+  shape.ndim = 2;
+  shape.data[0] = d0;
+  shape.data[1] = d1;
+  return shape;
+}
+
+// The shape a cached descriptor was built with. Object address and data pointer
+// are not enough to identify a tensor: a view can be freed and a new view of the
+// same buffer handed out with a different shape, so the shape must be compared
+// too. Host-side only, no device query.
+inline bool shape_matches(const NVTEShape& cached, at::IntArrayRef sizes) {
+  if (cached.ndim != static_cast<size_t>(sizes.size())) {
+    return false;
+  }
+  for (size_t i = 0; i < cached.ndim; ++i) {
+    if (cached.data[i] != static_cast<size_t>(sizes[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Off switch for the descriptor cache, used to A/B the host cost of building
+// every NVTETensor from scratch.
+inline bool reuse_grouped_descriptors() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("NVTE_GG_REUSE_DESCRIPTORS");
+    return value == nullptr || std::string(value) != "0";
+  }();
+  return enabled;
+}
+
+// True for ordinary torch tensors, including nn.Parameter. Quantized tensor
+// subclasses are excluded: their descriptors carry per-call scale pointers.
+inline bool is_plain_torch_tensor(py::handle tensor) {
+  PyObject* obj = tensor.ptr();
+  if (!THPVariable_Check(obj)) {
+    return false;
+  }
+  using namespace transformer_engine::pytorch::detail;
+  return !(IsFloat8Tensor(obj) || IsMXFP8Tensor(obj) || IsFloat8BlockwiseQTensor(obj) ||
+           IsNVFP4Tensor(obj));
 }
 
 }  // namespace
@@ -466,7 +603,7 @@ void te_atomic_gemm(at::Tensor A, at::Tensor A_scale_inverse, DType A_type,
 }
 
 std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
-    std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
+    std::vector<py::handle> A, bool transa, py::handle B, bool transb,
     std::optional<std::vector<at::Tensor>> D, DType D_type, std::vector<int64_t> m_splits,
     std::vector<at::Tensor> bias, DType bias_type, bool single_output,
     std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
@@ -486,17 +623,129 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
   }
 
   const auto none = py::none();
-  std::vector<TensorWrapper> te_A_wrappers, te_B_wrappers, te_D_wrappers, te_bias_wrappers,
-      te_pre_gelu_out_wrappers;
+  const auto dtype = GetATenDType(D_type);
+  const DType te_D_dtype = GetTransformerEngineDType(dtype);
+  // Descriptors and the NVTETensor arrays live in thread-local scratch, so a
+  // steady-state launch refreshes data pointers instead of rebuilding every
+  // expert's tensors, shapes and vector storage.
+  auto& scratch = grouped_gemm_host_scratch();
+  const bool reuse_descriptors = reuse_grouped_descriptors();
+  scratch.begin(A.size());
+  std::vector<TensorWrapper> te_bias_wrappers, te_pre_gelu_out_wrappers;
+  std::vector<NVTETensor> te_bias_vector, te_pre_gelu_out_vector;
+  te_bias_vector.reserve(A.size());
+  te_pre_gelu_out_vector.reserve(A.size());
+  // Python passes one shared empty tensor for every unused bias / pre-GELU slot. A slot that
+  // holds the same tensor as the previous GEMM's reuses its NVTETensor instead of a new one.
+  const at::Tensor* prev_bias = nullptr;
+  const at::Tensor* prev_pre_gelu_out = nullptr;
+  const bool single_input = THPVariable_Check(B.ptr());
+  at::Tensor input;
+  std::vector<py::handle> input_parts;
+  int64_t input_offset = 0;
+  DType input_dtype = DType::kBFloat16;
+  if (single_input) {
+    input = B.cast<at::Tensor>();
+    NVTE_CHECK(single_output && !transb && input.is_cuda() && input.dim() == 2 &&
+                   input.is_contiguous() && input.device() == workspace[0].device() &&
+                   (input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf),
+               "Single input requires a contiguous BF16/FP16 CUDA matrix and single output.");
+    NVTE_CHECK(m_splits.size() == A.size(), "Invalid number of input splits.");
+    int64_t rows = 0;
+    for (int64_t n : m_splits) {
+      NVTE_CHECK(n >= 0 && n <= input.size(0) - rows, "Invalid input split size.");
+      rows += n;
+    }
+    NVTE_CHECK(rows == input.size(0), "Input splits must cover all rows.");
+    input_dtype = GetTransformerEngineDType(input.scalar_type());
+  } else {
+    input_parts = B.cast<std::vector<py::handle>>();
+  }
   std::vector<at::Tensor> D_vectors;
+  size_t used = 0;
   for (size_t i = 0; i < A.size(); i++) {
-    auto te_A = makeTransformerEngineTensor(A[i], none);
-    auto te_B = makeTransformerEngineTensor(B[i], none);
+    // A slice: a plain torch tensor keeps its descriptor between launches, so
+    // only the data pointer (and shape) is refreshed when it changes.
+    TensorWrapper* te_A = &scratch.a[used];
+    at::Tensor a_tensor;
+    if (is_plain_torch_tensor(A[i])) {
+      a_tensor = A[i].cast<at::Tensor>();
+      void* dptr = a_tensor.data_ptr();
+      const int dtype_id = static_cast<int>(a_tensor.scalar_type());
+      if (!reuse_descriptors || scratch.a_quantized[used]) {
+        // A quantized descriptor cannot be refreshed into a plain one.
+        *te_A = makeTransformerEngineTensor(a_tensor);
+        scratch.a_quantized[used] = 0;
+        scratch.a_obj[used] = A[i].ptr();
+        scratch.a_ptr[used] = dptr;
+        scratch.a_dtype[used] = dtype_id;
+      } else if (scratch.a_obj[used] != A[i].ptr() || scratch.a_ptr[used] != dptr ||
+                 scratch.a_dtype[used] != dtype_id ||
+                 !shape_matches(te_A->shape(), a_tensor.sizes())) {
+        te_A->set_rowwise_data(dptr, GetTransformerEngineDType(a_tensor.scalar_type()),
+                               make_nvte_shape(a_tensor.sizes()));
+        scratch.a_obj[used] = A[i].ptr();
+        scratch.a_ptr[used] = dptr;
+        scratch.a_dtype[used] = dtype_id;
+      }
+    } else {
+      *te_A = makeTransformerEngineTensor(A[i], none);
+      scratch.a_quantized[used] = 1;
+      scratch.a_obj[used] = nullptr;
+    }
+
+    // B slice. In the flat path the row range is a raw pointer into the packed
+    // input, so no per-expert torch view is needed.
+    TensorWrapper* te_B = &scratch.b[used];
+    at::Tensor b_tensor;
+    if (single_input) {
+      void* b_dptr = input.numel() == 0
+                         ? nullptr
+                         : static_cast<char*>(input.data_ptr()) +
+                               input_offset * input.size(1) * input.element_size();
+      const NVTEShape b_shape = make_nvte_shape2(static_cast<size_t>(m_splits[i]),
+                                                 static_cast<size_t>(input.size(1)));
+      if (!reuse_descriptors || scratch.b_quantized[used]) {
+        // The flat path replaces a quantized descriptor with a plain one.
+        *te_B = TensorWrapper(b_dptr, b_shape, input_dtype);
+        scratch.b_quantized[used] = 0;
+      } else {
+        te_B->set_rowwise_data(b_dptr, input_dtype, b_shape);
+      }
+      scratch.b_obj[used] = reinterpret_cast<const void*>(1);  // never hits a torch tensor
+      input_offset += m_splits[i];
+    } else if (is_plain_torch_tensor(input_parts[i])) {
+      b_tensor = input_parts[i].cast<at::Tensor>();
+      void* dptr = b_tensor.data_ptr();
+      const int dtype_id = static_cast<int>(b_tensor.scalar_type());
+      if (!reuse_descriptors || scratch.b_quantized[used]) {
+        *te_B = makeTransformerEngineTensor(b_tensor);
+        scratch.b_quantized[used] = 0;
+        scratch.b_obj[used] = input_parts[i].ptr();
+        scratch.b_ptr[used] = dptr;
+        scratch.b_dtype[used] = dtype_id;
+      } else if (scratch.b_obj[used] != input_parts[i].ptr() ||
+                 scratch.b_ptr[used] != dptr || scratch.b_dtype[used] != dtype_id ||
+                 !shape_matches(te_B->shape(), b_tensor.sizes())) {
+        te_B->set_rowwise_data(dptr, GetTransformerEngineDType(b_tensor.scalar_type()),
+                               make_nvte_shape(b_tensor.sizes()));
+        scratch.b_obj[used] = input_parts[i].ptr();
+        scratch.b_ptr[used] = dptr;
+        scratch.b_dtype[used] = dtype_id;
+      }
+    } else {
+      *te_B = makeTransformerEngineTensor(input_parts[i], none);
+      scratch.b_quantized[used] = 1;
+      scratch.b_obj[used] = nullptr;
+    }
 
     // if there is single output
     at::Tensor out_tensor;
+    // Describe the output slice directly: no per-expert torch tensor, hence no
+    // cudaPointerGetAttributes to recover the device from the raw pointer.
+    void* out_slice_ptr = nullptr;
     auto size_t_shape =
-        pytorch::detail::getGemmOutputShape(te_A.shape(), transa, te_B.shape(), transb);
+        pytorch::detail::getGemmOutputShape(te_A->shape(), transa, te_B->shape(), transb);
     bool D_numel_is_zero = false;
     std::vector<int64_t> D_shape;
     for (size_t t : size_t_shape) {
@@ -505,23 +754,21 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
         D_numel_is_zero = true;
       }
     }
-    auto dtype = GetATenDType(D_type);
     auto opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
     if (single_output) {
       if (output_data_ptr == nullptr) {
         out_tensor = at::empty(D_shape, opts);
+        D_vectors.emplace_back(out_tensor);
       } else {
         // We need to check !D_numel_is_zero because if the final input portion has zero elements,
-        // output_data_ptr would point beyond the allocated memory of D. This would cause
-        // at::from_blob to fail as it would reference memory not allocated by CUDA.
+        // output_data_ptr would point beyond the allocated memory of D.
         if (!D_numel_is_zero) {
-          out_tensor = at::from_blob(output_data_ptr, D_shape, opts);
+          out_slice_ptr = output_data_ptr;
         }
       }
       char* char_ptr = reinterpret_cast<char*>(output_data_ptr);
       char_ptr += D_shape[0] * D_shape[1] * (*D)[0].element_size();
       output_data_ptr = reinterpret_cast<void*>(char_ptr);
-      D_vectors.emplace_back(out_tensor);
     } else {
       if (D == std::nullopt) {
         auto opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
@@ -532,8 +779,19 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       }
     }
 
-    if (te_A.numel() == 0 || te_B.numel() == 0) {
-      if (out_tensor.numel() != 0 && !accumulate) out_tensor.zero_();
+    if (te_A->numel() == 0 || te_B->numel() == 0) {
+      if (!accumulate) {
+        if (out_slice_ptr != nullptr) {
+          // The slice lies inside (*D)[0], so pin the device instead of querying the pointer.
+          at::for_blob(out_slice_ptr, D_shape)
+              .options(opts)
+              .target_device((*D)[0].device())
+              .make_tensor()
+              .zero_();
+        } else if (out_tensor.numel() != 0) {
+          out_tensor.zero_();
+        }
+      }
       if (bias[i].numel() != 0 && grad) {
         bias[i].zero_();
       }
@@ -541,27 +799,45 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       continue;
     }
 
-    auto te_D = makeTransformerEngineTensor(out_tensor);
-    auto te_bias = makeTransformerEngineTensor(bias[i]);
-    auto te_pre_gelu_out = makeTransformerEngineTensor(pre_gelu_out[i]);
+    if (out_slice_ptr != nullptr && reuse_descriptors) {
+      scratch.d[used].set_rowwise_data(out_slice_ptr, te_D_dtype, make_nvte_shape(size_t_shape));
+    } else if (out_slice_ptr != nullptr) {
+      scratch.d[used] = makeTransformerEngineTensor(out_slice_ptr, size_t_shape, te_D_dtype);
+    } else {
+      scratch.d[used] = makeTransformerEngineTensor(out_tensor);
+    }
 
-    const auto gelu_shape = pre_gelu_out[i].data_ptr() == nullptr
-                                ? std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0))}
-                                : std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0)),
-                                                      static_cast<size_t>(te_pre_gelu_out.size(1))};
+    if (prev_bias != nullptr && bias[i].is_same(*prev_bias)) {
+      te_bias_vector.emplace_back(te_bias_vector.back());
+    } else {
+      te_bias_wrappers.emplace_back(makeTransformerEngineTensor(bias[i]));
+      te_bias_vector.emplace_back(te_bias_wrappers.back().data());
+      prev_bias = &bias[i];
+    }
 
-    DType gelu_type = bias_type;
-    te_pre_gelu_out =
-        makeTransformerEngineTensor(get_data_ptr(pre_gelu_out[i]), gelu_shape, gelu_type);
+    if (prev_pre_gelu_out != nullptr && pre_gelu_out[i].is_same(*prev_pre_gelu_out)) {
+      te_pre_gelu_out_vector.emplace_back(te_pre_gelu_out_vector.back());
+    } else {
+      const auto gelu_shape =
+          pre_gelu_out[i].data_ptr() == nullptr
+              ? std::vector<size_t>{static_cast<size_t>(pre_gelu_out[i].size(0))}
+              : std::vector<size_t>{static_cast<size_t>(pre_gelu_out[i].size(0)),
+                                    static_cast<size_t>(pre_gelu_out[i].size(1))};
 
-    te_A_wrappers.emplace_back(std::move(te_A));
-    te_B_wrappers.emplace_back(std::move(te_B));
-    te_D_wrappers.emplace_back(std::move(te_D));
-    te_bias_wrappers.emplace_back(std::move(te_bias));
-    te_pre_gelu_out_wrappers.emplace_back(std::move(te_pre_gelu_out));
+      te_pre_gelu_out_wrappers.emplace_back(
+          makeTransformerEngineTensor(get_data_ptr(pre_gelu_out[i]), gelu_shape, bias_type));
+      te_pre_gelu_out_vector.emplace_back(te_pre_gelu_out_wrappers.back().data());
+      prev_pre_gelu_out = &pre_gelu_out[i];
+    }
+
+    scratch.a_v.emplace_back(te_A->data());
+    scratch.b_v.emplace_back(te_B->data());
+    scratch.d_v.emplace_back(scratch.d[used].data());
+    used++;
   }
+  scratch.finish(used);
 
-  if (te_A_wrappers.empty()) {
+  if (scratch.a_v.empty()) {
     return bias;
   }
 
@@ -570,9 +846,9 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
 
   // Optionally swizzle the scaling factors
   swizzled_scale_inverses_list.emplace_back(
-      multi_tensor_swizzle_scales_for_gemm(te_A_wrappers, transa, !transa));
+      multi_tensor_swizzle_scales_for_gemm(scratch.a, transa, !transa));
   swizzled_scale_inverses_list.emplace_back(
-      multi_tensor_swizzle_scales_for_gemm(te_B_wrappers, !transb, transb));
+      multi_tensor_swizzle_scales_for_gemm(scratch.b, !transb, transb));
 
   // Emulate the FP8 block scaling recipe with MXFP8 on Blackwell and newer
   // as it is not natively supported by cublasLt
@@ -580,7 +856,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     // Check if is using FP8 block scaling
     bool exists_tensor_using_fp8_block_scaling = false;
     bool exists_tensor_not_using_fp8_block_scaling = false;
-    for (const auto& tensor_wrappers : {&te_A_wrappers, &te_B_wrappers}) {
+    for (const auto& tensor_wrappers : {&scratch.a, &scratch.b}) {
       for (const TensorWrapper& tensor : *tensor_wrappers) {
         const NVTEScalingMode scaling_mode = tensor.scaling_mode();
         if (scaling_mode == NVTE_BLOCK_SCALING_1D || scaling_mode == NVTE_BLOCK_SCALING_2D)
@@ -593,11 +869,11 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       NVTE_CHECK(!exists_tensor_not_using_fp8_block_scaling,
                  "Either all tensors or no tensor must be FP8 block scaling tensors");
       // Convert tensors to mxfp8 and swizzle their scaling factors
-      for (TensorWrapper& A_tensor : te_A_wrappers) {
+      for (TensorWrapper& A_tensor : scratch.a) {
         swizzled_scale_inverses_list.emplace_back(
             convert_block_scaling_to_mxfp8_tensor(A_tensor, transa));
       }
-      for (TensorWrapper& B_tensor : te_B_wrappers) {
+      for (TensorWrapper& B_tensor : scratch.b) {
         swizzled_scale_inverses_list.emplace_back(
             convert_block_scaling_to_mxfp8_tensor(B_tensor, !transb));
       }
@@ -605,16 +881,6 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       transa = true;
       transb = false;
     }
-  }
-
-  std::vector<NVTETensor> te_A_vector, te_B_vector, te_D_vector, te_bias_vector,
-      te_pre_gelu_out_vector;
-  for (size_t i = 0; i < te_A_wrappers.size(); i++) {
-    te_A_vector.emplace_back(te_A_wrappers[i].data());
-    te_B_vector.emplace_back(te_B_wrappers[i].data());
-    te_D_vector.emplace_back(te_D_wrappers[i].data());
-    te_bias_vector.emplace_back(te_bias_wrappers[i].data());
-    te_pre_gelu_out_vector.emplace_back(te_pre_gelu_out_wrappers[i].data());
   }
 
   std::vector<NVTETensor> te_workspace_vector;
@@ -628,10 +894,11 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
 
   // For now, we only have multi-stream cublas backend.
   NVTE_SCOPED_GIL_RELEASE({
-    nvte_multi_tensor_gemm(te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
-                           te_bias_vector.data(), te_pre_gelu_out_vector.data(), te_A_vector.size(),
-                           transa, transb, grad, te_workspace_vector.data(), accumulate,
-                           use_split_accumulator, math_sm_count, at::cuda::getCurrentCUDAStream());
+    nvte_multi_tensor_gemm(scratch.a_v.data(), scratch.b_v.data(), scratch.d_v.data(),
+                           te_bias_vector.data(), te_pre_gelu_out_vector.data(),
+                           static_cast<int>(scratch.a_v.size()), transa, transb, grad,
+                           te_workspace_vector.data(), accumulate, use_split_accumulator,
+                           math_sm_count, at::cuda::getCurrentCUDAStream());
   });
   return bias;
 }
