@@ -245,13 +245,10 @@ REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 4096, bf16, bf16, bf16, fp32, 1
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, fp32, fp32, fp32, fp32, 1, 1, 8, 16, 4);
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, fp16, fp16, fp16, fp32, 1, 1, 16, 16, 4);
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, bf16, bf16, bf16, fp32, 1, 1, 16, 16, 4);
+
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 5120, fp32, fp32, fp32, fp32, 1, 1, 4, 16, 4);
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 5120, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 4);
 REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 5120, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4);
-
-REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, fp32, fp32, fp32, fp32, 1, 1, 4, 16, 4);
-REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 4);
-REGISTER_NORM_LAUNCHER(RMSNorm, Backward, tuned, 8192, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4);
 
 // Create rmsnorm bwd general launch function and register. Macro signature:
 //  HIDDEN_SIZE, WTYPE, ITYPE, OTYPE, CTYPE, ...
@@ -358,8 +355,6 @@ REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 4096, fp16, fp16, fp16, fp32
 REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 4096, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4,
                        true);
 
-// fused add 的逐元素运算也不变；增加归约 warp，降低活跃寄存器和 spill。
-REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 8192, fp32, fp32, fp32, fp32, 1, 1, 8, 16, 4,
 REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 5120, fp32, fp32, fp32, fp32, 1, 1, 4, 16, 4,
                        true);
 REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 5120, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 4,
@@ -367,7 +362,7 @@ REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 5120, fp16, fp16, fp16, fp32
 REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 5120, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4,
                        true);
 
-REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 8192, fp32, fp32, fp32, fp32, 1, 1, 4, 16, 4,
+REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 8192, fp32, fp32, fp32, fp32, 1, 1, 8, 16, 4,
                        true);
 REGISTER_NORM_LAUNCHER(RMSNorm, BackwardAdd, tuned, 8192, fp16, fp16, fp16, fp32, 1, 1, 8, 16, 4,
                        true);
