@@ -9,9 +9,12 @@
 #include <transformer_engine/transpose.h>
 
 #include <algorithm>
+#include <cstdint>
 
+#include "../util/cuda_runtime.h"
 #include "../util/rtc.h"
 #include "../util/string.h"
+#include "../util/system.h"
 #include "../utils.cuh"
 #include "cast_transpose.h"
 
@@ -21,44 +24,93 @@ namespace {
 
 // String with RTC kernel implementation
 #include "string_code_transpose_rtc_cast_transpose_cu.h"
+#include "string_code_transpose_rtc_cast_transpose_pipeline_cu.h"
 
 // Hard-coded kernel parameters
 using CType = float;
 constexpr size_t warps_per_tile = 4;
 constexpr size_t block_size = THREADS_PER_WARP * warps_per_tile;
 
-/* Performance heuristics for optimized kernel parameters */
+constexpr size_t pipe_load_size = 4;
+constexpr size_t pipe_store_size = 2;
+constexpr size_t pipe_warps = 8;
+constexpr size_t pipe_stages = 2;
+constexpr size_t pipe_block_size = THREADS_PER_WARP * pipe_warps;
+
+/* The type switches instantiate this for every output type, including ones
+ * whose size does not divide the pipeline's vector widths; folding the guard
+ * into the division keeps those instantiations free of a zero divisor. */
+constexpr size_t pipe_div(size_t a, size_t b) { return b == 0 ? 0 : a / b; }
+
+bool pipeline_eligible(const Tensor &input, const Tensor &output, size_t row_length,
+                       size_t num_rows, size_t itype_size, size_t otype_size, size_t load_size) {
+  if (getenv<int>("NVTE_CAST_TRANSPOSE_PIPELINE", 1) == 0 || cuda::sm_arch() < 80) return false;
+  if (itype_size != 2 && itype_size != 4) return false;
+  if (load_size % itype_size != 0 || pipe_store_size % otype_size != 0) return false;
+  const size_t tile_m = THREADS_PER_WARP * pipe_div(pipe_store_size, otype_size);
+  const size_t tile_n = THREADS_PER_WARP * pipe_div(load_size, itype_size);
+  if (row_length == 0 || num_rows == 0 || tile_m == 0 || tile_n == 0) return false;
+  if (row_length % tile_n != 0 || num_rows % tile_m != 0) return false;
+  if (num_rows > ((size_t{1} << 31) - 1) / row_length) return false;
+  if (num_rows * row_length <= (size_t{2} << 20)) return false;
+  // Rowwise output is written as Vec<OType, load_size / itype_size>, columnwise
+  // output as Vec<OType, store_size / otype_size>.
+  const size_t rowwise_vec_bytes = pipe_div(load_size, itype_size) * otype_size;
+  return reinterpret_cast<uintptr_t>(input.data.dptr) % 16 == 0 &&
+         reinterpret_cast<uintptr_t>(output.data.dptr) % rowwise_vec_bytes == 0 &&
+         reinterpret_cast<uintptr_t>(output.columnwise_data.dptr) % pipe_store_size == 0;
+}
+
+/* Performance heuristics for optimized kernel parameters
+ *
+ * Estimated cost of a config is waves * work_per_wave:
+ *  - waves = ceil(num_blocks / concurrent_blocks), where concurrent_blocks
+ *    is an occupancy estimate limited by registers, shared memory, and
+ *    resident threads per SM. This captures wave quantization, which
+ *    dominates on devices with few SMs.
+ *  - work_per_wave is the per-thread instruction stream: global memory
+ *    instructions (input loads, cast stores, transposed stores), shared
+ *    memory staging instructions (half weight: cheaper than global), and
+ *    per-element arithmetic (cast to compute type, scale multiply, amax
+ *    update, cast to output type ~5 ops/element).
+ *
+ * Register usage is estimated from the transposed-output staging array
+ * (nvec_in * num_iterations vectors) plus a fixed base for addressing and
+ * FP8-factor state. The model constants were calibrated against measured
+ * config sweeps (see docs/transpose_optimization.md). Integer arithmetic
+ * (weights scaled by 2) ensures stable ordering.
+ */
 struct KernelConfig {
   /** Vector load size */
   size_t load_size = 0;
   /** Vector store size to transposed output */
   size_t store_size = 0;
+  /** Warps per tile (block size = warp_size * warps_per_tile) */
+  size_t warps_per_tile = 0;
 
   /* Whether config is valid */
   bool valid = false;
   /* Number of CUDA blocks */
   size_t num_blocks = 0;
-
-  /* Number of active SMs */
-  size_t active_sm_count = 0;
-  /* Elements per L1 cache load */
-  size_t elements_per_load = 0;
-  /* Elements per L1 cache store to cast output*/
-  size_t elements_per_store_c = 0;
-  /* Elements per L1 cache store to transposed output */
-  size_t elements_per_store_t = 0;
+  /* Threads per block */
+  size_t block_size = 0;
+  /* Estimated cost (lower is better) */
+  size_t cost = 0;
 
   KernelConfig(size_t row_length, size_t num_rows, size_t itype_size, size_t otype_size,
-               size_t load_size_, size_t store_size_, size_t sm_count)
-      : load_size{load_size_}, store_size{store_size_} {
+               size_t load_size_, size_t store_size_, size_t warps, const cuda::DeviceProps &props)
+      : load_size{load_size_}, store_size{store_size_}, warps_per_tile{warps} {
     // Check that tiles are correctly aligned
     constexpr size_t cache_line_size = 128;
     if (load_size % itype_size != 0 || store_size % otype_size != 0 ||
-        cache_line_size % itype_size != 0 || cache_line_size % otype_size != 0) {
+        cache_line_size % itype_size != 0 || cache_line_size % otype_size != 0 || warps == 0 ||
+        THREADS_PER_WARP % warps != 0) {
       return;
     }
-    const size_t row_tile_elements = load_size * THREADS_PER_WARP / itype_size;
-    const size_t col_tile_elements = store_size * THREADS_PER_WARP / otype_size;
+    const size_t nvec_in = load_size / itype_size;
+    const size_t nvec_out = store_size / otype_size;
+    const size_t row_tile_elements = nvec_in * THREADS_PER_WARP;
+    const size_t col_tile_elements = nvec_out * THREADS_PER_WARP;
     valid = (row_length % row_tile_elements == 0 && num_rows % col_tile_elements == 0);
     if (!valid) {
       return;
@@ -66,34 +118,39 @@ struct KernelConfig {
 
     // Number of CUDA blocks
     num_blocks = (row_length / row_tile_elements) * (num_rows / col_tile_elements);
+    block_size = THREADS_PER_WARP * warps;
 
-    // Parameters for performance model
-    constexpr size_t warps_per_sm = 16;  // Rough estimate for saturated SMs
-    active_sm_count = std::min(DIVUP(num_blocks * warps_per_tile, warps_per_sm), sm_count);
-    elements_per_load = (std::min(cache_line_size, row_tile_elements * itype_size) / itype_size);
-    elements_per_store_c = (std::min(cache_line_size, row_tile_elements * otype_size) / otype_size);
-    elements_per_store_t = (std::min(cache_line_size, col_tile_elements * otype_size) / otype_size);
+    // Occupancy estimate
+    const size_t num_iterations = THREADS_PER_WARP / warps;
+    constexpr size_t base_regs = 40;          // addressing, FP8 factors, loop state
+    constexpr size_t max_blocks_per_sm = 32;  // conservative HW limit
+    const size_t staging_vecs = nvec_in * num_iterations;
+    const size_t staging_vec_regs = std::max<size_t>(1, nvec_out * otype_size / 4);
+    const size_t est_regs = staging_vecs * staging_vec_regs + base_regs;
+    const size_t smem_bytes = THREADS_PER_WARP * (THREADS_PER_WARP + 1) * nvec_out * otype_size;
+    const size_t reg_limit = static_cast<size_t>(props.regs_per_sm) / (est_regs * block_size);
+    const size_t smem_limit = props.shared_mem_per_sm / smem_bytes;
+    const size_t thread_limit = static_cast<size_t>(props.max_threads_per_sm) / block_size;
+    const size_t blocks_per_sm =
+        std::max<size_t>(1, std::min({reg_limit, smem_limit, thread_limit, max_blocks_per_sm}));
+    const size_t concurrent_blocks = blocks_per_sm * props.sm_count;
+    const size_t waves = DIVUP(num_blocks, concurrent_blocks);
+
+    // Per-thread instruction stream (weights scaled by 2 for integer math)
+    const size_t n_load = num_iterations * nvec_out;
+    const size_t n_store_c = n_load;
+    const size_t n_store_t = nvec_in * num_iterations;
+    const size_t n_smem = 2 * staging_vecs;
+    const size_t elts_per_thread = nvec_in * nvec_out * num_iterations;
+    constexpr size_t w_comp = 10;  // ~5 arithmetic ops per element
+    const size_t work = 2 * (n_load + n_store_c + n_store_t) + n_smem + w_comp * elts_per_thread;
+    cost = waves * work;
   }
 
   /* Compare by estimated cost */
   bool operator<(const KernelConfig &other) const {
     if (this->valid && other.valid) {
-      // cost ~ (1/elements_per_load
-      //         + 1/elements_per_store_c
-      //         + 1/elements_per_store_t) / active_sms
-      // Note: Integer arithmetic ensures stable ordering
-      const auto &l1 = this->elements_per_load;
-      const auto &sc1 = this->elements_per_store_c;
-      const auto &st1 = this->elements_per_store_t;
-      const auto &p1 = this->active_sm_count;
-      const auto &l2 = other.elements_per_load;
-      const auto &sc2 = other.elements_per_store_c;
-      const auto &st2 = other.elements_per_store_t;
-      const auto &p2 = other.active_sm_count;
-      const auto scale = l1 * sc1 * st1 * p1 * l2 * sc2 * st2 * p2;
-      const auto cost1 = (scale / l1 + scale / sc1 + scale / st1) / p1;
-      const auto cost2 = (scale / l2 + scale / sc2 + scale / st2) / p2;
-      return cost1 < cost2;
+      return this->cost < other.cost;
     } else {
       return this->valid && !other.valid;
     }
@@ -261,63 +318,152 @@ void cast_transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cu
             const bool aligned =
                 (row_length % THREADS_PER_WARP == 0 && num_rows % THREADS_PER_WARP == 0);
             if (aligned && rtc::is_enabled()) {  // Runtime-compiled tuned kernel
-              // Pick kernel config
-              std::vector<KernelConfig> kernel_configs;
-              kernel_configs.reserve(16);
-              const size_t sm_count = static_cast<size_t>(cuda::sm_count());
-              auto add_config = [&](size_t load_size, size_t store_size) {
-                kernel_configs.emplace_back(row_length, num_rows, itype_size, otype_size, load_size,
-                                            store_size, sm_count);
-              };
-              add_config(8, 8);
-              add_config(4, 8);
-              add_config(8, 4);
-              add_config(4, 4);
-              add_config(2, 8);
-              add_config(8, 2);
-              add_config(2, 4);
-              add_config(4, 2);
-              add_config(2, 2);
-              add_config(1, 8);
-              add_config(8, 1);
-              add_config(1, 4);
-              add_config(4, 1);
-              add_config(1, 2);
-              add_config(2, 1);
-              add_config(1, 1);
-              const auto &kernel_config =
-                  *std::min_element(kernel_configs.begin(), kernel_configs.end());
-              NVTE_CHECK(kernel_config.valid, "invalid kernel config");
-              const size_t load_size = kernel_config.load_size;
-              const size_t store_size = kernel_config.store_size;
-              const size_t num_blocks = kernel_config.num_blocks;
-
-              // Compile NVRTC kernel if needed and launch
               auto &rtc_manager = rtc::KernelManager::instance();
-              const std::string kernel_label = concat_strings(
-                  "cast_transpose"
-                  ",itype=",
-                  itype_name, ",otype=", otype_name, ",load_size=", load_size,
-                  ",store_size=", store_size);
-              if (!rtc_manager.is_compiled(kernel_label)) {
-                std::string code = string_code_transpose_rtc_cast_transpose_cu;
-                code = regex_replace(code, "__ITYPE__", itype_name);
-                code = regex_replace(code, "__OTYPE__", otype_name);
-                code = regex_replace(code, "__LOAD_SIZE__", load_size);
-                code = regex_replace(code, "__STORE_SIZE__", store_size);
-                code = regex_replace(code, "__WARPS_PER_TILE__", warps_per_tile);
-                code = regex_replace(code, "__BLOCK_SIZE__", block_size);
-                rtc_manager.compile(kernel_label, "cast_transpose_optimized_kernel", code,
-                                    "transformer_engine/common/transpose/rtc/cast_transpose.cu");
+              bool launched = false;
+              // 只在已验证的 FP8 形状范围使用新配置，其余保留原有路径。
+              // bytewise 转换算术不变；32 位元素偏移受 pipeline_eligible 的 2^31 上限保护。
+              const size_t elements = input.numel();
+              const bool wide = otype_size == 1 &&
+                                ((itype_size == 4 && elements >= (size_t{8} << 20)) ||
+                                 (itype_size == 2 && elements >= (size_t{32} << 20)));
+              const bool wide_aligned = wide &&
+                                        pipeline_eligible(input, output, row_length, num_rows,
+                                                          itype_size, otype_size, 8);
+              const bool narrow = otype_size == 1 && itype_size == 2 &&
+                                  elements <= (size_t{16} << 20);
+              const bool compact_index = wide_aligned || narrow;
+              const size_t load_size = wide_aligned ? 8 : pipe_load_size;
+              const size_t stages = wide_aligned ? 1 : pipe_stages;
+              // FP32 提前到量化后预取；两字节输入复用转置 barrier，避免额外同步。
+              const int prefetch_mode = wide_aligned && output.dtype() == DType::kFloat8E4M3
+                                            ? (itype_size == 4 ? 1 : 2)
+                                            : 0;
+              if (pipeline_eligible(input, output, row_length, num_rows, itype_size, otype_size,
+                                    load_size)) {
+                const size_t tile_m = THREADS_PER_WARP * pipe_div(pipe_store_size, otype_size);
+                const size_t tile_n = THREADS_PER_WARP * pipe_div(load_size, itype_size);
+                const size_t stage_bytes = tile_m * (tile_n * itype_size + 16);
+                const size_t staging_bytes = THREADS_PER_WARP * (THREADS_PER_WARP + 1) *
+                                             pipe_store_size *
+                                             (compact_index ? pipe_div(load_size, itype_size) : 1);
+                const size_t dyn_smem = stages * stage_bytes + staging_bytes;
+                const unsigned num_tiles_m = static_cast<unsigned>(num_rows / tile_m);
+                const unsigned total_tiles =
+                    static_cast<unsigned>(num_tiles_m * (row_length / tile_n));
+                const std::string pipe_label = concat_strings(
+                    "cast_transpose_pipeline,itype=", itype_name, ",otype=", otype_name,
+                    ",load_size=", load_size, ",store_size=", pipe_store_size,
+                    ",warps_per_tile=", pipe_warps, ",stages=", stages,
+                    ",compact_index=", compact_index, ",prefetch_mode=", prefetch_mode);
+                if (!rtc_manager.is_compiled(pipe_label)) {
+                  std::string code = string_code_transpose_rtc_cast_transpose_pipeline_cu;
+                  code = regex_replace(code, "__ITYPE__", itype_name);
+                  code = regex_replace(code, "__OTYPE__", otype_name);
+                  code = regex_replace(code, "__LOAD_SIZE__", load_size);
+                  code = regex_replace(code, "__STORE_SIZE__", pipe_store_size);
+                  code = regex_replace(code, "__WARPS_PER_TILE__", pipe_warps);
+                  code = regex_replace(code, "__BLOCK_SIZE__", pipe_block_size);
+                  code = regex_replace(code, "__STAGES__", stages);
+                  code = regex_replace(code, "__PREFETCH_MODE__", prefetch_mode);
+                  code = regex_replace(code, "__INDEX_TYPE__", compact_index ? "unsigned" : "size_t");
+                  code = regex_replace(code, "__COMBINE_COMPONENTS__", compact_index ? "true" : "false");
+                  rtc_manager.compile(
+                      pipe_label, "cast_transpose_pipeline_kernel", code,
+                      "transformer_engine/common/transpose/rtc/cast_transpose_pipeline.cu");
+                }
+                const int blocks_per_sm = rtc_manager.occupancy_max_active_blocks_per_sm(
+                    pipe_label, static_cast<int>(pipe_block_size), dyn_smem);
+                if (blocks_per_sm > 0) {
+                  // 成对 E4M3 转换降低寄存器占用后，不能把 wide 路径的访存并发随之放大。
+                  // FP32 高瘦或超大流式形状需要更多独立 warp 隐藏延迟，保留原上限。
+                  const int prefetch_grid_limit =
+                      prefetch_mode == 1 &&
+                              (row_length <= 2048 || elements >= (size_t{256} << 20))
+                          ? 8
+                          : 4;
+                  const int grid_blocks_per_sm = prefetch_mode != 0
+                                                     ? std::min(blocks_per_sm, prefetch_grid_limit)
+                                                     : blocks_per_sm;
+                  const size_t num_pipe_blocks = std::min<size_t>(
+                      total_tiles, static_cast<size_t>(cuda::sm_count()) * grid_blocks_per_sm);
+                  rtc_manager.launch(
+                      pipe_label, num_pipe_blocks, pipe_block_size, static_cast<unsigned>(dyn_smem),
+                      stream, static_cast<const InputType *>(input.data.dptr),
+                      reinterpret_cast<const CType *>(noop.data.dptr),
+                      static_cast<OutputType *>(output.data.dptr),
+                      static_cast<OutputType *>(output.columnwise_data.dptr),
+                      static_cast<const CType *>(output.scale.dptr),
+                      static_cast<CType *>(output.amax.dptr),
+                      static_cast<CType *>(output.scale_inv.dptr),
+                      static_cast<unsigned>(row_length), static_cast<unsigned>(num_rows),
+                      num_tiles_m, total_tiles);
+                  launched = true;
+                }
               }
-              rtc_manager.launch(kernel_label, num_blocks, block_size, 0, stream,
-                                 static_cast<const InputType *>(input.data.dptr),
-                                 reinterpret_cast<const CType *>(noop.data.dptr),
-                                 static_cast<OutputType *>(output.data.dptr),
-                                 static_cast<OutputType *>(output.columnwise_data.dptr),
-                                 static_cast<const CType *>(output.scale.dptr),
-                                 static_cast<CType *>(output.amax.dptr),
-                                 static_cast<CType *>(output.scale_inv.dptr), row_length, num_rows);
+              if (!launched) {
+                // Pick kernel config
+                // Note: Configs are ordered by preference for tie-breaking
+                // (larger vector accesses first, more warps per tile first).
+                std::vector<KernelConfig> kernel_configs;
+                kernel_configs.reserve(32);
+                const auto &props = cuda::device_props();
+                auto add_config = [&](size_t load_size, size_t store_size, size_t warps) {
+                  kernel_configs.emplace_back(row_length, num_rows, itype_size, otype_size, load_size,
+                                              store_size, warps, props);
+                };
+                for (size_t warps : {size_t{8}, size_t{4}}) {
+                  add_config(8, 8, warps);
+                  add_config(4, 8, warps);
+                  add_config(8, 4, warps);
+                  add_config(4, 4, warps);
+                  add_config(2, 8, warps);
+                  add_config(8, 2, warps);
+                  add_config(2, 4, warps);
+                  add_config(4, 2, warps);
+                  add_config(2, 2, warps);
+                  add_config(1, 8, warps);
+                  add_config(8, 1, warps);
+                  add_config(1, 4, warps);
+                  add_config(4, 1, warps);
+                  add_config(1, 2, warps);
+                  add_config(2, 1, warps);
+                  add_config(1, 1, warps);
+                }
+                const auto &kernel_config =
+                    *std::min_element(kernel_configs.begin(), kernel_configs.end());
+                NVTE_CHECK(kernel_config.valid, "invalid kernel config");
+                const size_t load_size = kernel_config.load_size;
+                const size_t store_size = kernel_config.store_size;
+                const size_t num_blocks = kernel_config.num_blocks;
+                const size_t cfg_warps_per_tile = kernel_config.warps_per_tile;
+                const size_t cfg_block_size = kernel_config.block_size;
+
+                // Compile NVRTC kernel if needed and launch
+                const std::string kernel_label = concat_strings(
+                    "cast_transpose"
+                    ",itype=",
+                    itype_name, ",otype=", otype_name, ",load_size=", load_size,
+                    ",store_size=", store_size, ",warps_per_tile=", cfg_warps_per_tile);
+                if (!rtc_manager.is_compiled(kernel_label)) {
+                  std::string code = string_code_transpose_rtc_cast_transpose_cu;
+                  code = regex_replace(code, "__ITYPE__", itype_name);
+                  code = regex_replace(code, "__OTYPE__", otype_name);
+                  code = regex_replace(code, "__LOAD_SIZE__", load_size);
+                  code = regex_replace(code, "__STORE_SIZE__", store_size);
+                  code = regex_replace(code, "__WARPS_PER_TILE__", cfg_warps_per_tile);
+                  code = regex_replace(code, "__BLOCK_SIZE__", cfg_block_size);
+                  rtc_manager.compile(kernel_label, "cast_transpose_optimized_kernel", code,
+                                      "transformer_engine/common/transpose/rtc/cast_transpose.cu");
+                }
+                rtc_manager.launch(kernel_label, num_blocks, cfg_block_size, 0, stream,
+                                   static_cast<const InputType *>(input.data.dptr),
+                                   reinterpret_cast<const CType *>(noop.data.dptr),
+                                   static_cast<OutputType *>(output.data.dptr),
+                                   static_cast<OutputType *>(output.columnwise_data.dptr),
+                                   static_cast<const CType *>(output.scale.dptr),
+                                   static_cast<CType *>(output.amax.dptr),
+                                   static_cast<CType *>(output.scale_inv.dptr), row_length, num_rows);
+              }
             } else {  // Statically-compiled general kernel
               constexpr size_t load_size = 4;
               constexpr size_t store_size = 4;
