@@ -243,10 +243,12 @@ struct TileConfig {
   // architecture-independent occupancy/default grid path.
   int workers_per_cu = 0;
   int contiguous_mode = 0;  // 0=通用，1=连续普通，2=连续 noC NExpand=4
+  int contiguous_kmax = 512;
 
   bool operator==(TileConfig const& o) const {
     return tile_m == o.tile_m && tile_n == o.tile_n && tile_k == o.tile_k &&
-           stages == o.stages && with_C == o.with_C;
+           stages == o.stages && with_C == o.with_C &&
+           contiguous_mode == o.contiguous_mode && contiguous_kmax == o.contiguous_kmax;
   }
 };
 
@@ -974,7 +976,9 @@ std::string make_kernel_symbol(int target_sm_arch, TileConfig const& cfg) {
       "_tb", cfg.tile_m, "x", cfg.tile_n, "x", cfg.tile_k,
       "_s", cfg.stages,
       "_C", cfg.with_C ? element_short<ED>() : "void",
-      cfg.contiguous_mode ? concat_strings("_contiguous", cfg.contiguous_mode) : "");
+      cfg.contiguous_mode ? concat_strings("_contiguous", cfg.contiguous_mode) : "",
+      cfg.contiguous_mode > 1 && cfg.contiguous_kmax != 512
+          ? concat_strings("_kmax", cfg.contiguous_kmax) : "");
 }
 
 template <typename Traits>
@@ -999,7 +1003,9 @@ std::string make_kernel_label(int target_sm_arch, TileConfig const& cfg) {
       element_name<ED>(), ",", element_name<Acc>(), ">,",
       "C=", cfg.with_C ? element_name<ED>() : "void", ",",
       layout_name<LC>(),
-      "> | sm", target_sm_arch);
+      "> | sm", target_sm_arch,
+      cfg.contiguous_mode > 1 && cfg.contiguous_kmax != 512
+          ? concat_strings(" | contiguous_kmax=", cfg.contiguous_kmax) : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,6 +1357,10 @@ std::vector<std::string> make_nvrtc_options(int sm_arch, bool trans_a, bool tran
       "-D__HGGC_BF16_HPP__=1",
       "-D__BF16_DEFINED__=1",
   };
+
+  if (cfg.contiguous_mode > 1 && cfg.contiguous_kmax != 512) {
+    opts.push_back(concat_strings("-DNVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX=", cfg.contiguous_kmax));
+  }
 
   // Debug/experiment passthrough: NVTE_GG_EXTRA_DEFINES="-DX=1 -DY=2" is
   // forwarded verbatim to the NVRTC command line. It is part of the
@@ -1711,18 +1721,20 @@ HostWsRing& host_ws_ring(int device) {
 }  // namespace
 
 // 专用 ABI 不依赖 pointer-array GemmUniversal::Params。
-template <bool TA, bool TB, bool FP32, bool WithC, int NExpand = 1>
-struct ContiguousTraits : GemmTraits<TA, TB, 89, cutlass::bfloat16_t, 256, 128, 64, 3, FP32> {
-  using Base = GemmTraits<TA, TB, 89, cutlass::bfloat16_t, 256, 128, 64, 3, FP32>;
+template <bool TA, bool TB, bool FP32, bool WithC, int NExpand = 1, int BN = 128,
+          int KMax = 512>
+struct ContiguousTraits : GemmTraits<TA, TB, 89, cutlass::bfloat16_t, 256, BN, 64, 3, FP32> {
+  static_assert(BN == 128 || (BN == 256 && !WithC));
+  using Base = GemmTraits<TA, TB, 89, cutlass::bfloat16_t, 256, BN, 64, 3, FP32>;
   using GemmKernel = cutlass::gemm::kernel::NvteContiguousGrouped<
-      typename Base::CollectiveMainloop, typename Base::CollectiveEpilogue, WithC, NExpand>;
+      typename Base::CollectiveMainloop, typename Base::CollectiveEpilogue, WithC, NExpand, KMax>;
 };
 
-template <bool TA, bool TB, bool FP32, bool WithC>
+template <bool TA, bool TB, bool FP32, bool WithC, int BN = 128>
 void launch_contiguous(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
                        NVTETensor* workspace, int groups, int math_sm_count,
                        cudaStream_t stream) {
-  using Traits = ContiguousTraits<TA, TB, FP32, WithC>;
+  using Traits = ContiguousTraits<TA, TB, FP32, WithC, 1, BN>;
   using namespace cutlass::gemm::kernel::nvte_contiguous;
   Params p{};
   p.groups = groups;
@@ -1734,6 +1746,10 @@ void launch_contiguous(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   const bool request_expand = expand_option == "4";
   NVTE_CHECK(!request_expand || !WithC,
              "NVTE_GG_CONTIGUOUS_N_EXPAND=4 currently supports noC only.");
+  const std::string kmax_option = getenv<std::string>("NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX");
+  NVTE_CHECK(kmax_option.empty() || kmax_option == "512" || kmax_option == "1024" ||
+             kmax_option == "2048", "NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX must be 512, 1024 or 2048.");
+  const int requested_kmax = kmax_option == "2048" ? 2048 : kmax_option == "1024" ? 1024 : 512;
   int eligible_groups = 0;
   cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
   NVTE_CHECK_CUDA(cudaStreamIsCapturing(stream, &capture));
@@ -1792,7 +1808,8 @@ void launch_contiguous(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
     NVTE_CHECK(bk == k && d->data.shape[0] == size_t(m) && d->data.shape[1] == size_t(n),
                "NVTE_GG_CONTIGUOUS incompatible matrix dimensions.");
     if (i == 0) { p.m = m; p.n = n; p.k = k; }
-    if (m > 0 && k > 0 && k <= 512 && n > 0 && n % 512 == 0) ++eligible_groups;
+    if (request_expand && m > 0 && k > 0 && k <= requested_kmax &&
+        n > 0 && n % (BN * 4) == 0) ++eligible_groups;
     NVTE_CHECK(n == p.n && (p.ragged_k ? m == p.m : k == p.k),
                "NVTE_GG_CONTIGUOUS requires fixed N/K or fixed M/N.");
     uint64_t a_count = checked_mul(m, k);
@@ -1808,14 +1825,26 @@ void launch_contiguous(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   }
   const int n_expand = request_expand && eligible_groups > 0 ? 4 : 1;
   // mode2 的一个 work 是同 M tile 的四个相邻 N 子块；POD 布局保持 80B。
-  p.n_tiles = (p.n + 127) / 128 / n_expand;
+  p.n_tiles = (p.n + BN - 1) / BN / n_expand;
   p.m_tiles = (p.m + 255) / 256;
   p.work_count = p.ragged_k ? checked_mul(checked_mul(groups, p.m_tiles), p.n_tiles)
                             : checked_mul(block_count, p.n_tiles);
   p.a = reinterpret_cast<void*>(abase);
   p.b = reinterpret_cast<void*>(bbase);
   p.d = reinterpret_cast<void*>(dbase);
-  if (p.work_count == 0) return;
+  const char* bypass_reason = WithC ? "withC_NE1" : !request_expand ? "requested_NE1" :
+      p.work_count == 0 ? "no_work" : eligible_groups > 0 ? "eligible" :
+      p.n % (BN * 4) != 0 ? "N_not_divisible" : "no_eligible_K";
+  if (p.work_count == 0) {
+    if (verbose_tile_debug()) {
+      NVTE_WARN("NVTE_GG_CONTIGUOUS NO_WORK requested_ne=", request_expand ? 4 : 1,
+                " effective_ne=", n_expand, " requested_kmax=", requested_kmax,
+                " effective_kmax=", n_expand > 1 ? requested_kmax : 512,
+                " eligible_groups=", eligible_groups, " bypass_reason=", bypass_reason,
+                " work=0 grid=0 threads=0 smem=0 params_bytes=", sizeof(p));
+    }
+    return;
+  }
   auto aligned_bytes = [&](uint64_t count, size_t element_size) {
     uint64_t padded = checked_add(checked_mul(count, element_size), 127) & ~uint64_t(127);
     NVTE_CHECK(padded <= std::numeric_limits<size_t>::max(),
@@ -1883,12 +1912,21 @@ void launch_contiguous(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
     NVTE_CHECK_CUDA(cudaStreamSynchronize(stream));
   }
   lock.unlock();
-  TileConfig cfg{256, 128, 64, 3, WithC};
+  TileConfig cfg{256, BN, 64, 3, WithC};
   cfg.contiguous_mode = n_expand == 4 ? 2 : 1;
+  cfg.contiguous_kmax = n_expand > 1 ? requested_kmax : 512;
   const auto& kernel = [&]() -> const CompiledKernel& {
     if constexpr (!WithC) {
       if (n_expand == 4) {
-        using ExpandedTraits = ContiguousTraits<TA, TB, FP32, false, 4>;
+        if (requested_kmax == 2048) {
+          using ExpandedTraits = ContiguousTraits<TA, TB, FP32, false, 4, BN, 2048>;
+          return get_or_compile<ExpandedTraits>(89, TA, TB, cfg);
+        }
+        if (requested_kmax == 1024) {
+          using ExpandedTraits = ContiguousTraits<TA, TB, FP32, false, 4, BN, 1024>;
+          return get_or_compile<ExpandedTraits>(89, TA, TB, cfg);
+        }
+        using ExpandedTraits = ContiguousTraits<TA, TB, FP32, false, 4, BN, 512>;
         return get_or_compile<ExpandedTraits>(89, TA, TB, cfg);
       }
     }
@@ -1906,6 +1944,9 @@ void launch_contiguous(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
               " work=", p.work_count, " grid=", grid, " smem=", kernel.smem_size,
               " threads=", kernel.thread_count, " n_expand=", n_expand,
               " ring_groups=", n_expand == 4 ? eligible_groups : 0,
+              " requested_ne=", request_expand ? 4 : 1, " effective_ne=", n_expand,
+              " requested_kmax=", requested_kmax, " effective_kmax=", cfg.contiguous_kmax,
+              " eligible_groups=", eligible_groups, " bypass_reason=", bypass_reason,
               " params_bytes=", sizeof(p), " descriptor_bytes=", bytes);
   }
 }
@@ -2343,10 +2384,26 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   if (getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1") {
     NVTE_CHECK(num_gemms > 0 && cuda::sm_arch(device) == 89 && !(transa && transb),
                "NVTE_GG_CONTIGUOUS requires nonempty lists, sm89, and TN/NN/NT layout.");
+    const std::string bn_option = getenv<std::string>("NVTE_GG_CONTIGUOUS_BN");
+    NVTE_CHECK(bn_option.empty() || bn_option == "128" || bn_option == "256",
+               "NVTE_GG_CONTIGUOUS_BN must be 128 or 256.");
+    const bool wide_no_c = bn_option == "256";
+    NVTE_CHECK(!wide_no_c || !accumulate,
+               "NVTE_GG_CONTIGUOUS_BN=256 currently supports noC only.");
+    const std::string tile = wide_no_c ? "256,256,64,3" : "256,128,64,3";
     NVTE_CHECK(getenv<std::string>("NVTE_GG_FORCE_TILE").empty() ||
-               getenv<std::string>("NVTE_GG_FORCE_TILE") == "256,128,64,3",
-               "NVTE_GG_CONTIGUOUS fixes tile=256,128,64,3.");
+               getenv<std::string>("NVTE_GG_FORCE_TILE") == tile,
+               "NVTE_GG_CONTIGUOUS fixes tile=", tile, ".");
     auto run_contiguous = [&](auto ta, auto tb, auto fp32, auto with_c) {
+      // 宽 BN 仅实例化 noC，不改变既有 C pool 或有 C 几何。
+      if constexpr (!decltype(with_c)::value) {
+        if (wide_no_c) {
+          launch_contiguous<decltype(ta)::value, decltype(tb)::value,
+                            decltype(fp32)::value, false, 256>(
+              B, A, D, workspace, num_gemms, math_sm_count, stream);
+          return;
+        }
+      }
       launch_contiguous<decltype(ta)::value, decltype(tb)::value,
                         decltype(fp32)::value, decltype(with_c)::value>(
           B, A, D, workspace, num_gemms, math_sm_count, stream);

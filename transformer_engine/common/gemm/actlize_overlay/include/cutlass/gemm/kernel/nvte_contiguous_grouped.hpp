@@ -5,9 +5,10 @@
 #include "cute/tensor.hpp"
 
 namespace cutlass::gemm::kernel {
-template <class Mainloop, class Epilogue, bool WithC, int NExpand = 1>
+template <class Mainloop, class Epilogue, bool WithC, int NExpand = 1, int KMax = 512>
 struct NvteContiguousGrouped {
   static_assert(NExpand == 1 || NExpand == 4);
+  static_assert(KMax == 512 || KMax == 1024 || KMax == 2048);
   static_assert(NExpand == 1 || !WithC, "NExpand 首轮仅启用 noC。");
   using Params = nvte_contiguous::Params;
   using TileShape = typename Mainloop::TileShape;
@@ -23,7 +24,9 @@ struct NvteContiguousGrouped {
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
   static constexpr int MaxThreadsPerBlock = cute::size(TiledMma{});
   static_assert(SharedStorageSize <= 256 * 1024);
-  static_assert(cute::size<0>(TileShape{}) == 256 && cute::size<1>(TileShape{}) == 128 &&
+  static constexpr int BN = cute::size<1>(TileShape{});
+  static_assert(BN == 128 || (BN == 256 && !WithC), "宽 BN 仅启用 noC。");
+  static_assert(cute::size<0>(TileShape{}) == 256 &&
                 cute::size<2>(TileShape{}) == 64 && Mainloop::DispatchPolicy::Stages == 3);
 
   struct Work {
@@ -66,13 +69,14 @@ struct NvteContiguousGrouped {
       clear(acc);
       auto store_column = [&](int column) {
         auto coordinate = make_coord(w.mi, w.ni + column, _, 0);
-        auto residue = make_tuple(w.m - w.mi * 256, p.n - (w.ni + column) * 128, 0);
+        auto residue = make_tuple(w.m - w.mi * 256, p.n - (w.ni + column) * BN, 0);
         Epilogue::template compute_contiguous<WithC>(
             static_cast<ElementD*>(p.d) + w.d_offset, w.m, p.n, TileShape{}, coordinate,
             acc, mma, residue, tid, storage.c_pool, []() { return false; });
       };
       if constexpr (NExpand > 1) {
-        if (w.k > 0 && w.k <= 512) {
+        // M/N整除由host验证并编码在work中；逐expert共享同一编译期KMax。
+        if (w.k > 0 && w.k <= KMax) {
           auto da = packed_stride<typename Mainloop::InternalStrideA>(w.m, w.k);
           auto db = packed_stride<typename Mainloop::InternalStrideB>(p.n, w.k);
           Tensor a = make_tensor(make_gmem_ptr(static_cast<ElementA const*>(p.a) + w.a_offset),
@@ -99,7 +103,7 @@ struct NvteContiguousGrouped {
       for (int column = 0; column < NExpand; ++column) {
         clear(acc);
         auto coordinate = make_coord(w.mi, w.ni + column, _, 0);
-        auto residue = make_tuple(w.m - w.mi * 256, p.n - (w.ni + column) * 128, 0);
+        auto residue = make_tuple(w.m - w.mi * 256, p.n - (w.ni + column) * BN, 0);
         if (w.k > 0) {
           auto da = packed_stride<typename Mainloop::InternalStrideA>(w.m, w.k);
           auto db = packed_stride<typename Mainloop::InternalStrideB>(p.n, w.k);

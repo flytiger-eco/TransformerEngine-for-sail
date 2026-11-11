@@ -7,6 +7,44 @@ import json
 import os
 from pathlib import Path
 
+def packed_study_config(arm, layout, accumulate, ne, kmax, m, n, k, groups):
+    """独立进程的专用配置；production不受实验开关污染。"""
+    assert arm in ("production", "contiguous")
+    assert layout in ("TN", "NN", "NT") and ne in (1, 4, 8)
+    assert kmax in (512, 1024, 2048) and min(m, n, k, groups) > 0
+    assert not accumulate or (layout == "NT" and ne == 1)
+    bn = 128 if accumulate else 256
+    eligible = not accumulate and ne > 1 and k <= kmax and n % (bn * ne) == 0
+    effective = ne if eligible and arm == "contiguous" else 1
+    return {"arm": arm, "requested_ne": ne, "effective_ne": effective,
+            "kmax": kmax, "effective_kmax": kmax if effective > 1 else 512,
+            "tile_n": bn if arm == "contiguous" else None,
+            "mode": 0 if arm == "production" else (2 if ne == 4 else 3) if effective > 1 else 1,
+            "eligible_groups": groups if eligible and arm == "contiguous" else 0,
+            "expected_work": None if arm == "production" else
+                groups * ((m + 255) // 256) * ((n + bn - 1) // bn) // effective,
+            "bypass_reason": ("production" if arm == "production" else
+                              "withC_NE1" if accumulate else "requested_NE1" if ne == 1 else
+                              "N_not_divisible" if n % (bn * ne) else
+                              "no_eligible_K" if k > kmax else "eligible")}
+
+
+def packed_study_environment(environment, config, cache):
+    """只保留RTC采集必需开关，不继承历史tile/epilogue实验。"""
+    keep = {"NVTE_GG_ALLOW_FP32_ACCUM", "NVTE_GG_RTC_LINEINFO"}
+    env = {key: value for key, value in environment.items()
+           if not key.startswith("NVTE_GG_") or key in keep}
+    env["NVTE_GG_RTC_CACHE_DIR"] = str(cache)
+    env["NVTE_GG_CONTIGUOUS"] = "1" if config["arm"] == "contiguous" else "0"
+    if config["arm"] == "contiguous":
+        env["NVTE_GG_CONTIGUOUS_BN"] = str(config["tile_n"])
+        env["NVTE_GG_CONTIGUOUS_N_EXPAND"] = str(config["requested_ne"])
+        # 默认512无需新host开关，阶段0仍使用未修改的生产库。
+        if config["kmax"] != 512:
+            env["NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX"] = str(config["kmax"])
+    return env
+
+
 p = argparse.ArgumentParser()
 p.add_argument("--groups", type=int, default=1)
 p.add_argument("--layout", choices=("TN", "NN", "NT"), default="NT")
@@ -35,8 +73,14 @@ p.add_argument("--pair-c", action="store_true", help="同输入、同 dtype 配�
 p.add_argument("--pair-warmup", type=int, default=8)
 p.add_argument("--pair-iters", type=int, default=10)
 p.add_argument("--reverse-pair", action="store_true")
-p.add_argument("--smallk-arms", nargs="+", choices=("production", "matched", "contiguous", "nexpand"),
-               help="fwd noC K512 的 packed ragged 四臂；tile缓存按进程初始化，每进程一臂")
+p.add_argument("--packed-study-arm", choices=("production", "contiguous"))
+p.add_argument("--packed-study-ne", type=int, choices=(1, 4, 8), default=1)
+p.add_argument("--packed-study-kmax", type=int, choices=(512, 1024, 2048), default=512)
+p.add_argument("--packed-study-profile", action="store_true")
+p.add_argument("--packed-study-cubins", type=Path)
+p.add_argument("--smallk-arms", nargs="+",
+               choices=("production", "matched", "contiguous", "nexpand", "contiguous256", "nexpand256"),
+               help="fwd noC K512 的 packed ragged 对照；tile缓存按进程初始化，每进程一臂")
 p.add_argument("--smallk-profile", action="store_true",
                help="避免嵌套 torch.profiler；匹配 launch 为正确性1次+预热3次+iters次")
 p.add_argument("--smallk-cubins", type=Path,
@@ -47,6 +91,8 @@ p.add_argument("--compile-tile", type=int, nargs=3, default=(256, 256, 64))
 p.add_argument("--compile-stages", type=int, default=3)
 p.add_argument("--compile-contiguous", type=int, choices=(0, 1, 2), default=0,
                help="仅离线编译验收：0=通用，1=连续普通，2=noC NExpand4；非性能替身")
+p.add_argument("--compile-kmax", type=int, choices=(512, 1024, 2048), default=512,
+               help="离线扩展kernel的K上限；普通/通用模式归一化512")
 p.add_argument("--compile-arch", type=int, choices=(80, 89), default=89)
 p.add_argument("--compile-ab-dtype", choices=("bf16", "fp16"), default="bf16")
 p.add_argument("--compile-with-c", type=int, choices=(0, 1), default=1,
@@ -114,6 +160,8 @@ if a.compile_only:
                "CUTLASS_ENABLE_TENSOR_CORE_MMA": 1, "__HGGC_FP16_H__": 1,
                "_HGGC_FP16_H_": 1, "HGGC_FP16_H": 1, "__HGGC_BF16_H__": 1,
                "__HGGC_BF16_HPP__": 1, "__BF16_DEFINED__": 1, "NDEBUG": 1, "USE_SAIL": 1}
+    if a.compile_contiguous > 1 and a.compile_kmax != 512:
+        defines["NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX"] = a.compile_kmax
     options = ["--no-cache", "--std=c++17", f"--gpu-architecture=sm_{a.compile_arch}",
                f"-I{cuda / 'include'}", f"-I{cuda / 'include/cccl'}", f"-I{include}",
                "-I/usr/local/PPU_SDK/targets/x86_64-linux/include"]
@@ -255,6 +303,141 @@ if a.resources:
             assert driver.cuModuleUnload(module) == 0
     raise SystemExit(0)
 
+if a.packed_study_arm:
+    import hashlib
+    import math
+    import shutil
+
+    assert a.backend == "rtc" and a.dump and not a.smallk_arms and not a.pair_c
+    assert not a.nonuniform and torch.cuda.get_device_capability() == (8, 9)
+    assert a.dtype == ("fp32" if a.accumulate else "bf16")
+    config = packed_study_config(a.packed_study_arm, a.layout, a.accumulate,
+                                 a.packed_study_ne, a.packed_study_kmax,
+                                 a.rows, a.cols, a.mpe, a.groups)
+    env = packed_study_environment(os.environ, config, (a.dump / "cache").resolve())
+    for key in list(os.environ):
+        if key.startswith("NVTE_GG_") and key not in env:
+            del os.environ[key]
+    os.environ.update(env)
+    loaded_cubin = None
+    if a.packed_study_cubins:
+        cubins = list(a.packed_study_cubins.glob("nvte_grouped_gemm3_*.cubin"))
+        assert len(cubins) == 1
+        loaded_cubin = cubins[0]
+        for suffix in (".cubin", ".cu"):
+            shutil.copyfile(loaded_cubin.with_suffix(suffix), a.dump / loaded_cubin.with_suffix(suffix).name)
+        os.environ["NVTE_GG_RTC_LOAD_CUBIN_DIR"] = str(a.packed_study_cubins.resolve())
+    torch.manual_seed(1234)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    dtype = torch.float32 if a.accumulate else torch.bfloat16
+
+    def packed_operand(shape, element_dtype, random=False):
+        count = math.prod(shape)
+        backing = torch.full((a.groups * count + 64,), 97, device="cuda", dtype=element_dtype)
+        views = [backing[32 + i * count:32 + (i + 1) * count].view(shape) for i in range(a.groups)]
+        for view in views:
+            view.copy_(torch.randn(shape, device="cuda", dtype=element_dtype)) if random else view.fill_(float("nan"))
+        return views, backing
+
+    A, abacking = packed_operand((a.cols, a.mpe) if a.layout == "TN" else (a.mpe, a.cols), torch.bfloat16, True)
+    B, bbacking = packed_operand((a.mpe, a.rows) if a.layout == "NT" else (a.rows, a.mpe), torch.bfloat16, True)
+    D, dbacking = packed_operand((a.rows, a.cols), dtype)
+    C = [torch.randn_like(d) for d in D] if a.accumulate else []
+    splits = [a.mpe if a.layout == "NT" else a.rows] * a.groups
+
+    def bits_hash(tensors):
+        digest = hashlib.sha256()
+        for tensor in tensors:
+            integer = torch.int32 if tensor.dtype == torch.float32 else torch.int16
+            digest.update(tensor.detach().cpu().view(integer).numpy().tobytes())
+        return digest.hexdigest()
+
+    input_hashes = {"A": bits_hash([abacking]), "B": bits_hash([bbacking])}
+    if C:
+        input_hashes["initial_C"] = bits_hash(C)
+
+    def launch_packed():
+        # 每次有C launch恢复同一C；copy不匹配grouped GEMM的profiler过滤器。
+        if C:
+            for d, c in zip(D, C):
+                d.copy_(c)
+        general_grouped_gemm(A, B, D, [None] * a.groups, torch.bfloat16,
+                             layout=a.layout, m_splits=splits, grad=a.layout != "TN",
+                             accumulate=bool(a.accumulate), single_output=False)
+
+    launch_packed()
+    torch.cuda.synchronize()
+    errors = []
+    for i, (x, y, d) in enumerate(zip(A, B, D)):
+        ref = (y.float().t() if a.layout == "NT" else y.float()) @ \
+              (x.float().t() if a.layout == "TN" else x.float())
+        if C:
+            ref += C[i].float()
+        assert torch.isfinite(d).all()
+        rel = float(torch.linalg.vector_norm(d.float() - ref) / torch.linalg.vector_norm(ref).clamp_min(1e-30))
+        limit = max(1e-6, 1e-6 * a.mpe / 256) if a.accumulate else 4e-3
+        assert rel < limit, (i, rel, limit)
+        torch.testing.assert_close(d.float(), ref, rtol=1e-4 if a.accumulate else 0.05,
+                                   atol=5e-4 * max(1, a.mpe / 256) if a.accumulate else 0.05)
+        errors.append(rel)
+    output_hash = bits_hash(D)
+    output = [d.cpu() for d in D]
+    if a.save:
+        assert not a.save.exists()
+        torch.save(output, a.save)
+    if a.compare:
+        old = torch.load(a.compare, weights_only=True)
+        integer = torch.int32 if a.accumulate else torch.int16
+        assert len(old) == len(output) and all(
+            d.dtype == b.dtype and d.shape == b.shape and torch.equal(d.view(integer), b.view(integer))
+            for d, b in zip(output, old)), "与同输入基线不是逐位相同"
+    kernels = []
+    if not a.packed_study_profile:
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                torch.profiler.ProfilerActivity.CUDA]) as prof:
+            launch_packed()
+            torch.cuda.synchronize()
+        kernels = [e.name for e in prof.events() if e.name.startswith("nvte_grouped_gemm3_")]
+        assert len(kernels) == 1 and f"bf16_bf16_{a.dtype}_acc_fp32" in kernels[0], kernels
+        if config["arm"] == "contiguous":
+            assert f"tb256x{config['tile_n']}x64_s3" in kernels[0], kernels
+            source = "fp32" if a.accumulate else "void"
+            ending = f"_C{source}_contiguous{config['mode']}"
+            if config["effective_ne"] > 1 and config["kmax"] != 512:
+                ending += f"_kmax{config['kmax']}"
+            assert kernels[0].endswith(ending), (kernels, config)
+        else:
+            assert "_contiguous" not in kernels[0] and kernels[0].endswith(f"_C{a.dtype}"), kernels
+    for backing in (abacking, bbacking, dbacking):
+        assert torch.all(backing[:32] == 97) and torch.all(backing[-32:] == 97)
+    record = {"correctness": "PASS", "config": config, "MNK": [a.rows, a.cols, a.mpe],
+              "layout": a.layout, "groups": a.groups, "splits": splits, "seed": 1234,
+              "dtype": a.dtype, "alpha": 1, "beta": a.accumulate,
+              "input_sha256": input_hashes, "output_sha256": output_hash,
+              "max_rel_error": max(errors), "kernels": kernels,
+              "operand_shapes": {"A": list(A[0].shape), "B": list(B[0].shape), "D": list(D[0].shape)},
+              "operand_strides": {"A": list(A[0].stride()), "B": list(B[0].stride()), "D": list(D[0].stride())},
+              "environment": {key: value for key, value in os.environ.items() if key.startswith("NVTE_")},
+              "core_library": str(_get_shared_object_file("core").resolve()),
+              "torch_library": str(_get_shared_object_file("torch").resolve()),
+              "rtc_include": os.environ.get("NVTE_CUTLASS3_INCLUDE_DIR"),
+              "skip_matching": 4 if a.packed_study_profile else None}
+    if loaded_cubin:
+        record.update(loaded_cubin=str(loaded_cubin),
+                      loaded_cubin_sha256=hashlib.sha256(loaded_cubin.read_bytes()).hexdigest())
+    (a.dump / "packed_study.json").write_text(json.dumps(record, indent=2) + "\n")
+    print(json.dumps({"packed_study": record}), flush=True)
+    if a.iters:
+        assert a.packed_study_profile and a.iters == 3
+        for _ in range(3):
+            launch_packed()
+        torch.cuda.synchronize()
+        for _ in range(a.iters):
+            launch_packed()
+        torch.cuda.synchronize()
+    raise SystemExit(0)
+
+
 if a.smallk_arms:
     import hashlib
     import math
@@ -304,10 +487,14 @@ if a.smallk_arms:
                     "NVTE_GG_FORCE_WITH_C", "NVTE_GG_RTC_LOAD_CUBIN_DIR", "NVTE_GG_WGRAD_C_FUSION",
                     "NVTE_GG_C_EVT_CLASSIC", "NVTE_GG_DISABLE_DIRECT_EPILOGUE"):
             os.environ.pop(key, None)
-        os.environ["NVTE_GG_CONTIGUOUS"] = "1" if arm in ("contiguous", "nexpand") else "0"
-        os.environ["NVTE_GG_CONTIGUOUS_N_EXPAND"] = "4" if arm == "nexpand" else "1"
+        contiguous = arm in ("contiguous", "nexpand", "contiguous256", "nexpand256")
+        bn = 256 if arm in ("production", "contiguous256", "nexpand256") else 128
+        ne = 4 if arm in ("nexpand", "nexpand256") else 1
+        os.environ["NVTE_GG_CONTIGUOUS"] = "1" if contiguous else "0"
+        os.environ["NVTE_GG_CONTIGUOUS_BN"] = str(bn)
+        os.environ["NVTE_GG_CONTIGUOUS_N_EXPAND"] = str(ne)
         if arm != "production":
-            os.environ["NVTE_GG_FORCE_TILE"] = "256,128,64,3"
+            os.environ["NVTE_GG_FORCE_TILE"] = f"256,{bn},64,3"
         loaded_cubin = None
         if a.smallk_cubins:
             import shutil
@@ -358,12 +545,10 @@ if a.smallk_arms:
             if arm in ("production", "matched"):
                 # 生产 beta=0 的 noC 语义使用 typed C 的运行时短路，不强制实验 Cvoid。
                 assert kernels[0].endswith("_Cbf16") and "_contiguous" not in kernels[0], kernels
-                if arm == "matched":
-                    assert "tb256x128x64_s3" in kernels[0], kernels
+                assert f"tb256x{bn}x64_s3" in kernels[0], kernels
             else:
-                assert "tb256x128x64_s3" in kernels[0], kernels
-                suffix = {"contiguous": "_contiguous1", "nexpand": "_contiguous2"}[arm]
-                assert kernels[0].endswith("_Cvoid" + suffix), kernels
+                assert f"tb256x{bn}x64_s3" in kernels[0], kernels
+                assert kernels[0].endswith(f"_Cvoid_contiguous{2 if ne == 4 else 1}"), kernels
         for storage in (abacking, bbacking, dbacking):
             assert torch.all(storage[:32] == 97) and torch.all(storage[-32:] == 97)
         mblocks = sum((m + 255) // 256 for m in splits)
@@ -376,9 +561,10 @@ if a.smallk_arms:
                  "contiguous": os.environ["NVTE_GG_CONTIGUOUS"],
                  "n_expand": os.environ["NVTE_GG_CONTIGUOUS_N_EXPAND"],
                  "alpha": 1, "beta": 0, "accumulate": False,
-                 "compiled_source_type": "void" if arm in ("contiguous", "nexpand") else "bf16",
-                 "expected_contiguous_work_count": mblocks * a.cols // (512 if arm == "nexpand" else 128)
-                     if arm in ("contiguous", "nexpand") else None}
+                 "tile_n": bn,
+                 "compiled_source_type": "void" if contiguous else "bf16",
+                 "expected_contiguous_work_count": mblocks * a.cols // (bn * ne)
+                     if contiguous else None}
         if loaded_cubin:
             entry["loaded_cubin"] = str(loaded_cubin)
             entry["loaded_cubin_sha256"] = hashlib.sha256(loaded_cubin.read_bytes()).hexdigest()

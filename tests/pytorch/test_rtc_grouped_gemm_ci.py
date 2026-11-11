@@ -946,3 +946,406 @@ def test_workflow_and_shell_syntax():
     report_step = next(s for s in steps if "--tolerance" in s.get("run", ""))
     assert "always()" in report_step["if"]
     assert "--tolerance 0.05" in report_step["run"]
+
+
+def study_cpu_functions():
+    """只加载采集器的纯函数，不执行CLI、导入torch或创建GPU context。"""
+    import ast
+    import statistics
+
+    namespace = {"statistics": statistics, "hashlib": hashlib, "Path": Path, "json": json, "re": re}
+    for filename, names in (("atomic_study.py", {"nexpand_case_manifest", "nexpand_statistics",
+                                               "nexpand_validate_codegen", "nexpand_validate_capture",
+                                               "nexpand_validate_current_anchor", "nexpand_validate_runtime", "nexpand_csv_row"}),
+                             ("repro.py", {"packed_study_config", "packed_study_environment"})):
+        path = ROOT / "profile/gg_fp32_accum" / filename
+        tree = ast.parse(path.read_text())
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        assert {node.name for node in nodes} == names
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    return SimpleNamespace(**namespace)
+
+
+def test_nexpand_24_case_contract():
+    functions = study_cpu_functions()
+    cases = functions.nexpand_case_manifest()
+    assert len(cases) == 26 and sum(not c["control"] for c in cases) == 24
+    assert len({c["id"] for c in cases}) == 26
+    for case in cases:
+        k, n = case["model_KN"]
+        expected = {"fwd": [2048, n, k], "dgrad": [2048, k, n], "wgrad": [n, k, 2048]}
+        assert case["MNK"] == expected[case["direction"]]
+        assert case["groups"] == 16 and case["splits"] == [2048] * 16
+        assert case["beta"] == int(case["direction"] == "wgrad")
+        assert case["dtype"] == ("fp32" if case["beta"] else "bf16")
+    assert all(c["MNK"] == [2048, 4096, 2048] and not c["beta"] for c in cases[-2:])
+
+
+@pytest.mark.parametrize("ne,kmax,expected", [(4, 512, 2), (4, 1024, 6), (4, 2048, 8),
+                                              (8, 512, 2), (8, 1024, 4), (8, 2048, 6)])
+def test_nexpand_admission_inventory(ne, kmax, expected):
+    functions = study_cpu_functions()
+    configs = [functions.packed_study_config("contiguous", c["layout"], c["beta"],
+               1 if c["beta"] else ne, kmax, *c["MNK"], c["groups"])
+               for c in functions.nexpand_case_manifest()[:24]]
+    assert sum(c["effective_ne"] > 1 for c in configs) == expected
+    assert sum(c["bypass_reason"] == "withC_NE1" for c in configs) == 8
+
+
+@pytest.mark.parametrize("ne,kmax", [(4, 512), (4, 1024), (4, 2048), (8, 512), (8, 1024), (8, 2048)])
+def test_nexpand_k2048_controls(ne, kmax):
+    functions = study_cpu_functions()
+    for case in functions.nexpand_case_manifest()[-2:]:
+        config = functions.packed_study_config("contiguous", case["layout"], 0, ne, kmax,
+                                               *case["MNK"], case["groups"])
+        assert config["effective_ne"] == (ne if kmax == 2048 else 1)
+        assert config["expected_work"] == 16 * 8 * 16 // config["effective_ne"]
+
+
+def test_nexpand_environment_isolation():
+    functions = study_cpu_functions()
+    environment = {"PATH": "/sdk/bin", "NVTE_GG_FORCE_TILE": "bad", "NVTE_GG_FORCE_WITH_C": "0",
+                   "NVTE_GG_EXTRA_DEFINES": "-DBAD=1", "NVTE_GG_RTC_LOAD_CUBIN_DIR": "/old",
+                   "NVTE_GG_ALLOW_FP32_ACCUM": "1", "NVTE_GG_RTC_LINEINFO": "1",
+                   "NVTE_CUTLASS3_INCLUDE_DIR": "/frozen", "NVTE_GG_N_EXPAND": "8"}
+    config = functions.packed_study_config("production", "TN", 0, 1, 512, 2048, 4096, 512, 16)
+    env = functions.packed_study_environment(environment, config, "/new")
+    assert env["NVTE_GG_CONTIGUOUS"] == "0" and env["NVTE_GG_RTC_CACHE_DIR"] == "/new"
+    assert env["NVTE_GG_ALLOW_FP32_ACCUM"] == env["NVTE_GG_RTC_LINEINFO"] == "1"
+    assert env["NVTE_CUTLASS3_INCLUDE_DIR"] == "/frozen"
+    assert not any(key in env for key in ("NVTE_GG_FORCE_TILE", "NVTE_GG_EXTRA_DEFINES",
+                                        "NVTE_GG_FORCE_WITH_C", "NVTE_GG_N_EXPAND", "NVTE_GG_RTC_LOAD_CUBIN_DIR"))
+    config = functions.packed_study_config("contiguous", "TN", 0, 4, 512, 2048, 4096, 512, 16)
+    env = functions.packed_study_environment(environment, config, "/new")
+    assert env["NVTE_GG_CONTIGUOUS_BN"] == "256" and env["NVTE_GG_CONTIGUOUS_N_EXPAND"] == "4"
+    assert "NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX" not in env and "NVTE_GG_FORCE_TILE" not in env
+
+
+def test_nexpand_round_statistics_and_incomplete_rejection():
+    functions = study_cpu_functions()
+    values = [[40, 42, 60], [45, 44, 46], [43, 44, 45]]
+    result = functions.nexpand_statistics(values)
+    assert result["round_medians"] == [42, 45, 44] and result["median"] == 44
+    assert (result["min"], result["max"]) == (40, 60)
+    for invalid in (values[:2], [[1, 2, 3], [1, 2], [1, 2, 3]], [[1, 2, float("nan")]] * 3):
+        with pytest.raises(AssertionError):
+            functions.nexpand_statistics(invalid)
+
+
+def test_nexpand_profile_restores_c_and_retains_failure_receipts():
+    import ast
+
+    repro = ast.parse((ROOT / "profile/gg_fp32_accum/repro.py").read_text())
+    launcher = next(node for node in ast.walk(repro) if isinstance(node, ast.FunctionDef) and node.name == "launch_packed")
+    text = ast.unparse(launcher)
+    assert text.index("d.copy_(c)") < text.index("general_grouped_gemm(")
+    assert "accumulate=bool(a.accumulate)" in text
+    study = ast.parse((ROOT / "profile/gg_fp32_accum/atomic_study.py").read_text())
+    branch = next(node for node in study.body if isinstance(node, ast.If) and ast.unparse(node.test) == "a.phase == 'nexpand-matrix'")
+    profiler = next(node for node in ast.walk(branch) if isinstance(node, ast.FunctionDef) and node.name == "profiled")
+    final = next(node for node in ast.walk(profiler) if isinstance(node, ast.Try) and node.finalbody)
+    assert "foreign_contenders(log)" in ast.unparse(ast.Module(body=final.finalbody, type_ignores=[]))
+    assert "assert target and (not foreign)" in ast.unparse(profiler)
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("kmax", [512, 1024, 2048])
+def test_nexpand_compile_kmax_options(mode, kmax):
+    """离线入口不把无效Kmax配置添加到production/NE1/default512。"""
+    import ast
+
+    path = ROOT / "profile/gg_fp32_accum/repro.py"
+    tree = ast.parse(path.read_text())
+    branch = next(node for node in tree.body if isinstance(node, ast.If) and
+                  ast.unparse(node.test) == "a.compile_only")
+    nodes = [node for node in branch.body if isinstance(node, ast.If) and
+             "a.compile_kmax" in ast.unparse(node.test)]
+    assert len(nodes) == 1
+    namespace = {"a": SimpleNamespace(compile_contiguous=mode, compile_kmax=kmax), "defines": {}}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    expected = {"NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX": kmax} if mode > 1 and kmax != 512 else {}
+    assert namespace["defines"] == expected
+
+
+def test_nexpand_kmax_host_device_wiring():
+    """门禁前检查三档Traits、模板ABI及RTC映射均接线；实际机器码另验收。"""
+    directory = ROOT / "transformer_engine/common/gemm"
+    host = (directory / "cutlass_grouped_gemm_rtc.cu").read_text()
+    kernel = (directory / "actlize_overlay/include/cutlass/gemm/kernel/nvte_contiguous_grouped.hpp").read_text()
+    rtc = (directory / "rtc/cutlass_grouped_gemm.cu").read_text()
+    for kmax in (512, 1024, 2048):
+        assert f"ContiguousTraits<TA, TB, FP32, false, 4, BN, {kmax}>" in host
+    assert "cfg.contiguous_kmax = n_expand > 1 ? requested_kmax : 512" in host
+    assert "k <= requested_kmax" in host and "w.k <= KMax) {" in kernel
+    assert "int NExpand = 1, int KMax = 512" in kernel
+    assert "NVTE_GG_CONTIGUOUS_MODE == 2 ? NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX : 512" in rtc
+    assert "std::stoi(kmax_option" not in host
+    for field in ("requested_ne=", "effective_ne=", "requested_kmax=", "effective_kmax=",
+                  "eligible_groups=", "bypass_reason="):
+        assert field in host
+
+
+@pytest.fixture
+def nexpand_codegen_receipt():
+    cases = []
+    configs = [(mode, bn, c, layout, dtype, 512)
+               for mode, bn, c in ((0, 256, 0), (0, 256, 1), (1, 128, 0), (1, 128, 1),
+                                  (1, 256, 0), (2, 128, 0), (2, 256, 0))
+               for layout in ("TN", "NN", "NT") for dtype in ("bf16", "fp32")]
+    configs += [(2, bn, 0, layout, dtype, kmax) for kmax in (1024, 2048)
+                for bn in (128, 256) for layout in ("TN", "NN", "NT") for dtype in ("bf16", "fp32")]
+    for mode, bn, c, layout, dtype, kmax in configs:
+        ta, tb = {"TN": (0, 1), "NN": (0, 0), "NT": (1, 0)}[layout]
+        macros = {"NVTE_GG_CONTIGUOUS_MODE": mode, "NVTE_GG_WITH_C": c,
+                  "NVTE_GG_TRANS_A": ta, "NVTE_GG_TRANS_B": tb,
+                  "NVTE_GG_OUT_FP32": int(dtype == "fp32"), "NVTE_GG_DTYPE": 0,
+                  "NVTE_GG_ARCH": 89, "NVTE_GG_TILE_M": 256, "NVTE_GG_TILE_N": bn,
+                  "NVTE_GG_TILE_K": 64, "NVTE_GG_STAGES": 3}
+        if kmax != 512:
+            macros["NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX"] = kmax
+        cases.append({"mode": mode, "bn": bn, "with_C": c, "layout": layout,
+                      "dtype": dtype, "kmax": kmax, "compile_result": {
+                          "compile_only": "PASS", "gpu_execution": False, "stack_size": 0,
+                          "atomic_instruction_count": 0, "options": [f"-D{k}={v}" for k, v in macros.items()]},
+                      "default_comparison": {"machine_identity_identical": True,
+                                             "resources_identical": True, "raw_cubin_identical": False}
+                                             if kmax == 512 else None})
+    return {"status": "PASS", "gpu_execution": False, "cases": cases}
+
+
+def test_nexpand_codegen_complete_inventory(nexpand_codegen_receipt):
+    study_cpu_functions().nexpand_validate_codegen(nexpand_codegen_receipt)
+
+
+@pytest.mark.parametrize("damage", ["partial", "duplicate", "wrong_mode", "stack", "atomic", "gpu",
+                                     "machine", "resource", "missing_macro", "duplicate_macro"])
+def test_nexpand_codegen_rejects_invalid_receipt(nexpand_codegen_receipt, damage):
+    gate = nexpand_codegen_receipt
+    if damage == "partial":
+        gate["cases"].pop()
+    elif damage == "duplicate":
+        gate["cases"][-1] = gate["cases"][-2]
+    elif damage == "wrong_mode":
+        gate["cases"][-1]["mode"] = 1
+    elif damage in ("stack", "atomic", "gpu"):
+        key = {"stack": "stack_size", "atomic": "atomic_instruction_count", "gpu": "gpu_execution"}[damage]
+        gate["cases"][0]["compile_result"][key] = 1
+    elif damage in ("machine", "resource"):
+        key = "machine_identity_identical" if damage == "machine" else "resources_identical"
+        gate["cases"][0]["default_comparison"][key] = False
+    elif damage == "missing_macro":
+        gate["cases"][-1]["compile_result"]["options"].pop()
+    else:
+        gate["cases"][-1]["compile_result"]["options"].append("-DNVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX=2048")
+    with pytest.raises(AssertionError):
+        study_cpu_functions().nexpand_validate_codegen(gate)
+
+
+@pytest.fixture
+def nexpand_capture_receipt():
+    functions = study_cpu_functions()
+    manifest = functions.nexpand_case_manifest()
+    digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    record = {"status": "PASS", "performance_valid": True, "contention": False, "manifest": manifest,
+              "case_digest": digest, "core_24_complete": True, "samples_per_round": 3, "rounds": 3,
+              "stage": "baseline", "kmax": 512, "device": {"uuid": "old_gpu"},
+              "baseline_audit": {"anchors_sha256": "frozen_anchor"}, "cases": {}}
+    for case in manifest:
+        summary = {arm: functions.nexpand_statistics([[40, 42, 44]] * 3) for arm in ("production", "contiguous")}
+        record["cases"][case["id"]] = {"status": "PASS", "case": case, "summary": summary,
+            "order": [["production", "contiguous"] if (case["index"] + r) % 2 == 0
+                      else ["contiguous", "production"] for r in range(3)],
+            "reports": [{"arm": arm} for _ in range(3) for arm in ("production", "contiguous")],
+            "production_anchor_identity": "PASS", "current_anchor_identity": "PASS"}
+    return record
+
+
+@pytest.mark.parametrize("damage", [None, "partial", "failed", "contention", "samples", "wrong_order", "wrong_stage", "wrong_kmax"])
+def test_nexpand_complete_capture_gate(nexpand_capture_receipt, damage):
+    gate = nexpand_capture_receipt
+    case = gate["cases"][gate["manifest"][0]["id"]]
+    if damage == "partial":
+        gate["cases"].pop(gate["manifest"][-1]["id"])
+    elif damage == "failed":
+        case["status"] = "FAIL"
+    elif damage == "contention":
+        gate["contention"] = True
+    elif damage == "samples":
+        case["summary"]["production"]["samples"] = [[40, 42, 44]] * 2
+    elif damage == "wrong_order":
+        case["order"][0].reverse()
+    elif damage == "wrong_stage":
+        gate["stage"] = "kmax"
+    elif damage == "wrong_kmax":
+        gate["kmax"] = 1024
+    if damage is None:
+        study_cpu_functions().nexpand_validate_capture(gate, gate["case_digest"], "baseline", 512)
+    else:
+        with pytest.raises(AssertionError):
+            study_cpu_functions().nexpand_validate_capture(gate, gate["case_digest"], "baseline", 512)
+
+
+@pytest.mark.parametrize("stage", ["baseline", "kmax"])
+def test_nexpand_first_cross_device_baseline_not_circular(nexpand_capture_receipt, stage):
+    gate = nexpand_capture_receipt
+    validate = study_cpu_functions().nexpand_validate_current_anchor
+    arguments = (stage, "new_gpu", gate, None, gate["case_digest"], gate["baseline_audit"])
+    if stage == "baseline":
+        validate(*arguments)
+    else:
+        with pytest.raises(AssertionError, match="同卡"):
+            validate(*arguments)
+
+
+@pytest.mark.parametrize("damage", [None, "wrong_gpu", "partial", "anchor_machine", "audit_binding"])
+def test_nexpand_cross_device_current_anchor(nexpand_capture_receipt, damage):
+    import copy
+
+    baseline = nexpand_capture_receipt
+    anchor = copy.deepcopy(baseline)
+    anchor["device"]["uuid"] = "new_gpu"
+    if damage == "wrong_gpu":
+        anchor["device"]["uuid"] = "third_gpu"
+    elif damage == "partial":
+        anchor["cases"].pop(anchor["manifest"][-1]["id"])
+    elif damage == "anchor_machine":
+        anchor["cases"][anchor["manifest"][0]["id"]]["current_anchor_identity"] = "FAIL"
+    elif damage == "audit_binding":
+        anchor["baseline_audit"] = {}
+    arguments = ("kmax", "new_gpu", baseline, anchor, baseline["case_digest"], baseline["baseline_audit"])
+    if damage is None:
+        study_cpu_functions().nexpand_validate_current_anchor(*arguments)
+    else:
+        with pytest.raises(AssertionError):
+            study_cpu_functions().nexpand_validate_current_anchor(*arguments)
+
+
+@pytest.mark.parametrize("damage", [None, "missing", "requested_only", "threshold", "eligible", "reason"])
+def test_nexpand_actual_host_launch_receipt(damage):
+    functions = study_cpu_functions()
+    config = functions.packed_study_config("contiguous", "TN", 0, 4, 1024, 2048, 4096, 1024, 16)
+    fields = {"symbol": "actual_symbol", "work": config["expected_work"], "requested_ne": 4,
+              "effective_ne": 4, "requested_kmax": 1024, "effective_kmax": 1024,
+              "eligible_groups": 16, "bypass_reason": "eligible"}
+    if damage == "threshold":
+        fields["effective_kmax"] = 512
+    elif damage == "eligible":
+        fields["eligible_groups"] = 0
+    elif damage == "reason":
+        fields["bypass_reason"] = "no_eligible_K"
+    elif damage == "requested_only":
+        fields.pop("effective_ne")
+    log = "NVTE_GG_CONTIGUOUS LAUNCHED " + " ".join(f"{k}={v}" for k, v in fields.items()) + " grid=16"
+    if damage == "missing":
+        log = ""
+    if damage is None:
+        functions.nexpand_validate_runtime(log, "actual_symbol", config)
+    else:
+        with pytest.raises(AssertionError):
+            functions.nexpand_validate_runtime(log, "actual_symbol", config)
+
+
+def test_nexpand_metadata_production_and_bypass_match_host():
+    functions = study_cpu_functions()
+    production = functions.packed_study_config("production", "TN", 0, 1, 2048, 2048, 4096, 1024, 16)
+    assert production["mode"] == 0 and production["expected_work"] is None
+    for n, k, reason in ((512, 2049, "N_not_divisible"), (4096, 2049, "no_eligible_K")):
+        config = functions.packed_study_config("contiguous", "TN", 0, 4, 2048, 2048, n, k, 16)
+        assert config["bypass_reason"] == reason and config["effective_kmax"] == 512
+
+
+def test_nexpand_prerequisite_failure_receipt_without_gpu(tmp_path):
+    out = tmp_path / "missing_baseline"
+    result = subprocess.run([sys.executable, str(ROOT / "profile/gg_fp32_accum/atomic_study.py"),
+        "nexpand-matrix", "--out", str(out), "--nexpand-stage", "kmax", "--nexpand-kmax", "2048",
+        "--full", "--samples", "3", "--repeats", "3", "--require-verify", str(tmp_path / "missing_verify")],
+        env=dict(os.environ, CUDA_VISIBLE_DEVICES=""), text=True, capture_output=True)
+    assert result.returncode != 0
+    receipt = json.loads((out / "result.json").read_text())
+    assert receipt["status"] == "FAIL" and receipt["failure_phase"] == "prerequisites"
+    assert receipt["gpu_execution"] is False and not receipt["performance_valid"]
+    assert "阶段0" in receipt["error"]
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_nexpand_full_ledger_preserves_negative_and_pending(nexpand_capture_receipt, complete):
+    functions = study_cpu_functions()
+    record = nexpand_capture_receipt
+    rows = []
+    for case in record["manifest"]:
+        p = functions.nexpand_statistics([[44, 45, 46]] * 3)
+        x = functions.nexpand_statistics([[40, 42, 44]] * 3)
+        cfg = functions.packed_study_config("contiguous", case["layout"], case["beta"],
+              1 if case["beta"] else 4, 1024, *case["MNK"], case["groups"])
+        summary = {"production": p, "contiguous": x, "config": cfg,
+                   "delta_pp": x["median"] - p["median"], "relative_pct": 100 * (x["median"] / p["median"] - 1)}
+        row = functions.nexpand_csv_row(case, summary if complete else None, "gpu", "PASS" if complete else "PENDING", [])
+        if complete:
+            assert row["delta_pp"] < 0 and row["relative_pct"] < 0
+            assert json.loads(row["paired_round_delta_pp"]) == [-3, -3, -3]
+            assert len(json.loads(row["current_samples"])) == 3
+            assert row["kmax"] == 1024 and row["effective_kmax"] in (512, 1024)
+        else:
+            assert row["production_tfu"] is row["current_tfu"] is None and row["status"] == "PENDING"
+        rows.append(row)
+    assert len(rows[:24]) == 24 and len(rows[24:]) == 2
+    assert sum(row["beta"] for row in rows[:24]) == 8
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_nexpand_independent_audit_fails_closed_without_gpu(tmp_path, nexpand_capture_receipt, missing):
+    capture, out = tmp_path / "capture", tmp_path / "audit"
+    capture.mkdir()
+    if not missing:
+        receipt = nexpand_capture_receipt
+        receipt["cases"].pop(receipt["manifest"][-1]["id"])
+        (capture / "result.json").write_text(json.dumps(receipt))
+    result = subprocess.run([sys.executable, str(ROOT / "profile/gg_fp32_accum/atomic_study.py"),
+        "audit-nexpand", "--out", str(out), "--nexpand-capture", str(capture)],
+        env=dict(os.environ, CUDA_VISIBLE_DEVICES=""), text=True, capture_output=True)
+    assert result.returncode != 0
+    audit = json.loads((out / "result.json").read_text())
+    assert audit["status"] == "FAIL" and audit["gpu_execution"] is False and not audit["performance_valid"]
+    assert audit["full_reports"] == audit["full_actions"] == 0
+
+
+def test_nexpand_independent_audit_keeps_report_parents_alive():
+    import ast
+
+    tree = ast.parse((ROOT / "profile/gg_fp32_accum/atomic_study.py").read_text())
+    branch = next(node for node in tree.body if isinstance(node, ast.If) and
+                  ast.unparse(node.test) == "a.phase == 'audit-nexpand'")
+    actions = next(node for node in ast.walk(branch) if isinstance(node, ast.FunctionDef) and node.name == "report_actions")
+    returned = next(node for node in actions.body if isinstance(node, ast.Return)).value
+    assert isinstance(returned, ast.Tuple)
+    assert [ast.unparse(node) for node in returned.elts[:2]] == ["context", "ranges"]
+    assert "capture / 'source_snapshot'" in ast.unparse(branch)
+    assert "capture / 'libraries'" in ast.unparse(branch)
+
+
+@pytest.mark.parametrize("failure", ["unbound", "missing", "partial", "overwrite"])
+def test_nexpand_codegen_audit_fails_closed_without_gpu(tmp_path, nexpand_codegen_receipt, failure):
+    """独立编译审计拒绝缺门禁、残缺清单和覆盖历史回执，不执行GPU。"""
+    out, gate = tmp_path / "audit", tmp_path / "codegen.json"
+    command = [sys.executable, str(ROOT / "profile/gg_fp32_accum/atomic_study.py"),
+               "audit-nexpand-codegen", "--out", str(out)]
+    if failure != "unbound":
+        command += ["--nexpand-codegen", str(gate)]
+    if failure == "partial":
+        nexpand_codegen_receipt["cases"].pop()
+        gate.write_text(json.dumps(nexpand_codegen_receipt))
+    if failure == "overwrite":
+        out.mkdir()
+        original = json.dumps({"status": "PASS", "historical": True}) + "\n"
+        (out / "result.json").write_text(original)
+    result = subprocess.run(command, env=dict(os.environ, CUDA_VISIBLE_DEVICES=""),
+                            text=True, capture_output=True)
+    assert result.returncode != 0
+    if failure == "overwrite":
+        assert (out / "result.json").read_text() == original
+    else:
+        receipt = json.loads((out / "result.json").read_text())
+        assert receipt["status"] == "FAIL" and receipt["gpu_execution"] is False
+        assert "artifact_sha256" not in receipt
+        if failure == "unbound":
+            assert "显式绑定66组" in receipt["error"]

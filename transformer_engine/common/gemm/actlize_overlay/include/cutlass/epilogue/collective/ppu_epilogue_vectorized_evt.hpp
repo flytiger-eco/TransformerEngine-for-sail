@@ -1102,7 +1102,8 @@ public:
     constexpr int ChunkElems = ChunkM * BN;
     using ChunkLayout = Layout<Shape<Int<ChunkM>, Shape<Int<CubeW>, Int<BN / CubeW>>>,
                                Stride<Int<CubeW>, Stride<_1, Int<CubeElems>>>>;
-    static_assert(ChunkElems * sizeof(ElementD) <= 32768);
+    // noC 不使用 C pool；宽 noC tile 不受有 C chunk 的 32 KiB 预算约束。
+    static_assert(!WithC || ChunkElems * sizeof(ElementD) <= 32768);
     auto store = [&](auto mma_m, auto mma_n, auto const& source) {
       Tensor a = tAcc(_, mma_m, mma_n);
       Tensor d = tDst(_, mma_m, mma_n);
@@ -1125,9 +1126,20 @@ public:
         cutlass::NumericArrayConverter<ElementD, ElementAccumulator, Frag> convert;
         auto converted = convert(combined);
         Tensor result = make_tensor(converted.data(), a.layout());
-        // packed ragged 的行首不保证向量对齐；完整 fragment 也需检查地址。
-        constexpr int VectorBytes = Frag * sizeof(ElementD);
-        bool aligned = reinterpret_cast<uintptr_t>(&d(0)) % VectorBytes == 0;
+        // 与 fwd direct 使用相同的自动 copy 粒度，不把分散的 MMA fragment
+        // 当成一个连续向量。当前每个连续 pair 为 bf16 4B / fp32 8B。
+        using CopyOp = typename CPY_Op<typename CopyAtomR2S::Traits>::type;
+        constexpr int CopyBits = sizeof(typename CopyOp::SRegisters) * 8;
+        constexpr int CommonElems = CUTE_STATIC_V(max_common_vector(result, d));
+        constexpr int AlignBits = CUTE_STATIC_V(
+            gcd(max_alignment(result), max_alignment(d), Int<CopyBits>{}));
+        constexpr int VectorBits = gcd(CommonElems * sizeof_bits<ElementD>::value, AlignBits);
+        constexpr int VectorBytes = VectorBits / 8;
+        static_assert(VectorBytes >= sizeof(ElementD));
+        // CuTe 只验证静态 stride；动态 N 也必须满足对齐，才能保证后续各
+        // 小片安全。packed expert 起点独立检查，真实尾 fragment 仍逐元素写。
+        bool aligned = (N % (VectorBytes / sizeof(ElementD)) == 0) &&
+                       (reinterpret_cast<uintptr_t>(&d(0)) % VectorBytes == 0);
         if (all && aligned) {
           copy(copy_c, result, d);
         } else {

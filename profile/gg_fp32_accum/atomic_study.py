@@ -41,8 +41,183 @@ for _name, _mode in (("stream_split_before", 1), ("stream_split_after", 2)):
 # prologue 以 C 为 MMA 初值，累加次序与 fragment/atomic 不同，不参与逐位比较。
 REORDERS_ACCUMULATION = {"prologue"}
 SYMBOL = "nvte_grouped_gemm3_bf16_bf16_fp32_acc_fp32_LA_CM_LB_RM_LC_RM_sm89_tb256x256x64_s3_Cfp32"
+def nexpand_case_manifest():
+    """业务K/N与实际MNK分开保存；控制case不混入24例。"""
+    shapes = [(1536, 4096), (4096, 1536), (512, 2048), (2048, 512),
+              (1024, 3072), (3072, 1024), (1024, 4096), (4096, 1024)]
+    cases = []
+    for index, (k, n) in enumerate(shapes):
+        for direction, layout, mnk in (("fwd", "TN", [2048, n, k]),
+                                        ("dgrad", "NN", [2048, k, n]),
+                                        ("wgrad", "NT", [n, k, 2048])):
+            cases.append({"id": f"{index + 1:02d}_{direction}_K{k}_N{n}",
+                          "index": len(cases), "direction": direction, "layout": layout,
+                          "model_KN": [k, n], "MNK": mnk, "groups": 16,
+                          "splits": [2048] * 16, "dtype": "fp32" if direction == "wgrad" else "bf16",
+                          "beta": int(direction == "wgrad"), "control": False, "seed": 1234})
+    for direction, layout, model in (("fwd", "TN", [2048, 4096]),
+                                      ("dgrad", "NN", [4096, 2048])):
+        cases.append({"id": f"control_K2048_{direction}", "index": len(cases),
+                      "direction": direction, "layout": layout, "model_KN": model,
+                      "MNK": [2048, 4096, 2048], "groups": 16, "splits": [2048] * 16,
+                      "dtype": "bf16", "beta": 0, "control": True, "seed": 1234})
+    return cases
+
+
+def nexpand_statistics(rounds):
+    assert len(rounds) == 3 and all(len(values) == 3 for values in rounds)
+    values = [value for row in rounds for value in row]
+    assert all(isinstance(value, (int, float)) and 0 <= value <= 100 for value in values)
+    medians = [statistics.median(row) for row in rounds]
+    return {"samples": rounds, "round_medians": medians,
+            "median": statistics.median(medians), "min": min(values), "max": max(values),
+            "round_min": min(medians), "round_max": max(medians)}
+
+
+def rtc_machine_identity(path):
+    """忽略debug布局，但逐字节绑定所有机器码、资源和非debug section。"""
+    import struct
+    image = path.read_bytes()
+    assert image[:6] == b"\x7fELF\x02\x01"
+    offset = struct.unpack_from("<Q", image, 40)[0]
+    size, count, string_index = struct.unpack_from("<HHH", image, 58)
+    assert size == 64 and count < 0xff00
+    headers = [struct.unpack_from("<IIQQQQIIQQ", image, offset + i * size) for i in range(count)]
+    string_header = headers[string_index]
+    strings = image[string_header[4]:string_header[4] + string_header[5]]
+    result = {}
+    for header in headers:
+        name = strings[header[0]:].split(b"\0", 1)[0].decode()
+        if not name or name == ".shstrtab" or name.startswith((".debug", ".rela.debug", ".rel.debug")):
+            continue
+        contents = b"" if header[1] == 8 else image[header[4]:header[4] + header[5]]
+        result[name] = {"type": header[1], "flags": header[2], "address": header[3],
+                        "size": header[5], "alignment": header[8], "entry_size": header[9],
+                        "sha256": hashlib.sha256(contents).hexdigest()}
+    assert any(name.startswith(".text") for name in result)
+    return result
+
+
+def nexpand_validate_codegen(gate):
+    """完整配置清单与默认不变性必须同时满足，不能仅检查PASS字符串。"""
+    assert gate["status"] == "PASS" and gate["gpu_execution"] is False
+    defaults = {(mode, bn, c, layout, dtype, 512)
+                for mode, bn, c in ((0, 256, 0), (0, 256, 1), (1, 128, 0), (1, 128, 1),
+                                   (1, 256, 0), (2, 128, 0), (2, 256, 0))
+                for layout in ("TN", "NN", "NT") for dtype in ("bf16", "fp32")}
+    added = {(2, bn, 0, layout, dtype, kmax) for kmax in (1024, 2048)
+             for bn in (128, 256) for layout in ("TN", "NN", "NT") for dtype in ("bf16", "fp32")}
+    cases = gate["cases"]
+    keys = [(c["mode"], c["bn"], int(c["with_C"]), c["layout"], c["dtype"], c["kmax"]) for c in cases]
+    assert len(keys) == len(set(keys)) == 66 and set(keys) == defaults | added
+    for key, case in zip(keys, cases):
+        mode, bn, with_c, layout, dtype, kmax = key
+        compiled = case["compile_result"]
+        assert compiled["compile_only"] == "PASS" and compiled["gpu_execution"] is False
+        assert compiled["stack_size"] == compiled["atomic_instruction_count"] == 0
+        ta, tb = {"TN": (0, 1), "NN": (0, 0), "NT": (1, 0)}[layout]
+        macros = {"NVTE_GG_CONTIGUOUS_MODE": mode, "NVTE_GG_WITH_C": with_c,
+                  "NVTE_GG_TRANS_A": ta, "NVTE_GG_TRANS_B": tb,
+                  "NVTE_GG_OUT_FP32": int(dtype == "fp32"), "NVTE_GG_DTYPE": 0,
+                  "NVTE_GG_ARCH": 89, "NVTE_GG_TILE_M": 256, "NVTE_GG_TILE_N": bn,
+                  "NVTE_GG_TILE_K": 64, "NVTE_GG_STAGES": 3}
+        for name, value in macros.items():
+            assert [o for o in compiled["options"] if o.startswith(f"-D{name}=")] == [f"-D{name}={value}"]
+        assert [o for o in compiled["options"] if o.startswith("-DNVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX=")] == \
+            ([f"-DNVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX={kmax}"] if kmax != 512 else [])
+        comparison = case["default_comparison"]
+        if key in defaults:
+            assert comparison["machine_identity_identical"] is True and comparison["resources_identical"] is True
+        else:
+            assert comparison is None
+
+
+def nexpand_codegen_artifacts(gate):
+    """重验实际cubin/资源/编译回执并绑定哈希，不信任可篡改的比较布尔值。"""
+    nexpand_validate_codegen(gate)
+    baseline = json.loads((Path(gate["baseline"]) / "result.json").read_text())
+    assert baseline["status"] == "PASS" and len(baseline["cases"]) == 42
+    old = {(c["mode"], c["bn"], int(c["with_C"]), c["layout"], c["dtype"]): c for c in baseline["cases"]}
+    assert len(old) == 42
+    hashes = {}
+    for case in gate["cases"]:
+        dest, symbol = Path(case["path"]), f"nvte_grouped_gemm3_compile_{case['dtype']}"
+        assert json.loads((dest / f"{symbol}.json").read_text()) == case["compile_result"]
+        assert re.findall(r"STACK SIZE:(\d+)", (dest / f"{symbol}.resources").read_text()) == ["0"]
+        assert not re.search(r"\bvmem\.atm\.add\.f32\b", (dest / f"{symbol}.isa").read_text())
+        if case["kmax"] == 512:
+            key = (case["mode"], case["bn"], int(case["with_C"]), case["layout"], case["dtype"])
+            previous = Path(old[key]["path"])
+            assert rtc_machine_identity(dest / f"{symbol}.cubin") == rtc_machine_identity(previous / f"{symbol}.cubin")
+            assert (dest / f"{symbol}.resources").read_bytes() == (previous / f"{symbol}.resources").read_bytes()
+        for suffix in ("json", "cubin", "isa", "resources"):
+            path = dest / f"{symbol}.{suffix}"
+            hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashes
+
+
+def nexpand_validate_capture(record, digest, stage=None, kmax=None):
+    """完整26例、每臂三轮三样本、无争用才允许作为后档门禁。"""
+    assert record["status"] == "PASS" and record["performance_valid"] is True and not record["contention"]
+    assert record["case_digest"] == digest and record["manifest"] == nexpand_case_manifest()
+    assert record["core_24_complete"] and record["samples_per_round"] == record["rounds"] == 3
+    if stage is not None:
+        assert record["stage"] == stage and record.get("kmax", 512) == kmax
+    assert set(record["cases"]) == {c["id"] for c in record["manifest"]}
+    for case in record["manifest"]:
+        entry = record["cases"][case["id"]]
+        assert entry["status"] == "PASS" and entry["case"] == case and len(entry["reports"]) == 6
+        assert entry["order"] == [["production", "contiguous"] if (case["index"] + r) % 2 == 0
+                                  else ["contiguous", "production"] for r in range(3)]
+        for arm in ("production", "contiguous"):
+            assert sum(report["arm"] == arm for report in entry["reports"]) == 3
+            assert nexpand_statistics(entry["summary"][arm]["samples"]) == entry["summary"][arm]
+
+
+def nexpand_validate_current_anchor(stage, uuid, baseline, anchor, digest, binding):
+    """首次换卡补采无需已有补采；新阈值换卡仍必须有同卡完整锚点。"""
+    if baseline is None or stage == "baseline" or uuid == baseline["device"]["uuid"]:
+        return
+    assert anchor is not None, "换卡须先补采同卡NE4/Kmax512锚点，禁止跨卡绝对相减"
+    nexpand_validate_capture(anchor, digest, "baseline", 512)
+    assert anchor["device"]["uuid"] == uuid and anchor["baseline_audit"] == binding
+    assert all(c["production_anchor_identity"] == c["current_anchor_identity"] == "PASS"
+               for c in anchor["cases"].values())
+
+
+def nexpand_csv_row(case, summary, uuid, status, reports):
+    """完整账本一例一行，保留九样本、负收益、旁路及资源信息。"""
+    summary = summary or {}
+    cfg, p, x = summary.get("config", {}), summary.get("production", {}), summary.get("contiguous", {})
+    return {"id": case["id"], "direction": case["direction"], "model_K": case["model_KN"][0],
+            "model_N": case["model_KN"][1], "M": case["MNK"][0], "N": case["MNK"][1], "K": case["MNK"][2],
+            "dtype": case["dtype"], "beta": case["beta"], "status": status, "gpu_uuid": uuid,
+            "production_tfu": p.get("median"), "current_tfu": x.get("median"),
+            "delta_pp": summary.get("delta_pp"), "relative_pct": summary.get("relative_pct"),
+            **{key: cfg.get(key) for key in ("requested_ne", "effective_ne", "kmax", "effective_kmax", "eligible_groups", "bypass_reason")},
+            "production_samples": json.dumps(p.get("samples", [])), "current_samples": json.dumps(x.get("samples", [])),
+            "paired_round_delta_pp": json.dumps([b - a for a, b in zip(p.get("round_medians", []), x.get("round_medians", []))]),
+            **{f"{label}_{key}": stats.get(key) for label, stats in (("production", p), ("current", x))
+               for key in ("min", "max", "round_min", "round_max")},
+            "resources": json.dumps(summary.get("resources", {})), "reports": json.dumps(reports)}
+
+
+def nexpand_validate_runtime(log, symbol, config):
+    """准入必须由真实host回执及实际symbol证明，不使用requested元数据代替。"""
+    lines = [line for line in log.splitlines() if "NVTE_GG_CONTIGUOUS LAUNCHED" in line and
+             f"symbol={symbol} " in line]
+    assert lines, "缺少contiguous实际launch回执"
+    expected = {"requested_ne": config["requested_ne"], "effective_ne": config["effective_ne"],
+                "requested_kmax": config["kmax"], "effective_kmax": config["effective_kmax"],
+                "eligible_groups": config["eligible_groups"], "bypass_reason": config["bypass_reason"],
+                "work": config["expected_work"]}
+    for line in lines:
+        fields = dict(re.findall(r"\b(\w+)=([^\s]+)", line))
+        assert all(fields.get(key) == str(value) for key, value in expected.items()), (fields, expected)
+
+
 parser = argparse.ArgumentParser()
-parser.add_argument("phase", choices=("build", "audit-build", "verify", "verify-codegen", "resources", "prepare", "run", "probe", "capture", "export", "audit-stream", "matrix", "source-reports", "tail-study", "smallk-study", "bind-verify-source"))
+parser.add_argument("phase", choices=("build", "audit-build", "verify", "verify-codegen", "resources", "prepare", "run", "probe", "capture", "export", "audit-stream", "matrix", "source-reports", "tail-study", "smallk-study", "nexpand-matrix", "audit-nexpand", "audit-nexpand-codegen", "audit-epilogue", "bind-verify-source"))
 parser.add_argument("--out", type=Path, required=True)
 parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=["fragment", "atomic"])
 parser.add_argument("--gpu", type=int, default=7)
@@ -64,7 +239,16 @@ parser.add_argument("--samples", type=int, default=1)
 parser.add_argument("--repeats", type=int, default=2)
 parser.add_argument("--full", action="store_true")
 parser.add_argument("--diagnostic", action="store_true",
-                    help="smallk-study 显式诊断采集：不等待完整回归，允许争用并禁止正式性能结论")
+                    help="smallk-study 显式诊断采集：不等待完整回归，仍要求空闲设备并禁止正式性能结论")
+parser.add_argument("--nexpand-stage", choices=("baseline", "kmax", "ne8"), default="baseline")
+parser.add_argument("--nexpand-kmax", type=int, choices=(512, 1024, 2048), default=512)
+parser.add_argument("--nexpand-baseline", type=Path, help="阶段0完整独立审计目录，包含production锚点")
+parser.add_argument("--nexpand-prior", type=Path, help="前一档完整采集result.json；2048必须绑定1024")
+parser.add_argument("--nexpand-codegen", type=Path, help="当前阶段默认不变性/新档位编译门禁result.json")
+parser.add_argument("--nexpand-current-anchor", type=Path, help="换卡时已完成的同卡NE4/Kmax512补采result.json")
+parser.add_argument("--nexpand-capture", type=Path, help="audit-nexpand独立审计的完整采集目录，不运行GPU")
+parser.add_argument("--smallk-bn256", action="store_true",
+                    help="smallk-study 额外采集 noC BN256 普通/NE4，保留默认四臂")
 parser.add_argument("--debug-capture", action="store_true",
                     help="仅诊断：gdb定位采集侧invalid_argument，不作为性能数据")
 parser.add_argument("--tag", default="", help="独立采集标签，保留失败日志与既有报告")
@@ -246,6 +430,719 @@ if a.phase == "bind-verify-source":
                                 "snapshot": str(snapshot), "verification": [str(p.resolve()) for p in a.require_verify]})
     raise SystemExit(0)
 
+if a.phase == "audit-epilogue":
+    # 只审计已有 full 导出；不启动 GPU、不重写采集回执或历史报告。
+    from collections import Counter, defaultdict
+    capture = json.loads((a.out / "result.json").read_text())
+    assert capture["status"] in ("DIAGNOSTIC_CAPTURED", "PASS")
+    assert not capture["contention"] and not capture["capture_failures"]
+    assert capture["case"] == "fwd_noC_M4096_N4096_K512_groups16_ragged"
+    output = a.out / "epilogue_audit.json"
+    assert not output.exists(), "不覆盖已有动态审计"
+    frozen = Path(capture["rtc_include"])
+    manifest = json.loads((a.out / "include_identity.json").read_text())
+    assert manifest == {str(p.relative_to(frozen)): hashlib.sha256(p.read_bytes()).hexdigest()
+                        for p in sorted(frozen.rglob("*")) if p.is_file()}
+    for check in capture["verification"]:
+        assert check["status"] == "PASS" and check["counts"]["tests"] == len(check["testcases"])
+        assert not any(check["counts"][k] for k in ("failures", "errors", "skipped"))
+    expected_bytes = sum(capture["actual"]["splits"]) * 4096 * 2
+    metrics_kept = (METRIC, "ppu__time_duration.sum", "kvd__bytes_pipe_lsu_mem_global_op_st.sum",
+                    "kvd__requests_store_pipe_lsu.sum", "kvd__bytes_store_pipe_l2.sum",
+                    "kvd__transactions_store_pipe_l2.sum")
+    result = {"status": "RUNNING", "capture": str(a.out / "result.json"),
+              "diagnostic": capture["diagnostic"], "performance_valid": capture["performance_valid"],
+              "expected_D_bytes": expected_bytes, "actions": [], "summary": {},
+              "gpu_regression_counts": [r["counts"] for r in capture["verification"]],
+              "note": "b16占比按实际thread执行次数和store位宽换算输出元素；KVD字节取原metric，不以向量宽度换算事务。"}
+    for report_path in capture["reports"]:
+        report = Path(report_path)
+        assert report.parent == a.out / "remote-results" and report.is_file()
+        label = report.stem
+        metrics = json.loads((a.out / "cases" / f"{label}.metrics.json").read_text())
+        arm = metrics[0]["arm"]
+        groups = defaultdict(list)
+        with (a.out / "cases" / f"{label}.sass.csv").open() as stream:
+            for row in csv.DictReader(stream):
+                groups[(row["Range Id"], row["Function Id"])].append(row)
+        assert len(groups) == len(metrics) == 3
+        embedded = json.loads((a.out / label / "embedded_sources.json").read_text())
+        assert len(embedded) == len(metrics)
+        symbol = capture["actual"]["arms"][arm]["kernels"][0]
+        native_isa = (a.out / "actual" / "rtc" / arm / "isa.txt").read_text()
+        native = {int(pc, 16): op for pc, op in re.findall(
+            r"^\s*([0-9a-f]+):\s+(?:[0-9a-f]{2}\s+){8}(\S+)", native_isa, re.M)}
+        assert native
+        for index, (rows, metric) in enumerate(zip(groups.values(), metrics)):
+            assert metric["arm"] == arm and metric["kernel_name"] == symbol
+            assert not metric["foreign_pids"]
+            assert len(metric["raw_metrics"]) > 0
+            assert metric["source_sha256"] == embedded[index]
+            for path, digest in embedded[index].items():
+                source = Path(path)
+                assert source.is_relative_to(frozen) and hashlib.sha256(source.read_bytes()).hexdigest() == digest
+            warp, thread, store_bytes = Counter(), Counter(), Counter()
+            base = min(int(r["Address"], 16) for r in rows)
+            for row in rows:
+                assert row["Function Name"] == symbol
+                opcode = row["Source"].split()[0]
+                offset = int(row["Address"], 16) - base
+                assert native.get(offset) == opcode, (arm, offset, opcode)
+                executed = float(row["Instructions Executed"].replace(",", "") or 0)
+                lanes = float(row["Thread Instructions Executed"].replace(",", "") or 0)
+                assert executed.is_integer() and lanes.is_integer() and 0 <= lanes <= executed * 32
+                warp[opcode] += int(executed)
+                thread[opcode] += int(lanes)
+                if opcode.startswith("vmem.st."):
+                    width = re.fullmatch(r"vmem\.st\.b(16|32|64|128)(?:x(\d+))?(?:\.[a-z]+)*", opcode)
+                    assert width, opcode
+                    store_bytes[opcode] += int(lanes) * (int(width[1]) // 8) * int(width[2] or 1)
+            assert sum(store_bytes.values()) == expected_bytes, (arm, store_bytes, expected_bytes)
+            raw = metric["raw_metrics"]
+            assert raw["kvd__bytes_store_pipe_l2.sum"] == expected_bytes
+            action = {"arm": arm, "sample": index, "report": str(report),
+                      "metric_count": len(raw), "embedded_sources": len(embedded[index]),
+                      "store_thread_instructions": {op: thread[op] for op in store_bytes},
+                      "store_warp_instructions": {op: warp[op] for op in store_bytes},
+                      "store_effective_bytes": dict(store_bytes),
+                      "scalar_output_pct": 100 * sum(value for op, value in store_bytes.items()
+                          if re.fullmatch(r"vmem\.st\.b16(?:\.[a-z]+)*", op)) / expected_bytes,
+                      "dynamic_warp_instructions": sum(warp.values()),
+                      "metrics": {key: raw[key] for key in metrics_kept}}
+            result["actions"].append(action)
+    assert {r["arm"] for r in result["actions"]} == set(capture["actual"]["arms"])
+    for arm in capture["actual"]["arms"]:
+        actions = [r for r in result["actions"] if r["arm"] == arm]
+        fields = {"scalar_output_pct": [r["scalar_output_pct"] for r in actions]}
+        fields.update({key: [r["metrics"][key] for r in actions] for key in metrics_kept})
+        result["summary"][arm] = {key: {"median": statistics.median(values),
+                                      "min": min(values), "max": max(values)}
+                                  for key, values in fields.items()}
+        result["summary"][arm]["resources"] = capture["resources"][arm]
+    result["status"] = "PASS"
+    save(output, result)
+    print(json.dumps({"status": "PASS", "audit": str(output), "summary": result["summary"]},
+                     ensure_ascii=False), flush=True)
+    raise SystemExit(0)
+
+if a.phase == "audit-nexpand-codegen":
+    output = a.out / "result.json"
+    assert not output.exists(), "不覆盖已有codegen独立审计"
+    result = {"status": "RUNNING", "gpu_execution": False}
+    save(output, result)
+    try:
+        assert a.nexpand_codegen, "必须显式绑定66组codegen门禁"
+        gate = json.loads(a.nexpand_codegen.read_text())
+        hashes = nexpand_codegen_artifacts(gate)
+        frozen = a.nexpand_codegen.parent / "rtc_include"
+        effective = ROOT / "build/cmake/actlize_effective/include"
+        def identity(tree):
+            return {str(p.relative_to(tree)): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in sorted(tree.rglob("*")) if p.is_file()}
+        assert gate["include_identity"] == identity(frozen) == identity(effective)
+        tu = ROOT / "transformer_engine/common/gemm/rtc/cutlass_grouped_gemm.cu"
+        assert gate["rtc_tu_sha256"] == hashlib.sha256(tu.read_bytes()).hexdigest()
+        result.update(status="PASS", cases=66, default_comparisons=42, new_kmax_cases=24,
+                      stack_bytes=0, atomic_instructions=0, artifact_sha256=hashes,
+                      codegen=str(a.nexpand_codegen.resolve()),
+                      codegen_sha256=hashlib.sha256(a.nexpand_codegen.read_bytes()).hexdigest(),
+                      rtc_tu_sha256=gate["rtc_tu_sha256"])
+    except Exception as error:
+        result.update(status="FAIL", error=str(error))
+        raise
+    finally:
+        save(output, result)
+    print(json.dumps({k: v for k, v in result.items() if k != "artifact_sha256"}), flush=True)
+    raise SystemExit(0)
+
+
+if a.phase == "audit-nexpand":
+    output = a.out / "result.json"
+    assert not output.exists(), "不覆盖已有独立审计"
+    result = {"status": "RUNNING", "gpu_execution": False, "performance_valid": False,
+              "full_reports": 0, "full_actions": 0, "probe_reports": 0, "audited_cases": []}
+    save(output, result)
+
+    def sha(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def tree_sha(path):
+        return {str(p.relative_to(path)): sha(p) for p in sorted(path.rglob("*")) if p.is_file()}
+
+    def report_actions(path):
+        context = acu_report.load_report(str(path))
+        ranges = [context.range_by_idx(i) for i in range(context.num_ranges())]
+        return context, ranges, [group.action_by_idx(j) for group in ranges for j in range(group.num_actions())]
+
+    try:
+        assert a.nexpand_capture, "必须显式绑定完整采集目录"
+        capture = a.nexpand_capture.resolve()
+        record = json.loads((capture / "result.json").read_text())
+        digest = hashlib.sha256(json.dumps(nexpand_case_manifest(), sort_keys=True).encode()).hexdigest()
+        nexpand_validate_capture(record, digest)
+        assert record["stage"] in ("baseline", "kmax") and record["kmax"] in (512, 1024, 2048)
+        result.update(capture=str(capture), capture_sha256=sha(capture / "result.json"),
+                      stage=record["stage"], kmax=record["kmax"], gpu_uuid=record["device"]["uuid"], case_digest=digest)
+        frozen = capture / "rtc_include"
+        assert record["include_identity"] == tree_sha(frozen)
+        for relative, expected in record["source_sha256"].items():
+            assert sha(capture / "source_snapshot" / relative) == expected
+        for name, expected in record["library_sha256"].items():
+            assert sha(capture / "libraries" / name) == expected
+        assert record["gate_artifact_sha256"] and all(sha(Path(p)) == h for p, h in record["gate_artifact_sha256"].items())
+        result["freeze_identity"] = "PASS"
+        gate = json.loads(Path(record["codegen_gate"]["path"]).read_text())
+        assert gate["include_identity"] == record["include_identity"]
+        assert gate["rtc_tu_sha256"] == record["source_sha256"]["transformer_engine/common/gemm/rtc/cutlass_grouped_gemm.cu"]
+        assert all(record["gate_artifact_sha256"].get(p) == h for p, h in nexpand_codegen_artifacts(gate).items())
+        result["codegen"] = {"status": "PASS", "cases": 66, "default_comparisons": 42}
+        anchors = json.loads((Path(record["baseline_audit"]["path"]) / "production_anchors.json").read_text())
+        assert all(not snap["live"] for snap in record["occupancy_snapshots"])
+        assert record["profiler_contention"] and all(not v["foreign_pids"] and v["target_identity_valid"]
+                                                      for v in record["profiler_contention"].values())
+        sys.path.insert(0, "/usr/local/PPU_SDK/asight/extras/python")
+        import acu_report
+        tables = {False: [], True: []}
+        for case in record["manifest"]:
+            entry = record["cases"][case["id"]]
+            assert all(sha(Path(p)) == h for p, h in entry["artifacts"].items())
+            attempt = Path(entry["attempts"][-1])
+            actual, resources = entry["actual"], entry["resources"]
+            assert actual["production"]["input_sha256"] == actual["contiguous"]["input_sha256"]
+            assert actual["production"]["output_sha256"] == actual["contiguous"]["output_sha256"]
+            assert entry["production_anchor_identity"] == "PASS"
+            samples = {"production": [], "contiguous": []}
+            for arm in samples:
+                identity, resource = actual[arm], resources[arm]
+                assert identity["correctness"] == "PASS" and identity["MNK"] == case["MNK"]
+                assert identity["beta"] == case["beta"] and identity["splits"] == case["splits"]
+                assert ("initial_C" in identity["input_sha256"]) == bool(case["beta"])
+                symbol = identity["kernels"][0]
+                rtc = attempt / "actual" / arm / "rtc"
+                assert resource["static_smem_bytes"] == resource["local_bytes_per_thread"] == 0
+                assert resource["active_blocks_per_cu"] > 0
+                assert json.loads((rtc / f"{symbol}.driver_resources.json").read_text()) == resource
+                assert re.findall(r"STACK SIZE:(\d+)", (rtc / "resources.txt").read_text()) == ["0"]
+                assert not re.search(r"\bvmem\.atm\.add\.f32\b", (rtc / "isa.txt").read_text())
+                machine = rtc_machine_identity(rtc / f"{symbol}.cubin")
+                assert machine == rtc_machine_identity(attempt / "annotated_rtc" / arm / f"{symbol}.cubin")
+                options = (rtc / f"{symbol}.options.txt").read_text().splitlines()
+                if arm == "production":
+                    anchor = anchors[case["id"]]
+                    assert symbol == anchor["symbol"] and machine == anchor["machine_identity"]
+                    assert identity["input_sha256"] == anchor["input_sha256"] and identity["output_sha256"] == anchor["output_sha256"]
+                    assert {k: v for k, v in resource.items() if k != "cubin"} == {k: v for k, v in anchor["resources"].items() if k != "cubin"}
+                    assert "-DNVTE_GG_CONTIGUOUS_MODE=0" in options
+                else:
+                    cfg = identity["config"]
+                    assert cfg["kmax"] == record["kmax"] and cfg["requested_ne"] == (1 if case["beta"] else 4)
+                    ending = f"_C{'fp32' if case['beta'] else 'void'}_contiguous{cfg['mode']}"
+                    if cfg["effective_ne"] > 1 and cfg["kmax"] != 512:
+                        ending += f"_kmax{cfg['kmax']}"
+                    assert symbol.endswith(ending)
+                    assert f"-DNVTE_GG_CONTIGUOUS_MODE={cfg['mode']}" in options
+                    nexpand_validate_runtime((rtc.parent / "verify.log").read_text(), symbol, cfg)
+                expected_kmax = identity["config"]["kmax"] if arm == "contiguous" and identity["config"]["effective_ne"] > 1 else 512
+                assert [o for o in options if o.startswith("-DNVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX=")] == \
+                    ([f"-DNVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX={expected_kmax}"] if expected_kmax != 512 else [])
+                context, report_ranges, actions = report_actions(attempt / "remote-results" / f"probe_{arm}.acurep")
+                assert len(actions) == 3
+                result["probe_reports"] += 1
+            for report in entry["reports"]:
+                arm = report["arm"]
+                context, report_ranges, actions = report_actions(Path(report["report"]))
+                raw = json.loads(Path(report["metrics"]).read_text())
+                assert len(raw) == len(actions) == 3
+                for metric, action in zip(raw, actions):
+                    assert set(metric["raw_metrics"]) == set(action.metrics())
+                    assert metric["performance_valid"] and not metric["foreign_pids"] and metric["gpu_uuid"] == record["device"]["uuid"]
+                    assert metric["case_digest"] == digest and metric["kernel_name"] == actual[arm]["kernels"][0]
+                    assert abs(metric["raw_metrics"][METRIC] - action.metric_by_name(METRIC).as_double()) < 1e-9
+                    sources = action.source_files()
+                    assert sources and all(sources.values())
+                    assert metric["source_sha256"] == {p: hashlib.sha256(v.encode()).hexdigest() for p, v in sources.items()}
+                    for name in ("nvte_contiguous_grouped.hpp" if arm == "contiguous" else "ppu_aiu_gemm_array_group.hpp",
+                                 "ppu_mma_aiu_multistage_batch_array.hpp", "ppu_epilogue_vectorized_evt.hpp"):
+                        embedded = next(v for p, v in sources.items() if Path(p).name == name)
+                        assert embedded.splitlines() == next(frozen.rglob(name)).read_text().splitlines()
+                assert any(float(r.get("Instructions Executed", "0").replace(",", "") or 0) > 0
+                           for r in csv.DictReader(io.StringIO(Path(report["sass"]).read_text())))
+                if arm == "production":
+                    assert all(all(launch[k] == anchors[case["id"]]["launches"][0][k] for k in ("Block Size", "Grid Size")) for launch in report["launch"])
+                samples[arm].append([m["raw_metrics"][METRIC] for m in raw])
+                result["full_reports"] += 1
+                result["full_actions"] += 3
+            assert all(nexpand_statistics(values) == entry["summary"][arm] for arm, values in samples.items())
+            p, x = entry["summary"]["production"], entry["summary"]["contiguous"]
+            assert entry["summary"]["delta_pp"] == x["median"] - p["median"]
+            assert entry["summary"]["relative_pct"] == 100 * (x["median"] / p["median"] - 1)
+            tables[case["control"]].append({**case, **entry["summary"], "status": "PASS", "gpu_uuid": record["device"]["uuid"],
+                "paired_round_delta_pp": [b - a for a, b in zip(p["round_medians"], x["round_medians"])], "actual": actual})
+            result["audited_cases"].append(case["id"])
+            save(output, result)
+        main, controls = tables[False], tables[True]
+        assert (len(main), len(controls), result["full_reports"], result["full_actions"], result["probe_reports"]) == (24, 2, 156, 468, 52)
+        assert sum(row["config"]["effective_ne"] == 4 for row in main) == {512: 2, 1024: 6, 2048: 8}[record["kmax"]]
+        assert sum(row["config"]["effective_ne"] == 4 for row in controls) == (2 if record["kmax"] == 2048 else 0)
+        for name, table in (("current_vs_production", main), ("K2048_controls", controls)):
+            save(a.out / f"{name}.json", table)
+            with (a.out / f"{name}.csv").open("w") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(nexpand_csv_row(table[0], table[0], record["device"]["uuid"], "PASS", [])))
+                writer.writeheader()
+                for row in table:
+                    writer.writerow(nexpand_csv_row(row, row, row["gpu_uuid"], row["status"], row["reports"]))
+        result.update(status="PASS", performance_valid=True, main_pass=24, control_pass=2)
+    except Exception as error:
+        result.update(status="FAIL", error=str(error))
+        raise
+    finally:
+        save(output, result)
+    raise SystemExit(0)
+
+
+if a.phase == "nexpand-matrix":
+    import xml.etree.ElementTree as ET
+
+    # 阶段0完成之前，不允许借此入口绕过顺序修改产品或采新准入。
+    receipt = a.out / "result.json"
+    manifest = nexpand_case_manifest()
+    manifest_digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    anchors, baseline_record, codegen_gate = None, None, None
+    gate_bindings = {}
+    try:
+        assert a.nexpand_stage in ("baseline", "kmax"), "NE8须在两档NE4矩阵完成后接入"
+        assert (a.nexpand_stage == "baseline" and a.nexpand_kmax == 512) or \
+            (a.nexpand_stage == "kmax" and a.nexpand_kmax in (1024, 2048))
+        assert a.full and a.samples == 3 and a.repeats == 3 and a.require_verify
+        assert not a.diagnostic and not a.actual_reference
+        if a.nexpand_stage != "baseline" or a.nexpand_baseline:
+            assert a.nexpand_baseline and a.nexpand_codegen, "新阶段须绑定完整阶段0独立审计与当前codegen门禁"
+            audit_path = a.nexpand_baseline / "result.json"
+            audit = json.loads(audit_path.read_text())
+            assert audit["status"] == "PASS" and audit["performance_valid"]
+            assert (audit["main_pass"], audit["control_pass"], audit["full_reports"], audit["full_actions"]) == (24, 2, 156, 468)
+            baseline_path = Path(audit["capture"]) / "result.json"
+            baseline_record = json.loads(baseline_path.read_text())
+            nexpand_validate_capture(baseline_record, manifest_digest, "baseline", 512)
+            anchor_path = a.nexpand_baseline / "production_anchors.json"
+            anchors = json.loads(anchor_path.read_text())
+            assert set(anchors) == {c["id"] for c in manifest}
+            for case in manifest:
+                old, anchor = baseline_record["cases"][case["id"]], anchors[case["id"]]
+                assert anchor["input_sha256"] == old["actual"]["production"]["input_sha256"]
+                assert anchor["output_sha256"] == old["actual"]["production"]["output_sha256"]
+                assert anchor["machine_identity"] == rtc_machine_identity(Path(anchor["resources"]["cubin"]))
+            codegen_gate = json.loads(a.nexpand_codegen.read_text())
+            gate_bindings = nexpand_codegen_artifacts(codegen_gate)
+            for path in (audit_path, baseline_path, anchor_path, a.nexpand_codegen):
+                gate_bindings[str(path.resolve())] = hashlib.sha256(path.read_bytes()).hexdigest()
+            if a.nexpand_stage == "kmax" and a.nexpand_kmax == 2048:
+                assert a.nexpand_prior, "先交付Kmax1024的完整24+2账本"
+                prior = json.loads(a.nexpand_prior.read_text())
+                nexpand_validate_capture(prior, manifest_digest, "kmax", 1024)
+                assert prior["baseline_audit"]["anchors_sha256"] == gate_bindings[str(anchor_path.resolve())]
+                assert prior["codegen_gate"]["sha256"] == gate_bindings[str(a.nexpand_codegen.resolve())]
+                gate_bindings[str(a.nexpand_prior.resolve())] = hashlib.sha256(a.nexpand_prior.read_bytes()).hexdigest()
+        if a.nexpand_current_anchor:
+            gate_bindings[str(a.nexpand_current_anchor.resolve())] = hashlib.sha256(a.nexpand_current_anchor.read_bytes()).hexdigest()
+    except Exception as error:
+        if not receipt.exists():
+            save(receipt, {"status": "FAIL", "failure_phase": "prerequisites", "gpu_execution": False,
+                           "stage": a.nexpand_stage, "kmax": a.nexpand_kmax, "error": str(error),
+                           "case_digest": manifest_digest, "performance_valid": False})
+        raise
+    if receipt.exists():
+        assert a.resume, "不覆盖既有批次；续采须显式--resume"
+        record = json.loads(receipt.read_text())
+        assert record["case_digest"] == manifest_digest and record["stage"] == a.nexpand_stage
+        assert record.get("kmax", 512) == a.nexpand_kmax
+        assert int(record["gpu_index"]) == a.gpu, "同批次续采不得换物理卡"
+    else:
+        record = {"status": "RUNNING", "stage": a.nexpand_stage, "pid": os.getpid(),
+                  "case_digest": manifest_digest, "manifest": manifest, "cases": {},
+                  "gpu_index": a.gpu, "contention": False, "occupancy_snapshots": [],
+                  "profiler_contention": {}, "performance_valid": False,
+                  "metric": METRIC, "samples_per_round": 3, "rounds": 3,
+                  "core_24_complete": False}
+    assert record.get("gate_artifact_sha256", gate_bindings) == gate_bindings, "续采门禁身份改变"
+    record["gate_artifact_sha256"] = gate_bindings
+    record.update(pid=os.getpid(), status="RUNNING", performance_valid=False, requested_ne=4, kmax=a.nexpand_kmax)
+    if anchors:
+        record["baseline_audit"] = {"path": str(a.nexpand_baseline.resolve()),
+            "result_sha256": hashlib.sha256((a.nexpand_baseline / "result.json").read_bytes()).hexdigest(),
+            "anchors_sha256": hashlib.sha256((a.nexpand_baseline / "production_anchors.json").read_bytes()).hexdigest()}
+        record["codegen_gate"] = {"path": str(a.nexpand_codegen.resolve()),
+            "sha256": hashlib.sha256(a.nexpand_codegen.read_bytes()).hexdigest()}
+    save(receipt, record)
+    library_paths = [ROOT / "libtransformer_engine.so", *ROOT.glob("transformer_engine_torch.*.so")]
+    assert len(library_paths) == 2
+    source_paths = [Path(__file__).resolve(), ROOT / "profile/gg_fp32_accum/repro.py",
+                    ROOT / "tests/pytorch/test_grouped_gemm_rtc.py",
+                    ROOT / "tests/pytorch/test_rtc_grouped_gemm_ci.py",
+                    ROOT / "transformer_engine/common/gemm/cutlass_grouped_gemm_rtc.cu",
+                    ROOT / "transformer_engine/common/gemm/rtc/cutlass_grouped_gemm.cu",
+                    ROOT / "transformer_engine/pytorch/cpp_extensions/gemm.py"]
+    effective = ROOT / "build/cmake/actlize_effective/include"
+    frozen = a.out / "rtc_include"
+    script = str(Path(__file__).resolve())
+    repro = str(ROOT / "profile/gg_fp32_accum/repro.py")
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(a.gpu), LC_ALL="C", LANG="C",
+               PYTHONPATH=str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+               NVTE_CUTLASS3_INCLUDE_DIR=str(frozen), NVTE_GG_RTC_LINEINFO="1",
+               NVTE_CUTLASS_GROUPED_GEMM_RTC_VERBOSE="1", CUDA_LAUNCH_BLOCKING="1")
+
+    def digests(tree):
+        return {str(p.relative_to(tree)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted(tree.rglob("*")) if p.is_file()}
+
+    def source_identity():
+        return {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths}
+
+    def library_identity():
+        return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in library_paths}
+
+    def check_device(stage):
+        devices = subprocess.check_output(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu",
+                                           "--format=csv,nounits"], text=True)
+        apps = subprocess.check_output(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name",
+                                       "--format=csv,nounits"], text=True)
+        gpu = next({k.strip().split(" [", 1)[0]: v.strip() for k, v in row.items()}
+                   for row in csv.DictReader(io.StringIO(devices)) if int(row["index"]) == a.gpu)
+        live = [{k.strip(): v.strip() for k, v in row.items()} for row in csv.DictReader(io.StringIO(apps))
+                if row["gpu_uuid"].strip() == gpu["uuid"] and Path(f"/proc/{row[' pid'].strip()}").exists()]
+        record["occupancy_snapshots"].append({"stage": stage, "device": gpu, "live": live,
+            "all_devices": devices, "all_apps": apps, "timestamp": datetime.now(timezone.utc).isoformat()})
+        record["contention"] |= bool(live)
+        save(receipt, record)
+        assert not live, ("NO_DEVICE_AVAILABLE", stage, live)
+        assert float(gpu["memory.total"]) - float(gpu["memory.used"]) > 8192
+        if "device" in record:
+            assert gpu["uuid"] == record["device"]["uuid"]
+        return gpu
+
+    def check_identity():
+        assert record["library_sha256"] == library_identity(), "采集期间库改变"
+        assert record["source_sha256"] == source_identity(), "采集期间源码改变"
+        assert record["include_identity"] == digests(frozen) == digests(effective), "采集期间头文件改变"
+        assert all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest
+                   for path, digest in record["gate_artifact_sha256"].items()), "采集期间前档或codegen门禁改变"
+
+    def command_case(case, arm, dest):
+        m, n, k = case["MNK"]
+        return [sys.executable, repro, "--packed-study-arm", arm, "--packed-study-ne",
+                "1" if case["beta"] or arm == "production" else "4",
+                "--packed-study-kmax", str(a.nexpand_kmax), "--layout", case["layout"], "--dtype", case["dtype"],
+                "--rows", str(m), "--cols", str(n), "--mpe", str(k), "--groups", "16",
+                "--accumulate", str(case["beta"]), "--check", "--dump", str(dest)]
+
+    def write_ledger():
+        for control, filename in ((False, "current_vs_production"), (True, "K2048_controls")):
+            rows = []
+            for case in manifest:
+                if case["control"] != control:
+                    continue
+                entry = record["cases"].get(case["id"], {})
+                row = {**case, "status": entry.get("status", "PENDING"),
+                       "gpu_uuid": record.get("device", {}).get("uuid"),
+                       "metric": METRIC, "result": entry.get("summary"),
+                       "actual": entry.get("actual"), "reports": entry.get("reports"),
+                       "error": entry.get("error")}
+                rows.append(row)
+            save(a.out / f"{filename}.json", {"case_digest": manifest_digest, "rows": rows,
+                 "complete": all(row["status"] == "PASS" for row in rows)})
+            # CSV每case一行，不以嵌套结果或赢家子集替代全量账本。
+            with (a.out / f"{filename}.csv").open("w") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(nexpand_csv_row(manifest[0], {}, None, "PENDING", [])))
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(nexpand_csv_row(row, row["result"], row["gpu_uuid"], row["status"], row["reports"]))
+
+    try:
+        record["device"] = check_device("start")
+        current_anchor = json.loads(a.nexpand_current_anchor.read_text()) if a.nexpand_current_anchor else None
+        nexpand_validate_current_anchor(a.nexpand_stage, record["device"]["uuid"], baseline_record,
+                                       current_anchor, manifest_digest, record.get("baseline_audit"))
+        if a.nexpand_stage != "baseline" and baseline_record and record["device"]["uuid"] != baseline_record["device"]["uuid"]:
+            record["same_device_current_anchor"] = str(a.nexpand_current_anchor.resolve())
+            record["gate_artifact_sha256"][str(a.nexpand_current_anchor.resolve())] = hashlib.sha256(a.nexpand_current_anchor.read_bytes()).hexdigest()
+        if not frozen.exists():
+            checks = [json.loads(path.read_text()) for path in a.require_verify]
+            current_test_hash = hashlib.sha256((ROOT / "tests/pytorch/test_grouped_gemm_rtc.py").read_bytes()).hexdigest()
+            before = digests(effective)
+            if codegen_gate:
+                assert codegen_gate["include_identity"] == before
+                assert codegen_gate["rtc_tu_sha256"] == hashlib.sha256((ROOT / "transformer_engine/common/gemm/rtc/cutlass_grouped_gemm.cu").read_bytes()).hexdigest()
+            expected = set(checks[0]["collected_test_names"])
+            assert expected and all(set(r["collected_test_names"]) == expected for r in checks)
+            verified = {c["name"] for r in checks for c in r["testcases"]}
+            assert verified == expected and all(r["status"] == "PASS" for r in checks)
+            for path, check in zip(a.require_verify, checks):
+                assert check["library_sha256"] == library_identity() and check["test_source_sha256"] == current_test_hash
+                assert digests(Path(check["rtc_include"])) == before
+                suites = ET.parse(path.parent / "junit.xml").getroot().findall("testsuite")
+                counts = {key: sum(int(s.get(key, 0)) for s in suites) for key in ("tests", "failures", "errors", "skipped")}
+                junit_cases = [{"classname": c.get("classname"), "name": c.get("name")} for s in suites for c in s.findall("testcase")]
+                assert counts == check["counts"] and junit_cases == check["testcases"]
+                assert not any(counts[key] for key in ("failures", "errors", "skipped"))
+                assert re.search(rf"\b{counts['tests']} passed\b", (path.parent / "pytest.log").read_text())
+            record["verification"] = [str(p) for p in a.require_verify]
+            record["verified_cases"] = len(verified)
+            cpu_dir = a.out / "cpu_gate"
+            cpu_dir.mkdir()
+            cpu_python = ROOT / ".smoke_venv18/bin/python"
+            assert cpu_python.is_file()
+            cpu_env = dict(env, PATH=str(cpu_python.parent) + os.pathsep + env["PATH"])
+            command = [str(cpu_python), "-m", "pytest", "tests/pytorch/test_rtc_grouped_gemm_ci.py", "-q",
+                       "--junitxml", str(cpu_dir / "junit.xml")]
+            save(cpu_dir / "command.json", command)
+            execute(command, cpu_dir / "pytest.log", env=cpu_env)
+            suites = ET.parse(cpu_dir / "junit.xml").getroot().findall("testsuite")
+            counts = {key: sum(int(s.get(key, 0)) for s in suites) for key in ("tests", "failures", "errors", "skipped")}
+            assert counts["tests"] >= 160 and not any(counts[k] for k in ("failures", "errors", "skipped"))
+            record["cpu_gate"] = counts
+            execute([sys.executable, script, "audit-build", "--out", str(a.out / "build_identity")],
+                    a.out / "audit_build.log", env=env)
+            assert json.loads((a.out / "build_identity/result.json").read_text())["status"] == "PASS"
+            shutil.copytree(effective, frozen)
+            assert before == digests(frozen) == digests(effective)
+            record.update(include_identity=before, source_sha256=source_identity(), library_sha256=library_identity())
+            snapshots = a.out / "source_snapshot"
+            for p in source_paths:
+                dest = snapshots / p.relative_to(ROOT)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(p, dest)
+            for p in library_paths:
+                dest = a.out / "libraries" / p.name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(p, dest)
+            save(a.out / "case_manifest.json", manifest)
+            save(receipt, record)
+        check_identity()
+        sdk = subprocess.check_output(["acu", "--version"], text=True)
+        compiler = subprocess.check_output(["nvcc", "--version"], text=True)
+        sdk_version = (f"acu {re.search(r'version\s+(\S+)', sdk)[1]}, "
+                       f"Data {re.search(r'Data version\s+(\S+)', sdk)[1]}, "
+                       f"HGGC {re.search(r'release\s+([^,]+)', compiler)[1]}")
+        sys.path.insert(0, "/usr/local/PPU_SDK/asight/extras/python")
+        import acu_report
+        for case in manifest:
+            case_id = case["id"]
+            previous = record["cases"].get(case_id, {})
+            if previous.get("status") == "PASS":
+                assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == h for p, h in previous["artifacts"].items())
+                continue
+            root = a.out / a.nexpand_stage / f"ne4_k{a.nexpand_kmax}" / case_id
+            root.mkdir(parents=True, exist_ok=True)
+            attempt = root / f"attempt_{len(previous.get('attempts', [])):03d}"
+            attempt.mkdir()
+            entry = {"status": "RUNNING", "attempts": [*previous.get("attempts", []), str(attempt)],
+                     "case": case, "reports": [], "samples": {"production": [], "contiguous": []}}
+            record["cases"][case_id] = entry
+            save(receipt, record)
+            write_ledger()
+            actual, resources, symbols = {}, {}, {}
+            baseline_output = attempt / "production_output.pt"
+            for arm in ("production", "contiguous"):
+                check_device(f"{case_id}:actual:{arm}")
+                check_identity()
+                job = attempt / "actual" / arm
+                job.mkdir(parents=True)
+                command = command_case(case, arm, job / "rtc")
+                command += ["--save" if arm == "production" else "--compare", str(baseline_output)]
+                save(job / "command.json", command)
+                log = execute(command, job / "verify.log", env=env, cwd=job, strict_contention=False)
+                identity = json.loads((job / "rtc/packed_study.json").read_text())
+                assert identity["correctness"] == "PASS" and identity["MNK"] == case["MNK"] and identity["splits"] == case["splits"]
+                for key, filename in (("core_library", "libtransformer_engine.so"),
+                                      ("torch_library", library_paths[1].name)):
+                    assert hashlib.sha256(Path(identity[key]).read_bytes()).hexdigest() == record["library_sha256"][filename]
+                if arm == "contiguous":
+                    assert identity["input_sha256"] == actual["production"]["input_sha256"]
+                    assert identity["output_sha256"] == actual["production"]["output_sha256"]
+                actual[arm] = identity
+                symbol = identity["kernels"][0]
+                symbols[arm] = symbol
+                runtime = re.findall(r"kernel report: threads=(\d+).*?chosen_smem=(\d+) for " + re.escape(symbol), log)
+                assert runtime and len(set(runtime)) == 1
+                threads, smem = map(int, runtime[0])
+                if arm == "contiguous":
+                    cfg = identity["config"]
+                    assert re.search(re.escape(symbol) + rf" work={cfg['expected_work']} grid=\d+ smem={smem}", log)
+                    nexpand_validate_runtime(log, symbol, cfg)
+                dest = job / "rtc"
+                cubin = dest / f"{symbol}.cubin"
+                execute([sys.executable, repro, "--resources", str(dest), "--resource-smem", str(smem),
+                         "--resource-threads", str(threads)], dest / "driver.log", env=env)
+                resource = json.loads((dest / f"{symbol}.driver_resources.json").read_text())
+                assert resource["static_smem_bytes"] == resource["local_bytes_per_thread"] == 0
+                assert resource["active_blocks_per_cu"] > 0
+                resources[arm] = resource
+                if anchors and arm == "production":
+                    anchor = anchors[case_id]
+                    assert symbol == anchor["symbol"] and identity["input_sha256"] == anchor["input_sha256"]
+                    assert identity["output_sha256"] == anchor["output_sha256"]
+                    assert rtc_machine_identity(cubin) == anchor["machine_identity"], "production机器码漂移"
+                    assert {k: v for k, v in resource.items() if k != "cubin"} == \
+                        {k: v for k, v in anchor["resources"].items() if k != "cubin"}, "production资源漂移"
+                    options = (dest / f"{symbol}.options.txt").read_text().splitlines()
+                    assert "-DNVTE_GG_CONTIGUOUS_MODE=0" in options
+                    assert not any("CONTIGUOUS_N_EXPAND_K_MAX" in o for o in options)
+                    entry["production_anchor_identity"] = "PASS"
+                if anchors and arm == "contiguous" and a.nexpand_stage == "baseline":
+                    old = baseline_record["cases"][case_id]
+                    old_symbol = old["actual"]["contiguous"]["kernels"][0]
+                    old_cubin = Path(old["resources"]["contiguous"]["cubin"])
+                    assert symbol == old_symbol and rtc_machine_identity(cubin) == rtc_machine_identity(old_cubin)
+                    assert identity["input_sha256"] == old["actual"]["contiguous"]["input_sha256"]
+                    assert identity["output_sha256"] == old["actual"]["contiguous"]["output_sha256"]
+                    assert {k: v for k, v in resource.items() if k != "cubin"} == \
+                        {k: v for k, v in old["resources"]["contiguous"].items() if k != "cubin"}
+                    entry["current_anchor_identity"] = "PASS"
+                execute(["hgobjdump", "--dump-isa", str(cubin)], dest / "isa.txt")
+                text = execute(["hgobjdump", "--dump-resource-usage=all", str(cubin)], dest / "resources.txt")
+                assert re.findall(r"STACK SIZE:(\d+)", text) == ["0"]
+                annotated = attempt / "annotated_rtc" / arm
+                image = annotate_native_rtc(cubin, annotated, frozen, symbol)
+                assert rtc_machine_identity(image) == rtc_machine_identity(cubin)
+                execute([sys.executable, repro, "--resources", str(annotated), "--resource-smem", str(smem),
+                         "--resource-threads", str(threads)], annotated / "driver.log", env=env)
+                annotated_resource = json.loads((annotated / f"{symbol}.driver_resources.json").read_text())
+                assert {k: v for k, v in resource.items() if k != "cubin"} == {k: v for k, v in annotated_resource.items() if k != "cubin"}
+                save(annotated / "machine_identity.json", rtc_machine_identity(image))
+            entry.update(actual=actual, resources=resources)
+            save(receipt, record)
+
+            def profiled(arm, label, full):
+                check_device(f"{case_id}:before:{label}")
+                check_identity()
+                job = attempt / label
+                job.mkdir()
+                raw_dir = attempt / "remote-results"
+                raw_dir.mkdir(exist_ok=True)
+                report = raw_dir / f"{label}.acurep"
+                annotated = attempt / "annotated_rtc" / arm
+                symbol = symbols[arm]
+                command = ["acu", "--set", "full"] if full else ["acu", "--section", "LaunchStats"]
+                command += ["--import-source", "yes", "-k", "regex:^" + re.escape(symbol) + "$", "-s", "4", "-c", "3",
+                            "--kill=no", "--check-exit-code=yes", "-o", str(report),
+                            *command_case(case, arm, job / "rtc"), "--packed-study-profile", "--iters", "3",
+                            "--packed-study-cubins", str(annotated), "--compare", str(baseline_output)]
+                save(job / "command.json", {"command": command, "sdk_version": sdk_version,
+                    "timestamp": datetime.now(timezone.utc).isoformat()})
+                try:
+                    log = execute(command, job / "profile.log", env=env, cwd=job, strict_contention=False)
+                finally:
+                    log = (job / "profile.log").read_text() if (job / "profile.log").is_file() else ""
+                    try:
+                        foreign, target = foreign_contenders(log)
+                    except AssertionError:
+                        foreign, target = [], set()
+                    record["profiler_contention"][f"{case_id}:{attempt.name}:{label}"] = {
+                        "foreign_pids": foreign, "target_pids": sorted(target), "target_identity_valid": bool(target)}
+                    record["contention"] |= bool(foreign)
+                    save(receipt, record)
+                assert target and not foreign, (target, foreign)
+                identity = json.loads((job / "rtc/packed_study.json").read_text())
+                loaded = annotated / f"{symbol}.cubin"
+                assert f"loaded prebuilt cubin {loaded} " in log
+                assert identity["loaded_cubin_sha256"] == hashlib.sha256(loaded.read_bytes()).hexdigest()
+                assert identity["input_sha256"] == actual[arm]["input_sha256"]
+                assert identity["output_sha256"] == actual[arm]["output_sha256"]
+                assert rtc_machine_identity(job / "rtc" / loaded.name) == rtc_machine_identity(loaded)
+                check_device(f"{case_id}:after:{label}")
+                context = acu_report.load_report(str(report))
+                report_ranges = [context.range_by_idx(i) for i in range(context.num_ranges())]
+                actions = [group.action_by_idx(j) for group in report_ranges for j in range(group.num_actions())]
+                assert len(actions) == 3
+                sources = []
+                for action in actions:
+                    embedded = action.source_files()
+                    assert embedded and all(embedded.values())
+                    required = ["nvte_contiguous_grouped.hpp" if arm == "contiguous" else "ppu_aiu_gemm_array_group.hpp",
+                                "ppu_mma_aiu_multistage_batch_array.hpp", "ppu_epilogue_vectorized_evt.hpp"]
+                    for name in required:
+                        content = next(v for p, v in embedded.items() if Path(p).name == name)
+                        assert content.splitlines() == next(frozen.rglob(name)).read_text().splitlines()
+                    sources.append({p: hashlib.sha256(v.encode()).hexdigest() for p, v in embedded.items()})
+                save(job / "embedded_sources.json", sources)
+                if not full:
+                    return
+                execute(["acu", "-i", str(report), "--stats-rule", "ExportMetricsByKernel", "--stats-rule-output", str(job / "full.csv")],
+                        job / "metrics_export.log", env=env)
+                rows = list(csv.DictReader(io.StringIO((job / "full.csv").read_text())))
+                assert len(rows) == 3 and {r["Kernel Name"] for r in rows} == {symbol}
+                if anchors and arm == "production":
+                    expected_launch = anchors[case_id]["launches"][0]
+                    assert all(all(row[key] == expected_launch[key] for key in ("Block Size", "Grid Size")) for row in rows), "production launch几何漂移"
+                cases_dir = attempt / "cases"
+                cases_dir.mkdir(exist_ok=True)
+                sass = cases_dir / f"{label}.sass.csv"
+                execute(["acu", "-i", str(report), "--page", "source", "--csv-file", str(sass)], job / "sass_export.log", env=env)
+                assert any(float(r.get("Instructions Executed", "0").replace(",", "") or 0) > 0
+                           for r in csv.DictReader(io.StringIO(sass.read_text())))
+                metadata = {"Range ID", "Kernel Name", "Kernel Mangled Name", "Kernel Demangled Name", "Block Size", "Grid Size", "Device"}
+                output = []
+                for row, action, source_hashes in zip(rows, actions, sources):
+                    def number(value):
+                        try:
+                            return float(value.replace(",", ""))
+                        except (ValueError, AttributeError):
+                            return value
+                    raw = {k: number(v) for k, v in row.items() if k not in metadata}
+                    assert set(raw) == set(action.metrics())
+                    assert raw[METRIC] > 0 and raw["ppu__time_duration.sum"] > 0
+                    output.append({"device": "PPU-890", "kernel_name": symbol,
+                        "kernel_mangled_name": row.get("Kernel Mangled Name"), "profiler": "ACU",
+                        "sdk_version": sdk_version, "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "process_id": next(iter(target)), "host_name": socket.gethostname(),
+                        "device_name": row["Device"], "gpu_uuid": record["device"]["uuid"],
+                        "case_id": case_id, "case_digest": manifest_digest, "arm": arm,
+                        "raw_metrics": raw, "source_sha256": source_hashes, "foreign_pids": foreign,
+                        "diagnostic": False, "performance_valid": True})
+                metrics = cases_dir / f"{label}.metrics.json"
+                save(metrics, output)
+                entry["samples"][arm].append([r["raw_metrics"][METRIC] for r in output])
+                entry["reports"].append({"arm": arm, "report": str(report), "metrics": str(metrics), "sass": str(sass),
+                                         "duration_ns": [r["raw_metrics"]["ppu__time_duration.sum"] for r in output],
+                                         "launch": [{key: row[key] for key in ("Block Size", "Grid Size", "Device")} for row in rows]})
+                save(receipt, record)
+            for arm in ("production", "contiguous"):
+                profiled(arm, f"probe_{arm}", False)
+            for repeat in range(3):
+                order = ("production", "contiguous") if (case["index"] + repeat) % 2 == 0 else ("contiguous", "production")
+                entry.setdefault("order", []).append(list(order))
+                for arm in order:
+                    profiled(arm, f"{arm}_full_r{repeat}", True)
+            summary = {arm: nexpand_statistics(values) for arm, values in entry["samples"].items()}
+            p, x = summary["production"]["median"], summary["contiguous"]["median"]
+            summary.update(delta_pp=x - p, relative_pct=100 * (x / p - 1),
+                           config=actual["contiguous"]["config"], resources=resources,
+                           reports=entry["reports"], input_sha256=actual["production"]["input_sha256"])
+            entry.update(status="PASS", summary=summary, artifacts={str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                         for p in sorted(attempt.rglob("*")) if p.is_file() and p.suffix in (".json", ".csv", ".acurep", ".cubin", ".cu", ".txt")})
+            record["core_24_complete"] = all(record["cases"].get(c["id"], {}).get("status") == "PASS" for c in manifest if not c["control"])
+            save(receipt, record)
+            write_ledger()
+            print(json.dumps({"case_complete": case_id, "delta_pp": x - p, "relative_pct": summary["relative_pct"],
+                              "core_24_complete": record["core_24_complete"]}), flush=True)
+        assert len(record["cases"]) == len(manifest) and all(e["status"] == "PASS" for e in record["cases"].values())
+        expected_hits = {512: 2, 1024: 6, 2048: 8}[a.nexpand_kmax]
+        assert sum(record["cases"][c["id"]]["summary"]["config"]["effective_ne"] == 4
+                   for c in manifest if not c["control"]) == expected_hits
+        assert sum(record["cases"][c["id"]]["summary"]["config"]["effective_ne"] == 4
+                   for c in manifest if c["control"]) == (2 if a.nexpand_kmax == 2048 else 0)
+        record.update(status="PASS", performance_valid=True)
+    except Exception as error:
+        record.update(status="NO_DEVICE_AVAILABLE" if "NO_DEVICE_AVAILABLE" in str(error) else "FAIL", error=str(error))
+        if "entry" in locals() and entry["status"] == "RUNNING":
+            entry.update(status="FAIL", error=str(error))
+        raise
+    finally:
+        save(receipt, record)
+        write_ledger()
+    raise SystemExit(0)
+
+
 if a.phase == "smallk-study":
     # 独立于旧 streaming 实验：实际 RTC 四臂，同输入、AB/BA、3轮×3样本。
     assert (a.layout, a.dtype, a.source_mode, a.rows, a.cols, a.mpe, a.groups) == \
@@ -272,18 +1169,19 @@ if a.phase == "smallk-study":
         live = [{k.strip(): v.strip() for k, v in row.items()}
                 for row in csv.DictReader(io.StringIO(apps))
                 if row["gpu_uuid"].strip() == gpu["uuid"] and Path(f"/proc/{row[' pid'].strip()}").exists()]
-        assert float(gpu["memory.total"]) - float(gpu["memory.used"]) > 8192, "剩余显存不足"
+        # 拒绝占用卡之前先保存现场，失败回执也必须准确记录争用。
         record["contention"] |= bool(live)
         record["occupancy_snapshots"].append({"stage": stage, "device": gpu, "live": live,
             "timestamp": datetime.now(timezone.utc).isoformat(), "all_devices": devices, "all_apps": apps})
         save(receipt, record)
+        # 诊断仅放宽正式回归门禁，不允许在有外部 live 进程的设备上采集。
+        assert not live, (stage, live, apps)
+        assert float(gpu["memory.total"]) - float(gpu["memory.used"]) > 8192, "剩余显存不足"
         return gpu
     try:
         try:
             device = check_device("start")
         except AssertionError:
-            if a.diagnostic:
-                raise
             record["status"] = "NO_DEVICE_AVAILABLE"
             record["occupancy"] = subprocess.check_output(
                 ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv"], text=True)
@@ -304,9 +1202,14 @@ if a.phase == "smallk-study":
                     verification_source_identity(check, a.verify_source_snapshot))
         cases_verified = {(c["classname"], c["name"]) for r in checks for c in r["testcases"]}
         contiguous_verified = sum("test_contiguous_" in name for _, name in cases_verified)
-        full_regression = len(cases_verified) == 208 and contiguous_verified == 89
+        # 按当前源码的完整收集集合验收，新增测试不能被历史固定数量漏掉。
+        collections = [set(r.get("collected_test_names", [])) for r in checks]
+        expected_cases = collections[0]
+        full_regression = (bool(expected_cases) and all(c == expected_cases for c in collections)
+                           and {name for _, name in cases_verified} == expected_cases
+                           and len(cases_verified) == len(expected_cases))
         if not a.diagnostic:
-            assert full_regression, "必须覆盖89项contiguous与119项通用回归"
+            assert full_regression, "必须逐项覆盖当前完整收集集合，不能沿用历史数量"
         record.update(device=device, verification=checks, library_sha256=library_hashes,
                       full_regression_complete=full_regression, verified_cases=len(cases_verified),
                       contiguous_verified=contiguous_verified)
@@ -351,6 +1254,11 @@ if a.phase == "smallk-study":
         for key in ("NVTE_GG_DISABLE_RTC_CACHE", "NVTE_GG_NO_EXTRA_NVRTC_FLAGS"):
             env.pop(key, None)
         arms = ["production", "matched", "contiguous", "nexpand"]
+        if a.smallk_bn256:
+            wide_tests = {name for name in expected_cases if "test_contiguous_bn256_" in name}
+            assert wide_tests and wide_tests <= {name for _, name in cases_verified}, \
+                "BN256采集必须先完整通过当前宽BN正确性集合"
+            arms += ["contiguous256", "nexpand256"]
         base = [sys.executable, str(ROOT / "profile/gg_fp32_accum/repro.py"), "--layout", "TN",
                 "--dtype", "bf16", "--rows", "4096", "--cols", "4096", "--mpe", "512",
                 "--groups", "16", "--accumulate", "0", "--check"]
@@ -410,8 +1318,9 @@ if a.phase == "smallk-study":
                                    re.escape(symbol), text)
             assert resources and len(set(resources)) == 1, (arm, resources)
             threads, smem = map(int, resources[0])
-            if arm in ("contiguous", "nexpand"):
-                assert (threads, smem) == (256, 147584), (arm, threads, smem)
+            if identity["arms"][arm]["contiguous"] == "1":
+                wide = arm in ("contiguous256", "nexpand256")
+                assert (threads, smem) == ((512, 196736) if wide else (256, 147584)), (arm, threads, smem)
                 expected_work = identity["arms"][arm]["expected_contiguous_work_count"]
                 assert re.search(re.escape(symbol) + rf" work={expected_work} grid=\d+ smem={smem}", text)
             command = [sys.executable, str(ROOT / "profile/gg_fp32_accum/repro.py"),
@@ -506,13 +1415,22 @@ if a.phase == "smallk-study":
                     "--smallk-cubins", str(annotated), "--dump", str(job / "rtc")]
             save(job / "command.json", {"command": cmd, "sdk_version": sdk_version,
                                        "timestamp": datetime.now(timezone.utc).isoformat()})
-            log = execute(cmd, job / "profile.log", env=env, cwd=job, strict_contention=False)
-            foreign, target = foreign_contenders(log)
-            record["profiler_contention"][label] = {"foreign_pids": foreign,
-                "target_pids": sorted(target), "warnings": log.lower().count("may affect")}
-            record["contention"] |= bool(foreign)
-            if not a.diagnostic:
-                assert not foreign, (foreign, target)
+            try:
+                log = execute(cmd, job / "profile.log", env=env, cwd=job, strict_contention=False)
+            finally:
+                # 非零退出也保留 profiler 的外部 pid，不能被 execute 的断言跳过。
+                log = (job / "profile.log").read_text() if (job / "profile.log").is_file() else ""
+                try:
+                    foreign, target = foreign_contenders(log)
+                except AssertionError:
+                    foreign, target = [], set()
+                record["profiler_contention"][label] = {"foreign_pids": foreign,
+                    "target_pids": sorted(target), "target_identity_valid": bool(target),
+                    "warnings": log.lower().count("may affect")}
+                record["contention"] |= bool(foreign)
+                save(receipt, record)
+            assert target, "未取得被测进程身份，不接受采集结果"
+            assert not foreign, (foreign, target)
             loaded = annotated / arm / f"{symbols[arm]}.cubin"
             assert f"loaded prebuilt cubin {loaded} " in log, "未命中已校验实际RTC加载"
             sample_identity = json.loads((job / "rtc/smallk.json").read_text())
@@ -532,7 +1450,7 @@ if a.phase == "smallk-study":
             actions = [r.action_by_idx(j) for r in ranges for j in range(r.num_actions())]
             assert len(actions) == 3
             source_manifests = []
-            expected = ("nvte_contiguous_grouped.hpp" if arm in ("contiguous", "nexpand")
+            expected = ("nvte_contiguous_grouped.hpp" if arm in ("contiguous", "nexpand", "contiguous256", "nexpand256")
                         else "ppu_aiu_gemm_array_group.hpp")
             for action in actions:
                 embedded = action.source_files()
@@ -569,7 +1487,7 @@ if a.phase == "smallk-study":
                 assert set(raw) == set(action.metrics()), "metrics 必须全量导出"
                 embedded = action.source_files()
                 assert embedded and all(embedded.values()), "未实际嵌入源码，不放行采集回执"
-                expected = ("nvte_contiguous_grouped.hpp" if arm in ("contiguous", "nexpand")
+                expected = ("nvte_contiguous_grouped.hpp" if arm in ("contiguous", "nexpand", "contiguous256", "nexpand256")
                             else "ppu_aiu_gemm_array_group.hpp")
                 assert any(Path(path).name == expected for path in embedded), expected
                 output.append({"device": "PPU-890", "kernel_name": symbols[arm], "profiler": "ACU",
@@ -1056,6 +1974,13 @@ if a.phase in ("build", "audit-build", "verify", "verify-codegen", "resources"):
                                             for p in library_paths}
                 test_source = ROOT / "tests/pytorch/test_grouped_gemm_rtc.py"
                 record["test_source_sha256"] = hashlib.sha256(test_source.read_bytes()).hexdigest()
+                collection_cmd = [sys.executable, "-m", "pytest", str(test_source), "--collect-only", "-q"]
+                save(a.out / "collection_command.json", collection_cmd)
+                collected = execute(collection_cmd, a.out / "collection.log", env=env,
+                                    strict_contention=False)
+                record["collected_test_names"] = [line.split("::", 1)[1] for line in collected.splitlines()
+                                                  if line.startswith("tests/pytorch/test_grouped_gemm_rtc.py::")]
+                assert record["collected_test_names"], "未取得完整测试收集集合"
                 save(result_path, record)
             cmd = [sys.executable, "-m", "pytest", "tests/pytorch/test_grouped_gemm_rtc.py",
                    "-k", a.test_filter, "--basetemp", str(a.out / "tests"),

@@ -214,10 +214,14 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     KernelSchedule>::CollectiveOp;
 
 #if NVTE_GG_CONTIGUOUS_MODE
+#ifndef NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX
+#define NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX 512
+#endif
 static_assert(NVTE_GG_CONTIGUOUS_MODE == 1 || NVTE_GG_CONTIGUOUS_MODE == 2);
 using GemmKernel = cutlass::gemm::kernel::NvteContiguousGrouped<
     CollectiveMainloop, CollectiveEpilogue, bool(NVTE_GG_WITH_C),
-    NVTE_GG_CONTIGUOUS_MODE == 2 ? 4 : 1>;
+    NVTE_GG_CONTIGUOUS_MODE == 2 ? 4 : 1,
+    NVTE_GG_CONTIGUOUS_MODE == 2 ? NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX : 512>;
 #else
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     ProblemShape, CollectiveMainloop, CollectiveEpilogue>;

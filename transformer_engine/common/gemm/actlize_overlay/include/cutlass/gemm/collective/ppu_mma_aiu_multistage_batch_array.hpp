@@ -467,7 +467,8 @@ struct CollectiveMma<
                                       int k_tiles_per_n, int thread_idx, char* smem_buf,
                                       AfterNTile&& after_n_tile, int n_tile_start) {
     static_assert(DispatchPolicy::Stages == 3 && size<0>(TileShape{}) == 256 &&
-                  size<1>(TileShape{}) == 128 && size<2>(TileShape{}) == 64);
+                  (size<1>(TileShape{}) == 128 || size<1>(TileShape{}) == 256) &&
+                  size<2>(TileShape{}) == 64);
     static_assert(is_rmem<Acc>::value);
     int warp_idx = canonical_warp_idx_sync();
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
