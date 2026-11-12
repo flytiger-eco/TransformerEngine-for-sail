@@ -814,6 +814,41 @@ struct Stats<T, 1, WARPS_M, WARPS_N> {
 
     return {m, m2};
   }
+
+  // 使用按需载入的元素执行基线两趟统计，保持元素顺序与 Chan 合并树不变。
+  // load(it, v) 产生第 it 个向量的 NUM_ELTS 个精确转换值。
+  template <uint32_t LDGS, uint32_t NUM_ELTS, typename Load>
+  inline __device__ stats_t compute_from(Load load, const T rn) {
+    constexpr uint32_t N = LDGS * NUM_ELTS;
+    stats_t *smem = use0_ ? smem0_ : smem1_;
+    use0_ = !use0_;
+    constexpr T warp_rn = 1.f / T(N * THREADS_PER_WARP);
+    stats_t warp_stats = warp_stats_.template compute_from<LDGS, NUM_ELTS>(load, warp_rn);
+
+    // Each warp leader stores its stats
+    const auto warp_n = warp_stats_.reducer_.warp_n_;
+    const auto lane = warp_stats_.reducer_.lane_;
+    if (lane == 0) {
+      smem[warp_n] = warp_stats;
+    }
+    __syncthreads();
+
+    T n = Zeros<T>::get();
+    T m = Zeros<T>::get();
+    T m2 = Zeros<T>::get();
+
+    static_assert(WARPS_N <= 32);
+    if (lane < WARPS_N) {
+      stats_t result = smem[lane];
+      n = N * THREADS_PER_WARP;
+      m = transformer_engine::Get<0>::of<stats_t, T>(result);
+      m2 = transformer_engine::Get<1>::of<stats_t, T>(result);
+    }
+
+    warp_chan_upd_dynamic(m, m2, n, WARPS_N);
+
+    return {m, m2};
+  }
   WarpStats warp_stats_;
   stats_t *smem0_;
   stats_t *smem1_;
@@ -851,6 +886,40 @@ struct Stats<T, 1, WARPS_M, 1> {
     for (int it = 0; it < N; it++) {
       T diff = (elts[it] - m);
       m2 += diff * diff;
+    }
+    m2 = reducer_.allreduce(m2, sum);
+
+    return {m, m2};
+  }
+
+  // 与 compute(elts, rn) 相同的两趟运算及累加顺序。
+  // 仅改变中间值存放方式，不改变基线均值和中心化平方和的计算。
+  template <uint32_t LDGS, uint32_t NUM_ELTS, typename Load>
+  inline __device__ stats_t compute_from(Load load, const T rn) {
+    auto sum = Sum<T>();
+
+    T m = Zeros<T>::get();
+#pragma unroll
+    for (int it = 0; it < LDGS; it++) {
+      T v[NUM_ELTS];
+      load(it, v);
+#pragma unroll
+      for (int jt = 0; jt < NUM_ELTS; jt++) {
+        m += v[jt];
+      }
+    }
+    m = reducer_.allreduce(m, sum) * rn;
+
+    T m2 = Zeros<T>::get();
+#pragma unroll
+    for (int it = 0; it < LDGS; it++) {
+      T v[NUM_ELTS];
+      load(it, v);
+#pragma unroll
+      for (int jt = 0; jt < NUM_ELTS; jt++) {
+        T diff = (v[jt] - m);
+        m2 += diff * diff;
+      }
     }
     m2 = reducer_.allreduce(m2, sum);
 
