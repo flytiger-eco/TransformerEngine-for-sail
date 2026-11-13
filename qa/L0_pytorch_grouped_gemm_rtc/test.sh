@@ -55,7 +55,12 @@ publish_wheel_cache() {
 }
 
 build_arm() {
-    local arm="$1" tree="$2" sha="$3" reuse_dir="${4:-}"
+    # sha：当前 arm 的 commit（wheel 复用校验用）；reuse_dir：候选复用 wheel 目录。均可省略。
+    # 旧式两参调用（CPU 单测）下两者为空，直接走本地构建。
+    local arm="$1" tree="$2"
+    local sha="" reuse_dir=""
+    if (( $# >= 3 )); then sha="$3"; fi
+    if (( $# >= 4 )); then reuse_dir="$4"; fi
     git -C "$tree" submodule update --init --recursive
     python3 -m venv --system-site-packages "$SCRATCH/$arm-venv"
     local py="$SCRATCH/$arm-venv/bin/python"
@@ -106,20 +111,21 @@ PY
         pydantic 'importlib-metadata>=1.0' einops onnx onnxscript nvdlfw-inspect
     mkdir -p "$SCRATCH/$arm-wheel"
     local reuse_from=""
-    if [[ -n "$WHEEL_REUSE" ]]; then
+    # 未绑定（旧调用方只传 arm/tree，如 CPU 单测）时安全回退本地构建。
+    if [[ -n "${WHEEL_REUSE:-}" && -n "$reuse_dir" ]]; then
         reuse_from=$(verify_wheel_dir "$reuse_dir" "$sha" || true)
     fi
     if [[ -n "$reuse_from" ]]; then
         echo "[RTC CI] $arm arm 复用 wheel：$reuse_from（commit=$sha，跳过本地编译）"
         cp "$reuse_from"/transformer_engine*.whl "$SCRATCH/$arm-wheel/"
     else
-        echo "[RTC CI] $arm arm 本地构建 wheel（commit=$sha）"
+        echo "[RTC CI] $arm arm 本地构建 wheel（commit=${sha}）"
         (
             cd "$tree"
             "$py" -m pip wheel -v --no-build-isolation --no-deps . -w "$SCRATCH/$arm-wheel"
         )
         # base arm 构建成功后写回缓存（head arm 的复用源由 ppu-890-build 负责，不在此缓存）。
-        if [[ "$arm" == "base" && -n "$WHEEL_REUSE" ]]; then
+        if [[ "$arm" == "base" && -n "${WHEEL_REUSE:-}" ]]; then
             publish_wheel_cache "$WHEEL_REUSE/cache-$sha" "$SCRATCH/$arm-wheel" "$sha" \
                 && echo "[RTC CI] base wheel 已写入缓存：$WHEEL_REUSE/cache-$sha" \
                 || echo "[RTC CI] warning: base wheel 缓存写入失败（不影响本次测量）"

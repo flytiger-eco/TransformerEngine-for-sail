@@ -346,6 +346,8 @@ def test_build_bootstrap_before_frontend(tmp_path, failure):
         ["bash"],
         input=shell,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         env={
             **os.environ,
