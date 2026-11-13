@@ -8,6 +8,9 @@ on:
     - cron: '0 2 * * 1'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -26,6 +29,50 @@ env:
   TE_REPO: "https://github.com/flytiger-eco/TransformerEngine-for-sail.git"
   TE_REF: "${{ github.event.pull_request.head.sha || github.sha }}"
   PCCL_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
+
+  TEST_SETUP: |
+    # 拉取与编译时相同 commit 的源码（仅用于测试脚本与用例），安装本 run 编译 step 产出的 wheel
+    git init -q TransformerEngine-for-sail
+    cd TransformerEngine-for-sail
+    git remote add origin "${TE_REPO}"
+    git fetch -q --depth=1 origin "$(cat "${ARTIFACT_DIR}/commit")"
+    git checkout -q FETCH_HEAD
+
+    # 镜像自带 packaging==21.3 过旧：安装 wheel 的依赖（如 cuda-bindings 走 sdist）时
+    # setuptools 75.8 会调 canonicalize_version(strip_trailing_zero=...)，旧版无此参数直接崩溃。
+    # 与构建侧保持一致，先升级 packaging。
+    pip3 install -U packaging==24.2
+    pip3 install "${ARTIFACT_DIR}"/transformer_engine*.whl
+    pip3 install nvdlfw_inspect pydantic onnxscript einops psutil transformers scipy==1.18.1 pytest==8.2.1
+
+    export TE_PATH="${PWD}"
+    export XML_LOG_DIR="${PWD}/logs"
+    mkdir -p "$XML_LOG_DIR"
+
+  SMOKE_TEST: |
+    set -x
+    : ${NVTE_TEST_NVINSPECT_FEATURE_DIRS:=$TE_PATH/transformer_engine/debug/features}
+
+    RET=0
+    FAILED_CASES=""
+
+    pytest -v -s $TE_PATH/tests/pytorch/debug/test_sanity.py --feature_dirs=$NVTE_TEST_NVINSPECT_FEATURE_DIRS || FAILED_CASES="$FAILED_CASES debug/test_sanity.py"
+    pytest -v -s $TE_PATH/tests/pytorch/debug/test_config.py --feature_dirs=$NVTE_TEST_NVINSPECT_FEATURE_DIRS || FAILED_CASES="$FAILED_CASES debug/test_config.py"
+
+    NVTE_GROUPED_LINEAR_SINGLE_PARAM=1 python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_sanity.py || FAILED_CASES="$FAILED_CASES test_sanity.py"
+    python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_recipe.py || FAILED_CASES="$FAILED_CASES test_recipe.py"
+    python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_jit.py || FAILED_CASES="$FAILED_CASES test_jit.py"
+    NVTE_GROUPED_LINEAR_SINGLE_PARAM=1 python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_grouped_tensor.py || FAILED_CASES="$FAILED_CASES test_grouped_tensor.py"
+    python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/attention/test_attention.py || FAILED_CASES="$FAILED_CASES test_attention.py"
+    NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/attention/test_attention.py || FAILED_CASES="$FAILED_CASES NVTE_ALLOW_NONDETERMINISTIC_ALGO=0/test_attention.py"
+
+    if [ -n "$FAILED_CASES" ]; then
+      echo "Smoke test failed cases:$FAILED_CASES"
+      RET=1
+    else
+      echo "All smoke tests passed"
+    fi
+    exit $RET
 
   ENV_SETUP: |
     set -euo pipefail
@@ -98,3 +145,54 @@ jobs:
           path: /wl_nas/te-ci/${{ github.run_id }}-${{ github.run_attempt }}/*.whl
           if-no-files-found: error
           compression-level: 0
+
+  # smoke 并入同一 workflow：pull_request 触发的普通 job，结果天然显示在 PR Checks。
+  # schedule/workflow_dispatch 触发时也会跑（行为与原 workflow_run 消费链一致）。
+  smoke:
+    needs: build
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: "Smoke Test (890P, 1 PPU)"
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          nnodes: 0
+          nproc_per_node: 1
+          timeout_minutes: 120
+          command: |
+            ${{ env.ENV_SETUP }}
+            ${{ env.TEST_SETUP }}
+            ${{ env.SMOKE_TEST }}
+
+  # build pod 以容器用户写入的产物，runner 容器里的用户无权删除（rm: Permission denied），
+  # 因此清理也在集群容器内执行（与写入侧同一 uid、同一挂载路径）。
+  # 仅清理 pull_request 触发的 run：schedule/workflow_dispatch 的 NAS 产物是
+  # ppu-890-single/multi-ppu-test（workflow_run 消费者）的输入，须等其跑完后再由其自身清理。
+  cleanup:
+    needs: [build, smoke]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: "清理 NAS 产物"
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          nnodes: 0
+          nproc_per_node: 1
+          timeout_minutes: 10
+          command: |
+            set -euo pipefail
+            # RTC gate 可能仍在读取本 run 的 build wheel 做复用（gate 与本 workflow 并行触发）；
+            # 清理失败不致命，残留目录由后续 run 同名覆盖。
+            rm -rf "${{ env.ARTIFACT_DIR }}" || true
+            echo "cleaned: ${{ env.ARTIFACT_DIR }}"

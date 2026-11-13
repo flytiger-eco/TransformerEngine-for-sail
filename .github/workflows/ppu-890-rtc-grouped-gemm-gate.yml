@@ -64,6 +64,8 @@ env:
   PCCL_URL: 'https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz'
   NAS_OUT: /wl_nas/te-ci/rtc-grouped-gemm/${{ github.run_id }}-${{ github.run_attempt }}
   POD_OUT: /mnt/wl_nas/te-ci/rtc-grouped-gemm/${{ github.run_id }}-${{ github.run_attempt }}
+  # wheel 复用目录：head 侧接 ppu-890-build 的产物，base 侧按 merge-base SHA 缓存。
+  POD_WHEEL_REUSE: /mnt/wl_nas/te-ci/rtc-grouped-gemm/wheels
   TE_REPO: ${{ github.server_url }}/${{ github.repository }}.git
 
 jobs:
@@ -140,6 +142,27 @@ jobs:
           print(f'::notice::RTC GroupGemm: run={run}, policy={policy}, base={base}, head={head}')
           PY
 
+      - name: 查找 ppu-890-build 产出的 head wheel（可选加速）
+        id: buildwheel
+        if: steps.scope.outputs.run == 'true'
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.scope.outputs.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 反查同一 head SHA 上最近成功的 ppu-890-build run；gate 与 build 由同一 push 同时触发，
+          # build 可能尚未完成——找不到就留空，pod 内回退本地构建，gate 不因等待 build 而失败。
+          RUN_KEY=$(gh api \
+            "repos/${{ github.repository }}/actions/workflows/ppu-build-890.yml/runs?head_sha=${HEAD_SHA}&status=success&per_page=10" \
+            --jq '[.workflow_runs[] | select(.event == "pull_request")] | first | "\(.id)-\(.run_attempt)"' || true)
+          if [[ -n "${RUN_KEY}" && "${RUN_KEY}" != "null" ]]; then
+            echo "subdir=te-ci/${RUN_KEY}" >> "$GITHUB_OUTPUT"
+            echo "::notice::复用 ppu-890-build wheel：te-ci/${RUN_KEY}"
+          else
+            echo "::notice::未找到已完成的 ppu-890-build run，head arm 将本地构建"
+          fi
+
       - name: 同一 890P 上构建和配对测试 base/head
         if: steps.scope.outputs.run == 'true'
         # 发布步骤根据实际测量强制判定；调度/构建失败不能丢失报告。
@@ -171,8 +194,39 @@ jobs:
             git -C "$SRC" remote add origin '${{ env.TE_REPO }}'
             git -C "$SRC" fetch --no-tags origin '${{ steps.scope.outputs.head_sha }}' '${{ steps.scope.outputs.base_sha }}'
             git -C "$SRC" checkout --detach '${{ steps.scope.outputs.head_sha }}'
+            # head 侧：若 ppu-890-build 已产出同一 head SHA 的 wheel，则拷入复用目录跳过本地编译。
+            # 拷贝可能被并发的 NAS 清理打断（build 产物生命周期不归 gate 管）：
+            # 失败只丢弃已拷内容并回退本地构建，绝不让可选加速中断 gate。
+            REUSE='${{ env.POD_WHEEL_REUSE }}'
+            BUILD_SUBDIR='${{ steps.buildwheel.outputs.subdir }}'
+            if [[ -n "${BUILD_SUBDIR}" ]]; then
+              SRC_DIR="/mnt/wl_nas/${BUILD_SUBDIR}"
+              if [[ -f "${SRC_DIR}/commit" ]] && grep -qx '${{ steps.scope.outputs.head_sha }}' "${SRC_DIR}/commit" \
+                 && ls "${SRC_DIR}"/transformer_engine*.whl >/dev/null 2>&1; then
+                HEAD_SHA='${{ steps.scope.outputs.head_sha }}'
+                DEST="$REUSE/build-$HEAD_SHA"
+                STAGE=$(mktemp -d "$REUSE/.staging-XXXXXX")
+                if cp -a "$SRC_DIR/." "$STAGE/" \
+                   && [[ -f "$STAGE/commit" ]] && grep -qx "$HEAD_SHA" "$STAGE/commit" \
+                   && ls "$STAGE"/transformer_engine*.whl >/dev/null 2>&1; then
+                  # 已发布的有效缓存不可覆盖（可能有别的任务正在读）；同名目录已存在视为命中。
+                  if [[ -d "$DEST" ]]; then
+                    echo "[RTC CI] 复用目录已存在，保持不变：$DEST"
+                  else
+                    mv "$STAGE" "$DEST" \
+                      && echo "[RTC CI] 已接入 ppu-890-build wheel：$DEST" \
+                      || echo "[RTC CI] warning: 复用目录发布失败，head arm 将本地构建"
+                  fi
+                else
+                  echo "[RTC CI] build 产物拷贝/校验未通过，head arm 将本地构建"
+                fi
+                rm -rf "$STAGE" 2>/dev/null || true
+              else
+                echo "[RTC CI] build 产物校验未通过（commit 不匹配或缺失），head arm 将本地构建"
+              fi
+            fi
             bash "$SRC/qa/L0_pytorch_grouped_gemm_rtc/test.sh" "$SRC" \
-              '${{ steps.scope.outputs.base_sha }}' "$OUT" 2>&1 | tee "$OUT/campaign.log"
+              '${{ steps.scope.outputs.base_sha }}' "$OUT" "$REUSE" 2>&1 | tee "$OUT/campaign.log"
 
       - name: 判定并生成报告
         if: always() && steps.scope.outputs.run == 'true'
