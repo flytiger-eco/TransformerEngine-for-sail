@@ -1117,10 +1117,8 @@ class _GroupedLinear(torch.autograd.Function):
             def grouped_gemm_wgrad(
                 inputmats, grad_output_mats, grad_weights,
                 weight_owners=ctx.contiguous_weight_owners if use_contiguous_grouped_gemm else (),
-                *,
-                use_contiguous_grouped_gemm=use_contiguous_grouped_gemm,
             ):
-                # Retain forward intent and parameter owners after the context is released.
+                # Delayed execution must keep the forward parameter owners alive.
                 general_grouped_gemm_for_grouped_tensor(
                     inputmats,
                     grad_output_mats,
@@ -1128,7 +1126,7 @@ class _GroupedLinear(torch.autograd.Function):
                     layout="NT",
                     use_split_accumulator=wgrad_gemm_use_split_accumulator,
                     accumulate=accumulate,
-                    use_contiguous_grouped_gemm=use_contiguous_grouped_gemm,
+                    use_contiguous_grouped_gemm=False,
                 )
                 return None, [None] * N, None
 

@@ -2016,7 +2016,7 @@ def test_grouped_linear_strict_contiguous(
             assert all(param.grad is None for param in params)
             set_contiguous_env("0" if backward_env == "1" else "1")
             layer.backward_dw()
-        assert gemm_calls == [("TN", True), ("NN", True), ("NT", True)]
+        assert gemm_calls == [("TN", True), ("NN", True), ("NT", False)]
         assert dgrad_ptrs == [dgrad_out.data_ptr()]
         torch.testing.assert_close(x.grad, dgrad_out, rtol=0, atol=0)
         torch.testing.assert_close(dgrad_out.float(), reference_dx, rtol=1.6e-2, atol=5e-3)

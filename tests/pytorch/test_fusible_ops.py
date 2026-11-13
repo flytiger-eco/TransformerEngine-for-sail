@@ -2380,7 +2380,7 @@ class TestBasicOps:
         grouped_gemm = grouped_linear_ops.general_grouped_gemm_for_grouped_tensor
 
         def selected_gemm(*args, **kwargs):
-            assert kwargs["use_contiguous_grouped_gemm"] is True
+            assert kwargs["use_contiguous_grouped_gemm"] is (kwargs["layout"] != "NT")
             gemm_calls.append(kwargs["layout"])
             return grouped_gemm(*args, **kwargs)
 

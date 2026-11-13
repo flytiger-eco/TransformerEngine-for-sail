@@ -1973,15 +1973,13 @@ class GroupedLinear(BasicOperation):
         if ctx.weight_requires_grad:
             if use_contiguous_grouped_gemm:
 
-                # WeightGradStore passes owners as its fourth positional operand.
-                # Freeze both the owners and forward intent across env/param changes.
+                # WeightGradStore retains forward owners as its fourth operand.
                 def wgrad_gemm(
                     inputmats,
                     grad_output_mats,
                     grad_weights,
                     _weight_owners=weights,
                     *,
-                    _use_contiguous_grouped_gemm=use_contiguous_grouped_gemm,
                     _accumulate=accumulate_into_main_grad,
                 ):
                     return general_grouped_gemm_for_grouped_tensor(
@@ -1991,7 +1989,7 @@ class GroupedLinear(BasicOperation):
                         layout="NT",
                         accumulate=_accumulate,
                         use_split_accumulator=_2X_ACC_WGRAD,
-                        use_contiguous_grouped_gemm=_use_contiguous_grouped_gemm,
+                        use_contiguous_grouped_gemm=False,
                     )
 
             else:

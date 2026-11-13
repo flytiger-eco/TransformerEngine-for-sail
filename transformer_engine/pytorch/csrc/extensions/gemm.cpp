@@ -757,7 +757,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<at::Tensor> bias, DType bias_type, bool single_output,
     std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count) {
-  if (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1") {
+  if (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1" &&
+      (transa || !transb)) {
     NVTE_CHECK(py::isinstance<py::list>(B) || py::isinstance<py::tuple>(B),
                "NVTE_GG_CONTIGUOUS requires a packed tensor B list.");
     const auto packed_B = B.cast<std::vector<py::handle>>();
@@ -936,7 +937,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     }
 
     if ((te_A->numel() == 0 || te_B->numel() == 0) &&
-        transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1") {
+        (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1" ||
+         (!transa && transb))) {
       if (!accumulate) {
         if (out_slice_ptr != nullptr) {
           // The slice lies inside (*D)[0], so pin the device instead of querying the pointer.
@@ -1064,6 +1066,7 @@ void te_contiguous_grouped_gemm(std::vector<py::handle> A, bool transa,
                                 std::vector<py::handle> B, bool transb,
                                 std::vector<at::Tensor> D, std::vector<int64_t> m_splits,
                                 at::Tensor workspace, bool accumulate, int math_sm_count) {
+  NVTE_CHECK(!transb, "NVTE_GG_CONTIGUOUS NT/wgrad is temporarily disabled; use ordinary grouped GEMM.");
   NVTE_CHECK(!D.empty() && D[0].defined(),
              "NVTE_GG_CONTIGUOUS requires nonempty explicit output tensors.");
   NVTE_CHECK(workspace.defined(), "NVTE_GG_CONTIGUOUS requires device workspace.");
@@ -1109,7 +1112,8 @@ py::object te_general_grouped_gemm_for_grouped_tensor(
     int math_sm_count) {
   using namespace transformer_engine::pytorch::detail;
 
-  NVTE_CHECK(transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1",
+  NVTE_CHECK(transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1" ||
+                 (!transa && transb),
              "NVTE_GG_CONTIGUOUS requires the validated packed-list adapter, not the cuBLAS "
              "GroupedTensor extension entry.");
   init_extension();
@@ -1176,7 +1180,8 @@ py::object te_general_grouped_gemm_for_discrete_in(py::handle A, bool transa, py
                                                    bool use_split_accumulator, int math_sm_count) {
   using namespace transformer_engine::pytorch::detail;
 
-  NVTE_CHECK(transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1",
+  NVTE_CHECK(transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1" ||
+                 (!transa && transb),
              "NVTE_GG_CONTIGUOUS requires the validated packed-list adapter, not the cuBLAS "
              "GroupedTensor extension entry.");
   init_extension();
@@ -1256,7 +1261,8 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
                                                     bool use_split_accumulator, int math_sm_count) {
   using namespace transformer_engine::pytorch::detail;
 
-  NVTE_CHECK(transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1",
+  NVTE_CHECK(transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1" ||
+                 (!transa && transb),
              "NVTE_GG_CONTIGUOUS requires the validated packed-list adapter, not the cuBLAS "
              "GroupedTensor extension entry.");
   init_extension();

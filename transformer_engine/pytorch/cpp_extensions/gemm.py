@@ -467,7 +467,7 @@ def general_grouped_gemm(
     TN layout Grouped GEMM with fp8 inputs.
     """
     num_gemms = len(A)
-    if os.getenv("NVTE_GG_CONTIGUOUS", "0") == "1":
+    if os.getenv("NVTE_GG_CONTIGUOUS", "0") == "1" and layout != "NT":
         if single_output or use_bias or gelu or D_dtype is not None:
             raise ValueError("NVTE_GG_CONTIGUOUS does not support single_output or fusion")
         m_splits = _validate_contiguous_grouped_gemm(
@@ -657,7 +657,11 @@ def general_grouped_gemm_for_grouped_tensor(
     beta: Optional[torch.Tensor] = None,
     use_contiguous_grouped_gemm: Optional[bool] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
-    """GroupedTensor GEMM, defaulting to the strict contiguous backend on PPU sm89."""
+    """GroupedTensor GEMM with contiguous fwd/dgrad and ordinary wgrad on PPU sm89."""
+    if layout == "NT" and use_contiguous_grouped_gemm:
+        raise ValueError("NVTE_GG_CONTIGUOUS NT/wgrad is temporarily disabled; use ordinary grouped GEMM")
+    if use_contiguous_grouped_gemm is None and layout == "NT":
+        use_contiguous_grouped_gemm = False
     if use_contiguous_grouped_gemm is None:
         if os.getenv("NVTE_GG_CONTIGUOUS", "0") == "1":
             use_contiguous_grouped_gemm = True
@@ -694,6 +698,23 @@ def general_grouped_gemm_for_grouped_tensor(
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     if grad:
         raise NotImplementedError("grad is not supported for grouped_tensor GEMM yet.")
+    if (layout == "NT" and getattr(torch.version, "ppu", None) is not None
+            and isinstance(B, GroupedTensorStorage) and B.quantizer is None
+            and B.rowwise_data is not None
+            and torch.cuda.get_device_capability(B.rowwise_data.device) == (8, 9)):
+        if bias is not None or bias_scale is not None or alpha is not None or beta is not None:
+            raise NotImplementedError("PPU sm89 ordinary grouped wgrad does not support fusion or custom alpha/beta")
+        a = A.split_into_quantized_tensors() if isinstance(A, GroupedTensorStorage) else A
+        b = B.split_into_quantized_tensors()
+        d = out.split_into_quantized_tensors() if isinstance(out, GroupedTensorStorage) else out
+        if not a or len(a) != len(b) or len(a) != len(d):
+            raise ValueError("PPU sm89 ordinary grouped wgrad requires matching nonempty expert lists")
+        general_grouped_gemm(
+            a, b, d, [None] * len(a), d[0].dtype,
+            layout="NT", m_splits=[], accumulate=accumulate,
+            use_split_accumulator=use_split_accumulator,
+        )
+        return out
     transa = layout[0] == "T"
     transb = layout[1] == "T"
     is_discrete_out = isinstance(out, list)

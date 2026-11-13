@@ -365,7 +365,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            std::vector<at::Tensor> workspace, size_t workspaceSize, bool accumulate,
            bool use_split_accumulator, int math_sm_count) {
           const bool contiguous =
-              transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1";
+              transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1" &&
+              (transa || !transb);
           if (contiguous && !raw_splits.is_none()) {
             NVTE_CHECK(py::isinstance<py::list>(raw_splits) ||
                            py::isinstance<py::tuple>(raw_splits),
@@ -376,7 +377,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                          "NVTE_GG_CONTIGUOUS splits must be nonnegative integers, not bools.");
             }
           }
-          auto splits = contiguous && raw_splits.is_none()
+          auto splits = (contiguous || (!transa && transb)) && raw_splits.is_none()
                             ? std::vector<int64_t>{}
                             : raw_splits.cast<std::vector<int64_t>>();
           return transformer_engine::pytorch::te_general_grouped_gemm(

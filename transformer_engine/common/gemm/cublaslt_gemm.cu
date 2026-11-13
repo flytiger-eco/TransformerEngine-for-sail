@@ -1147,7 +1147,8 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   };
 
   // 显式连续布局声明不可经过任何通用后端或静默 fallback。
-  if (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1") {
+  if (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1" &&
+      (transa || !transb)) {
     NVTE_CHECK(is_sm89 && use_cutlass && use_cutlass_rtc,
                "NVTE_GG_CONTIGUOUS requires sm89 and the CUTLASS RTC backend.");
     for (int i = 0; i < num_gemms; ++i) {

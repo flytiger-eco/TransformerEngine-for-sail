@@ -2444,9 +2444,10 @@ void dispatch_contiguous(const NVTETensor* A, const NVTETensor* B, NVTETensor* D
                          int num_gemms, bool transa, bool transb, NVTETensor* workspace,
                          bool accumulate, int device, int math_sm_count,
                          cudaStream_t stream) {
+  NVTE_CHECK(!transb, "NVTE_GG_CONTIGUOUS NT/wgrad is temporarily disabled; use ordinary grouped GEMM.");
   NVTE_CHECK(A != nullptr && B != nullptr && D != nullptr && num_gemms > 0 &&
-                 cuda::sm_arch(device) == 89 && !(transa && transb),
-             "NVTE_GG_CONTIGUOUS requires nonempty lists, sm89, and TN/NN/NT layout.");
+                 cuda::sm_arch(device) == 89,
+             "NVTE_GG_CONTIGUOUS requires nonempty lists, sm89, and TN/NN layout.");
   for (const char* option : {"NVTE_GG_RTC_LINEINFO",
                              "NVTE_GG_DISABLE_RTC_CACHE",
                              "NVTE_CUTLASS_GROUPED_GEMM_RTC_VERBOSE"}) {
@@ -2484,7 +2485,6 @@ void dispatch_contiguous(const NVTETensor* A, const NVTETensor* B, NVTETensor* D
     using T = std::true_type;
     using F = std::false_type;
     if (transa) run_contiguous(F{}, T{}, fp32, with_c);
-    else if (transb) run_contiguous(T{}, F{}, fp32, with_c);
     else run_contiguous(F{}, F{}, fp32, with_c);
   };
   const bool fp32 = convertNVTETensorCheck(D[0])->data.dtype == DType::kFloat32;
@@ -2498,7 +2498,7 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
               int num_gemms, bool transa, bool transb, NVTETensor* workspace,
               bool accumulate, int device, int math_sm_count,
               cudaStream_t stream) {
-  if (getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1") {
+  if (getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1" && (transa || !transb)) {
     dispatch_contiguous(A, B, D, num_gemms, transa, transb, workspace, accumulate,
                         device, math_sm_count, stream);
     return true;
@@ -2735,7 +2735,8 @@ bool cutlass_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
         A, B, D, num_gemms, transa, transb, workspace, accumulate, device,
         math_sm_count, stream);
   } catch (const std::exception& e) {
-    if (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1") throw;
+    if (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1" &&
+        (transa || !transb)) throw;
     if (transformer_engine::getenv<bool>(
             "NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", false)) {
       NVTE_WARN("CUTLASS RTC grouped GEMM failed: ", e.what());

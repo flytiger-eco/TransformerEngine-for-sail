@@ -1541,6 +1541,47 @@ def test_contiguous_empty_d_still_validates(monkeypatch, layout, boundary, inval
     assert torch.equal(guards[-1], before)
 
 
+@pytest.mark.parametrize("boundary", ["python", "extension"])
+def test_wgrad_explicit_contiguous_disabled(monkeypatch, boundary):
+    a, b, d, guards = _packed_case("NT", torch.float32, [256, 0, 512])
+    before = guards[-1].clone()
+    monkeypatch.setenv("NVTE_GG_CONTIGUOUS", "1")
+    if boundary == "python":
+        with pytest.raises(ValueError, match="NT/wgrad is temporarily disabled"):
+            general_grouped_gemm_for_grouped_tensor(
+                a, b, d, layout="NT", use_contiguous_grouped_gemm=True,
+            )
+    else:
+        ws = torch.empty(4096, device="cuda", dtype=torch.uint8)
+        with pytest.raises(RuntimeError, match="NT/wgrad is temporarily disabled"):
+            tex.te_contiguous_grouped_gemm(a, False, b, True, d, [256, 0, 512], ws, False, 0)
+    assert torch.equal(guards[-1], before)
+    _assert_guards(guards)
+
+
+@pytest.mark.parametrize("accumulate", [False, True])
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_wgrad_ordinary_ragged_with_contiguous_policy(monkeypatch, accumulate, enabled):
+    a, b, d, guards = _packed_case("NT", torch.float32, [8, 0, 64], m=264, n=520)
+    monkeypatch.setenv("NVTE_GG_CONTIGUOUS", enabled)
+    operands = [_grouped_storage(views, backing) for views, backing in zip((a, b, d), guards)]
+    products = _products(a, b, "NT")
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                            torch.profiler.ProfilerActivity.CUDA]) as prof:
+        for _ in range(2):
+            source = [view.float().clone() for view in d]
+            general_grouped_gemm_for_grouped_tensor(
+                *operands, layout="NT", accumulate=accumulate, use_contiguous_grouped_gemm=False,
+            )
+            torch.cuda.synchronize()
+            for actual, product, old in zip(d, products, source):
+                torch.testing.assert_close(actual.float(), product + old if accumulate else product,
+                                           rtol=0.005, atol=0.005)
+    kernels = [event.name for event in prof.events() if event.name.startswith("nvte_grouped_gemm3_")]
+    assert len(kernels) == 2 and all("_contiguous" not in name for name in kernels)
+    _assert_guards(guards)
+
+
 def _grouped_storage(views, backing):
     shapes = [tuple(t.shape) for t in views]
     offsets = [0]
