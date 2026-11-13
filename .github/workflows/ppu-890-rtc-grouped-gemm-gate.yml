@@ -144,7 +144,7 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         # 发布步骤根据实际测量强制判定；调度/构建失败不能丢失报告。
         continue-on-error: true
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           image: ${{ env.IMAGE }}
           namespace: ppu-sched
