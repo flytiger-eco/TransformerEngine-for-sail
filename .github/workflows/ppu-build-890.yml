@@ -8,6 +8,9 @@ on:
     - cron: '0 2 * * 1'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -144,6 +147,7 @@ jobs:
           compression-level: 0
 
   # smoke 并入同一 workflow：pull_request 触发的普通 job，结果天然显示在 PR Checks。
+  # schedule/workflow_dispatch 触发时也会跑（行为与原 workflow_run 消费链一致）。
   smoke:
     needs: build
     runs-on: k8s-runner-group-cpu-flytiger
@@ -167,9 +171,11 @@ jobs:
 
   # build pod 以容器用户写入的产物，runner 容器里的用户无权删除（rm: Permission denied），
   # 因此清理也在集群容器内执行（与写入侧同一 uid、同一挂载路径）。
+  # 仅清理 pull_request 触发的 run：schedule/workflow_dispatch 的 NAS 产物是
+  # ppu-890-single/multi-ppu-test（workflow_run 消费者）的输入，须等其跑完后再由其自身清理。
   cleanup:
     needs: [build, smoke]
-    if: always()
+    if: always() && github.event_name == 'pull_request'
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -186,5 +192,7 @@ jobs:
           timeout_minutes: 10
           command: |
             set -euo pipefail
+            # RTC gate 可能仍在读取本 run 的 build wheel 做复用（gate 与本 workflow 并行触发）；
+            # 清理失败不致命，残留目录由后续 run 同名覆盖。
             rm -rf "${{ env.ARTIFACT_DIR }}" || true
             echo "cleaned: ${{ env.ARTIFACT_DIR }}"

@@ -195,17 +195,32 @@ jobs:
             git -C "$SRC" fetch --no-tags origin '${{ steps.scope.outputs.head_sha }}' '${{ steps.scope.outputs.base_sha }}'
             git -C "$SRC" checkout --detach '${{ steps.scope.outputs.head_sha }}'
             # head 侧：若 ppu-890-build 已产出同一 head SHA 的 wheel，则拷入复用目录跳过本地编译。
+            # 拷贝可能被并发的 NAS 清理打断（build 产物生命周期不归 gate 管）：
+            # 失败只丢弃已拷内容并回退本地构建，绝不让可选加速中断 gate。
             REUSE='${{ env.POD_WHEEL_REUSE }}'
             BUILD_SUBDIR='${{ steps.buildwheel.outputs.subdir }}'
             if [[ -n "${BUILD_SUBDIR}" ]]; then
               SRC_DIR="/mnt/wl_nas/${BUILD_SUBDIR}"
               if [[ -f "${SRC_DIR}/commit" ]] && grep -qx '${{ steps.scope.outputs.head_sha }}' "${SRC_DIR}/commit" \
                  && ls "${SRC_DIR}"/transformer_engine*.whl >/dev/null 2>&1; then
-                mkdir -p "$REUSE"
-                DEST="$REUSE/build-'${{ steps.scope.outputs.head_sha }}'"
-                rm -rf "$DEST" 2>/dev/null || true
-                cp -a "$SRC_DIR" "$DEST"
-                echo "[RTC CI] 已接入 ppu-890-build wheel：$DEST"
+                HEAD_SHA='${{ steps.scope.outputs.head_sha }}'
+                DEST="$REUSE/build-$HEAD_SHA"
+                STAGE=$(mktemp -d "$REUSE/.staging-XXXXXX")
+                if cp -a "$SRC_DIR/." "$STAGE/" \
+                   && [[ -f "$STAGE/commit" ]] && grep -qx "$HEAD_SHA" "$STAGE/commit" \
+                   && ls "$STAGE"/transformer_engine*.whl >/dev/null 2>&1; then
+                  # 已发布的有效缓存不可覆盖（可能有别的任务正在读）；同名目录已存在视为命中。
+                  if [[ -d "$DEST" ]]; then
+                    echo "[RTC CI] 复用目录已存在，保持不变：$DEST"
+                  else
+                    mv "$STAGE" "$DEST" \
+                      && echo "[RTC CI] 已接入 ppu-890-build wheel：$DEST" \
+                      || echo "[RTC CI] warning: 复用目录发布失败，head arm 将本地构建"
+                  fi
+                else
+                  echo "[RTC CI] build 产物拷贝/校验未通过，head arm 将本地构建"
+                fi
+                rm -rf "$STAGE" 2>/dev/null || true
               else
                 echo "[RTC CI] build 产物校验未通过（commit 不匹配或缺失），head arm 将本地构建"
               fi

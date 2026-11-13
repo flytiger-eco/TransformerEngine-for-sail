@@ -42,16 +42,34 @@ verify_wheel_dir() {
 }
 
 # 在 NAS 复用目录下写入一份带 commit 标记的 wheel（base 缓存用）。
-# 为避免读到写一半的目录，先写入临时目录再原子改名。
+# 缓存按 SHA 跨 PR 共享，已发布的有效缓存不可覆盖（其他任务可能正在读）：
+# 命名冲突（同名非空目录已存在）视为别的任务已发布，直接算成功。
+# 暂存目录写完后原子改名发布；暂存期间任何失败都返回错误，不发布不完整缓存。
 publish_wheel_cache() {
     local dest="$1" src_dir="$2" sha="$3"
     mkdir -p "$(dirname "$dest")"
+    if [[ -d "$dest" ]] && ls "$dest"/transformer_engine*.whl >/dev/null 2>&1 \
+       && [[ "$(cat "$dest/commit" 2>/dev/null || true)" == "$sha" ]]; then
+        echo "[RTC CI] 缓存已存在且有效，保持不覆盖：$dest"
+        return 0
+    fi
     local tmp
-    tmp=$(mktemp -d "$(dirname "$dest")/.tmp-XXXXXX")
-    cp "$src_dir"/transformer_engine*.whl "$tmp/"
-    printf '%s\n' "$sha" > "$tmp/commit"
-    rm -rf "$dest" 2>/dev/null || true
-    mv "$tmp" "$dest"
+    tmp=$(mktemp -d "$(dirname "$dest")/.tmp-XXXXXX") || return 1
+    # 暂存内部失败必须终止：发布不完整缓存会让后续任务装到坏 wheel。
+    if ! { cp "$src_dir"/transformer_engine*.whl "$tmp/" \
+            && printf '%s\n' "$sha" > "$tmp/commit" \
+            && ls "$tmp"/transformer_engine*.whl >/dev/null 2>&1; }; then
+        rm -rf "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    if [[ -d "$dest" ]] && ls "$dest"/transformer_engine*.whl >/dev/null 2>&1; then
+        # 别的任务发布了内容不同的目录（理论上同 SHA 不该发生）；不动它。
+        rm -rf "$tmp" 2>/dev/null || true
+        echo "[RTC CI] 缓存目录已被其他任务占用，保持不覆盖：$dest"
+        return 0
+    fi
+    # mv 到不存在的目标即原子发布；失败则保留/清理由调用方容错。
+    mv "$tmp" "$dest" || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
 }
 
 build_arm() {
