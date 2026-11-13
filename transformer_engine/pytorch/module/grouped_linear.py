@@ -6,6 +6,7 @@
 
 from typing import Union, Optional, Callable, Tuple, List
 from itertools import chain
+import math
 import os
 import warnings
 import weakref
@@ -39,6 +40,7 @@ from ..utils import (
     requires_grad,
     resolve_grouped_linear_single_param_flags,
     get_nvtx_range_context,
+    torch_get_autocast_gpu_dtype,
 )
 from ..distributed import (
     set_tensor_model_parallel_attributes,
@@ -49,6 +51,11 @@ from ..distributed import (
 from ..cpp_extensions import (
     general_grouped_gemm,
     general_grouped_gemm_for_grouped_tensor,
+)
+from ..cpp_extensions.gemm import (
+    _contiguous_grouped_tensor_views,
+    _use_contiguous_grouped_gemm,
+    _validate_contiguous_splits,
 )
 from ..constants import GemmParallelModes, dist_group_type
 from ..jit import no_torch_dynamo
@@ -124,6 +131,7 @@ class _GroupedLinear(torch.autograd.Function):
         activation_dtype: torch.dtype,
         input_quantizers: List[Optional[Quantizer]],
         output_quantizers: List[Optional[Quantizer]],
+        use_contiguous_grouped_gemm: bool = False,
     ) -> bool:
         """Whether to use cuBLASLt grouped GEMM through GroupedTensor metadata.
 
@@ -149,6 +157,24 @@ class _GroupedLinear(torch.autograd.Function):
         Input/weight/grad_output quantizers are assumed to be of the same type, otherwise it would
         trigger a fatal error in the cuBLASLt grouped GEMM check.
         """
+        # Contiguous GEMM reuses ragged metadata, not the cuBLASLt eligibility gates.
+        if use_contiguous_grouped_gemm:
+            if (
+                fp8
+                or fp8_calibration
+                or debug
+                or cpu_offloading
+                or backward_override is not None
+                or save_original_input
+                or activation_dtype != torch.bfloat16
+                or any(q is not None for q in input_quantizers)
+                or any(q is not None for q in output_quantizers)
+            ):
+                raise ValueError(
+                    "NVTE_GG_CONTIGUOUS requires unquantized BF16 compute without debug,"
+                    " calibration, offloading, backward overrides or output quantization"
+                )
+            return True
         # 1. Filter by environment variable
         if not bool(int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))):
             return False
@@ -258,10 +284,27 @@ class _GroupedLinear(torch.autograd.Function):
         is_first_microbatch: Optional[bool],
         skip_fp8_weight_update: Optional[torch.Tensor],
         cache_weight: bool,
+        use_contiguous_grouped_gemm: bool = False,
     ) -> Tuple[List[torch.Tensor], List[Optional[QuantizedTensorStorage]]]:
         """Prepare discrete weight tensors for GroupedTensor GEMM."""
         weights_for_gemm: List[torch.Tensor] = []
         new_workspaces: List[Optional[QuantizedTensorStorage]] = [None] * len(weights)
+        if use_contiguous_grouped_gemm:
+            if (
+                with_quantized_compute
+                or activation_dtype != torch.bfloat16
+                or any(q is not None for q in weight_quantizers)
+                or any(
+                    type(w) not in (torch.Tensor, torch.nn.Parameter)
+                    or w.dtype != torch.bfloat16
+                    or not w.is_contiguous()
+                    for w in weights
+                )
+            ):
+                raise ValueError("NVTE_GG_CONTIGUOUS requires ordinary contiguous BF16 weights")
+            # Preserve parameter leaves and main_grad callbacks. The GEMM adapter
+            # alone detaches no-copy aliases for the native list ABI.
+            return list(weights), new_workspaces
         if not with_quantized_compute:
             return (
                 [_GroupedLinear._maybe_dequantize(weight, activation_dtype) for weight in weights],
@@ -348,8 +391,31 @@ class _GroupedLinear(torch.autograd.Function):
         biases: Tuple[torch.Tensor, ...],
         out: Optional[torch.Tensor] = None,
         dgrad_out: Optional[torch.Tensor] = None,
+        use_contiguous_grouped_gemm: bool = False,
     ) -> Tuple[torch.Tensor, list]:
-        """Forward path backed by GroupedTensor + cuBLASLt grouped GEMM."""
+        """Forward path backed by GroupedTensor grouped GEMM."""
+        if use_contiguous_grouped_gemm:
+            if use_bias:
+                raise ValueError("NVTE_GG_CONTIGUOUS does not support bias")
+            if (
+                type(inp) not in (torch.Tensor, torch.nn.Parameter)
+                or inp.dtype != torch.bfloat16
+                or not inp.is_contiguous()
+                or fp8
+                or activation_dtype != torch.bfloat16
+                or any(
+                    q is not None
+                    for qs in (
+                        input_quantizers,
+                        weight_quantizers,
+                        grad_input_quantizers,
+                        grad_weight_quantizers,
+                        grad_output_quantizers,
+                    )
+                    for q in qs
+                )
+            ):
+                raise ValueError("NVTE_GG_CONTIGUOUS requires ordinary contiguous BF16 compute")
         num_gemms = len(m_splits)
         device = inp.device
         in_features = weights[0].size(-1)
@@ -359,8 +425,12 @@ class _GroupedLinear(torch.autograd.Function):
         split_sizes = m_splits.to(device=device)
         base_split_offsets = tex.splits_to_offsets(split_sizes, 1)
 
-        inp_view = inp.reshape(-1, in_features)
-        x = cast_if_needed(inp_view, activation_dtype)
+        if use_contiguous_grouped_gemm:
+            inp_view = inp.view(math.prod(inp.shape[:-1]), in_features)
+            x = inp_view
+        else:
+            inp_view = inp.reshape(-1, in_features)
+            x = cast_if_needed(inp_view, activation_dtype)
         if fp8:
             input_quantizer = input_quantizers[0]
             input_quantizer.set_usage(
@@ -390,6 +460,7 @@ class _GroupedLinear(torch.autograd.Function):
             is_first_microbatch=is_first_microbatch,
             skip_fp8_weight_update=skip_fp8_weight_update,
             cache_weight=cache_weight,
+            use_contiguous_grouped_gemm=use_contiguous_grouped_gemm,
         )
 
         out = _GroupedLinear._validate_or_alloc_output(
@@ -430,6 +501,7 @@ class _GroupedLinear(torch.autograd.Function):
             layout="TN",
             bias=grouped_bias,
             use_split_accumulator=use_split_accumulator,
+            use_contiguous_grouped_gemm=use_contiguous_grouped_gemm,
         )
 
         if is_grad_enabled:
@@ -453,6 +525,11 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.tensor_objects = tensor_objects
 
             ctx.use_grouped_tensor_path = True
+            ctx.use_contiguous_grouped_gemm = use_contiguous_grouped_gemm
+            if use_contiguous_grouped_gemm:
+                ctx.contiguous_weight_owners = tuple(
+                    getattr(weight, "_nvte_grouped_owner", weight) for weight in weights
+                )
             ctx.weight_quantizers = weight_quantizers
             ctx.weights_shape_0 = out_features
             ctx.weights_shape_1 = in_features
@@ -461,16 +538,37 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.grad_weight_quantizers = grad_weight_quantizers
             ctx.weights_requires_grad = weight_requires_grad
             if fuse_wgrad_accumulation and ctx.weights_requires_grad:
-                ctx.origin_weight_refs = [weakref.ref(w) for w in weights]
-                ctx.origin_weights_overwrite_main_grad = getattr(
-                    weights[0], "overwrite_main_grad", False
-                )
-                if hasattr(weights[0], "__fsdp_param__"):
-                    ctx.main_grad_funcs = [weights[i].get_main_grad for i in range(num_gemms)]
+                grouped_owner = getattr(weights[0], "_nvte_grouped_owner", None)
+                ctx.origin_weight_is_grouped = grouped_owner is not None
+                if grouped_owner is not None:
+                    ctx.origin_weight_refs = [weakref.ref(grouped_owner)] * num_gemms
+                    ctx.origin_weights_overwrite_main_grad = getattr(
+                        grouped_owner, "overwrite_main_grad", False
+                    )
+
+                    def main_grad_member(index):
+                        if hasattr(grouped_owner, "__fsdp_param__"):
+                            grouped_owner.main_grad = grouped_owner.get_main_grad()
+                        main_grad = grouped_owner.main_grad
+                        if isinstance(main_grad, GroupedTensorStorage):
+                            return _contiguous_grouped_tensor_views(main_grad, "main_grad")[index]
+                        if (type(main_grad) is not torch.Tensor or not main_grad.is_contiguous()
+                                or main_grad.numel() != num_gemms * out_features * in_features):
+                            raise ValueError("NVTE_GG_CONTIGUOUS requires packed grouped main_grad")
+                        return main_grad.view(num_gemms, out_features, in_features)[index]
+
+                    ctx.main_grad_funcs = [lambda j=i: main_grad_member(j) for i in range(num_gemms)]
                 else:
-                    ctx.main_grad_funcs = [
-                        lambda j=i: weights[j].main_grad for i in range(num_gemms)
-                    ]
+                    ctx.origin_weight_refs = [weakref.ref(w) for w in weights]
+                    ctx.origin_weights_overwrite_main_grad = getattr(
+                        weights[0], "overwrite_main_grad", False
+                    )
+                    if hasattr(weights[0], "__fsdp_param__"):
+                        ctx.main_grad_funcs = [weights[i].get_main_grad for i in range(num_gemms)]
+                    else:
+                        ctx.main_grad_funcs = [
+                            lambda j=i: weights[j].main_grad for i in range(num_gemms)
+                        ]
             ctx.device = device
             ctx.dgrad_out = dgrad_out
             ctx.m_splits = None
@@ -496,6 +594,9 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.save_original_input = False
             ctx.input_quantizers = input_quantizers
 
+        if use_contiguous_grouped_gemm:
+            leading_dim = inp.shape[0] if inp.ndim > 1 else 1
+            return out.view(leading_dim, *inp.shape[1:-1], out.shape[-1]), new_workspaces
         return out.view(-1, *inp.shape[1:-1], out.shape[-1]), new_workspaces
 
     # pylint: disable=keyword-arg-before-vararg
@@ -535,6 +636,7 @@ class _GroupedLinear(torch.autograd.Function):
             skip_fp8_weight_update,
             save_original_input,
             debug,
+            use_contiguous_grouped_gemm,
         ) = non_tensor_args
         if fp8:
             backward_override = FP8GlobalStateManager.get_fp8_recipe().backward_override
@@ -616,6 +718,7 @@ class _GroupedLinear(torch.autograd.Function):
             activation_dtype=activation_dtype,
             input_quantizers=input_quantizers,
             output_quantizers=output_quantizers,
+            use_contiguous_grouped_gemm=use_contiguous_grouped_gemm,
         ):
             return _GroupedLinear._forward_grouped_tensor(
                 ctx,
@@ -640,6 +743,7 @@ class _GroupedLinear(torch.autograd.Function):
                 biases=biases,
                 out=out,
                 dgrad_out=dgrad_out,
+                use_contiguous_grouped_gemm=use_contiguous_grouped_gemm,
             )
 
         # Convert splits to list of ints for compatibility with split functions
@@ -751,6 +855,7 @@ class _GroupedLinear(torch.autograd.Function):
         if is_grad_enabled:
             ctx.use_grouped_tensor_path = False
             ctx.use_flat_input = use_flat_input
+            ctx.use_contiguous_grouped_gemm = use_contiguous_grouped_gemm
             ctx.weight_quantizers = weight_quantizers
             ctx.weights_shape_1 = weights[0].shape[1]
 
@@ -859,6 +964,13 @@ class _GroupedLinear(torch.autograd.Function):
         grad_output: torch.Tensor,
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         """Backward path paired with ``_forward_grouped_tensor``."""
+        use_contiguous_grouped_gemm = getattr(ctx, "use_contiguous_grouped_gemm", False)
+        if use_contiguous_grouped_gemm:
+            if (
+                type(grad_output) not in (torch.Tensor, torch.nn.Parameter)
+                or grad_output.dtype != torch.bfloat16
+            ):
+                raise ValueError("NVTE_GG_CONTIGUOUS requires ordinary BF16 grad_output")
         saved_tensors = restore_from_func_ctx(ctx)
         N = ctx.num_gemms
         grouped_x = saved_tensors[0]
@@ -877,11 +989,16 @@ class _GroupedLinear(torch.autograd.Function):
             ), "weight was removed while fuse_wgrad_accumulation=True"
             main_grads = [main_grad_func() for main_grad_func in ctx.main_grad_funcs]
             for origin_weight, main_grad in zip(origin_weights, main_grads):
-                if main_grad is not None:
+                if main_grad is not None and not getattr(ctx, "origin_weight_is_grouped", False):
                     origin_weight.main_grad = main_grad
 
-        grad_output_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
-        dy_2d = cast_if_needed(grad_output_view, ctx.activation_dtype)
+        if use_contiguous_grouped_gemm:
+            dy_2d = grad_output.contiguous().view(
+                math.prod(ctx.inp_shape[:-1]), ctx.weights_shape_0
+            )
+        else:
+            grad_output_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
+            dy_2d = cast_if_needed(grad_output_view, ctx.activation_dtype)
         dbias_packed = None
         if ctx.fp8:
             grad_output_quantizer = ctx.grad_output_quantizers[0]
@@ -942,6 +1059,13 @@ class _GroupedLinear(torch.autograd.Function):
                 ctx.activation_dtype,
                 ctx.device,
             )
+            if use_contiguous_grouped_gemm and grouped_x is not None:
+                saved_input = grouped_x.rowwise_data
+                start, input_start = dgrad.data_ptr(), saved_input.data_ptr()
+                end = start + dgrad.numel() * dgrad.element_size()
+                input_end = input_start + saved_input.numel() * saved_input.element_size()
+                if start < end and input_start < input_end and start < input_end and input_start < end:
+                    raise ValueError("NVTE_GG_CONTIGUOUS dgrad_out must not overlap saved input")
             grouped_dgrad = _GroupedLinear._make_grouped_tensor(
                 dgrad,
                 num_gemms=N,
@@ -956,6 +1080,7 @@ class _GroupedLinear(torch.autograd.Function):
                 grouped_dgrad,
                 layout="NN",
                 use_split_accumulator=dgrad_gemm_use_split_accumulator,
+                use_contiguous_grouped_gemm=use_contiguous_grouped_gemm,
             )
 
         if ctx.is_first_microbatch is not None:
@@ -989,7 +1114,11 @@ class _GroupedLinear(torch.autograd.Function):
                 else False
             )
 
-            def grouped_gemm_wgrad(inputmats, grad_output_mats, grad_weights):
+            def grouped_gemm_wgrad(
+                inputmats, grad_output_mats, grad_weights,
+                weight_owners=ctx.contiguous_weight_owners if use_contiguous_grouped_gemm else (),
+            ):
+                # Delayed execution must keep the forward parameter owners alive.
                 general_grouped_gemm_for_grouped_tensor(
                     inputmats,
                     grad_output_mats,
@@ -997,11 +1126,15 @@ class _GroupedLinear(torch.autograd.Function):
                     layout="NT",
                     use_split_accumulator=wgrad_gemm_use_split_accumulator,
                     accumulate=accumulate,
+                    use_contiguous_grouped_gemm=False,
                 )
                 return None, [None] * N, None
 
             if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
-                ctx.wgrad_store.put([grouped_x, grouped_dy, wgrad_list], grouped_gemm_wgrad)
+                operands = [grouped_x, grouped_dy, wgrad_list]
+                if use_contiguous_grouped_gemm:
+                    operands.append(ctx.contiguous_weight_owners)
+                ctx.wgrad_store.put(operands, grouped_gemm_wgrad)
             else:
                 grouped_gemm_wgrad(grouped_x, grouped_dy, wgrad_list)
 
@@ -1030,6 +1163,13 @@ class _GroupedLinear(torch.autograd.Function):
                 handle_custom_ddp_from_mcore(weight, main_grad, wgrad)
                 for weight, main_grad, wgrad in zip(origin_weights, main_grads, wgrad_list)
             ]
+            if (
+                use_contiguous_grouped_gemm
+                and not ctx.fuse_wgrad_accumulation
+                and ctx.wgrad_store is not None
+                and ctx.wgrad_store.delay_wgrad_compute()
+            ):
+                wgrad_list = [None] * N
         else:
             wgrad_list = [None] * N
 
@@ -1857,6 +1997,51 @@ class GroupedLinear(TransformerEngineBaseModule):
         is_grad_enabled = torch.is_grad_enabled()
         num_gemms = self.num_gemms
 
+        # Match prepare_forward's current compute precision, not the previous call's cache.
+        activation_dtype = (
+            torch_get_autocast_gpu_dtype() if torch.is_autocast_enabled() else inp.dtype
+        )
+        contiguous_features_supported = not (
+            FP8GlobalStateManager.is_fp8_enabled()
+            or FP8GlobalStateManager.is_fp8_calibration()
+            or self.primary_weights_in_fp8
+            or debug
+            or is_cpu_offload_enabled()
+            or self.save_original_input
+            or self.use_bias
+            or activation_dtype != torch.bfloat16
+        )
+        use_contiguous_grouped_gemm = _use_contiguous_grouped_gemm(
+            inp.device, supported=contiguous_features_supported
+        )
+        if use_contiguous_grouped_gemm:
+            # CPU splits still require readback later; reject capture on the operand device first.
+            if inp.device.type == "cuda":
+                with torch.cuda.device(inp.device):
+                    if torch.cuda.is_current_stream_capturing():
+                        raise ValueError("NVTE_GG_CONTIGUOUS does not support CUDA graph capture")
+            if self.use_bias:
+                raise ValueError("NVTE_GG_CONTIGUOUS does not support bias")
+            if not contiguous_features_supported:
+                raise ValueError(
+                    "NVTE_GG_CONTIGUOUS requires unquantized BF16 compute without calibration,"
+                    " debug, offloading or save_original_input"
+                )
+            if (
+                type(inp) not in (torch.Tensor, torch.nn.Parameter)
+                or inp.ndim == 0
+                or inp.dtype != torch.bfloat16
+                or not inp.is_contiguous()
+            ):
+                raise ValueError("NVTE_GG_CONTIGUOUS requires ordinary contiguous BF16 input")
+            total_tokens = (
+                inp.numel() // inp.shape[-1]
+                if inp.shape[-1]
+                else math.prod(inp.shape[:-1])
+            )
+            # Validate before int64 conversion can truncate floats or accept bools.
+            _validate_contiguous_splits(m_splits, num_gemms, total_tokens)
+
         if FP8GlobalStateManager.fp8_graph_capturing():
             skip_fp8_weight_update = (
                 FP8GlobalStateManager.quantization_state.skip_fp8_weight_update_tensor
@@ -1884,7 +2069,9 @@ class GroupedLinear(TransformerEngineBaseModule):
         inp = self.prepare_forward(inp, num_gemms=self.num_gemms)
 
         try:
-            weight_tensors = self._get_weight_tensors()
+            weight_tensors = self._get_weight_tensors(
+                use_contiguous_grouped_gemm=use_contiguous_grouped_gemm
+            )
             bias_tensors = self._get_bias_tensors()
 
             quantizers = self._get_quantizers() if not debug else self._get_debug_quantizers()
@@ -1946,6 +2133,7 @@ class GroupedLinear(TransformerEngineBaseModule):
                 skip_fp8_weight_update,
                 self.save_original_input,
                 debug,
+                use_contiguous_grouped_gemm,
             )
             out, new_workspaces = linear_fn(
                 *autograd_ctx,
@@ -1984,10 +2172,27 @@ class GroupedLinear(TransformerEngineBaseModule):
         with get_nvtx_range_context("_GroupedLinear_wgrad"):
             (_, grad_biases_, _), tensor_list = self.wgrad_store.pop()
             wgrad_list = tensor_list[2]
-            weight_params = self._get_weight_tensors()
+            original_owners = tensor_list[3] if len(tensor_list) == 4 else None
+            weight_params = original_owners if original_owners is not None else self._get_weight_tensors()
             if not self.fuse_wgrad_accumulation:
-                for i in range(self.num_gemms):
-                    weight_params[i].grad = wgrad_list[i].to(weight_params[i].dtype)
+                grouped_weight = (
+                    original_owners[0] if isinstance(original_owners[0], GroupedTensorStorage) else None
+                ) if original_owners is not None else getattr(self, "weight", None)
+                if original_owners is not None and grouped_weight is not None:
+                    grad = wgrad_list[0].as_strided(
+                        grouped_weight.shape, grouped_weight.stride()
+                    ).to(grouped_weight.dtype)
+                    if grouped_weight.grad is None:
+                        grouped_weight.grad = grad
+                    else:
+                        grouped_weight.grad.add_(grad)
+                else:
+                    for i in range(self.num_gemms):
+                        grad = wgrad_list[i].to(weight_params[i].dtype)
+                        if original_owners is None or weight_params[i].grad is None:
+                            weight_params[i].grad = grad
+                        else:
+                            weight_params[i].grad.add_(grad)
             has_grad_biases = [
                 grad_bias is not None and grad_bias.numel() != 0 for grad_bias in grad_biases_
             ]
@@ -2065,16 +2270,53 @@ class GroupedLinear(TransformerEngineBaseModule):
         except KeyError:
             return [getattr(self, f"{prefix}{i}") for i in range(num_gemms)]
 
-    def _get_weight_tensors(self) -> List[Union[torch.Tensor, QuantizedTensorStorage]]:
+    def _get_weight_tensors(
+        self, *, use_contiguous_grouped_gemm: bool = False
+    ) -> List[Union[torch.Tensor, QuantizedTensorStorage]]:
         """Get the weight tensors of the module."""
         grouped_weight = self._grouped_param_or_none("weight")
+        live_views = None
         if grouped_weight is not None:
+            if use_contiguous_grouped_gemm:
+                # Check live CSR, shape caches and payload before accessing member
+                # parameters; never replace those leaves with the detached GEMM views.
+                live_views = _contiguous_grouped_tensor_views(grouped_weight, "weight")
             weight_tensors = grouped_weight.quantized_tensors
             if weight_tensors is None:
                 # TODO(ksivaman): Remove this after GEMM integration.
                 weight_tensors = grouped_weight.split_into_quantized_tensors()
         else:
             weight_tensors = self._get_expert_attrs("weight")
+        if use_contiguous_grouped_gemm:
+            if len(weight_tensors) != self.num_gemms or any(
+                type(w) not in (torch.Tensor, torch.nn.Parameter)
+                or w.dtype != torch.bfloat16
+                or tuple(w.shape) != (self.out_features, self.in_features)
+                or not w.is_contiguous()
+                for w in weight_tensors
+            ):
+                raise ValueError("NVTE_GG_CONTIGUOUS requires ordinary contiguous BF16 weights "
+                                 f"of shape ({self.out_features}, {self.in_features})")
+            if live_views is not None and (
+                len(live_views) != len(weight_tensors)
+                or any(
+                    w.shape != view.shape
+                    or w.device != view.device
+                    or w.dtype != view.dtype
+                    or w.untyped_storage()._cdata != view.untyped_storage()._cdata
+                    or w.storage_offset() != view.storage_offset()
+                    for w, view in zip(weight_tensors, live_views)
+                )
+            ):
+                raise ValueError("NVTE_GG_CONTIGUOUS weight member cache does not match live storage")
+            if live_views is not None:
+                # The wrapper's supported flat view connects aliases to the registered leaf.
+                weight_tensors = list(grouped_weight.view(-1).view(
+                    self.num_gemms, self.out_features, self.in_features
+                ).unbind(0))
+                for weight in weight_tensors:
+                    weight._nvte_grouped_owner = grouped_weight
+            return weight_tensors
         if not self.fp8 and any(isinstance(w, QuantizedTensorStorage) for w in weight_tensors):
             warnings.warn(
                 "You are using quantized weights without quantized compute. "

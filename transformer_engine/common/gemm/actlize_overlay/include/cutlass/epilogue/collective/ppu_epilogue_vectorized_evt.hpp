@@ -59,43 +59,9 @@
 #ifndef NVTE_GG_PRELOAD_C
 #define NVTE_GG_PRELOAD_C 0
 #endif
-#ifndef NVTE_GG_PROLOGUE_C
-#define NVTE_GG_PROLOGUE_C 0
-#endif
-#ifndef NVTE_GG_ATOMIC_C
-#define NVTE_GG_ATOMIC_C 0
-#endif
-#ifndef NVTE_GG_ATOMIC_GLOBAL
-#define NVTE_GG_ATOMIC_GLOBAL 0
-#endif
-#ifndef NVTE_GG_ATOMIC_INTERLEAVE
-#define NVTE_GG_ATOMIC_INTERLEAVE 0
-#endif
-// A3-native: bulk-prefetch C into smem with an AIU tensor copy instead of a
-// per-thread global vector load. Measured over eight shapes, the ACU tensor
-// core active rate gains a geometric mean of +23.78% and the net cost of C
-// drops to 0.339x, with D bit-identical to the baseline — hence on by default.
-// A tile whose shape does not qualify falls back to the fragment path silently
-// via kCanStageC.
-#ifndef NVTE_GG_C_AIU_SMEM
-#define NVTE_GG_C_AIU_SMEM 1
-#endif
-// Upper bound on the C prefetch pipeline depth. Depth 2 measured a further
-// +6.3% over depth 1 (TFU 59.88 vs 56.33, non-overlapping distributions), so 2
-// is the default. The second stage must be borrowed from the kernel union's
-// slack and must never live in the epilogue's own SharedStorage: that would be
-// subtracted from the 256KB by StageCountAutoCarveout, and 4 of 7 tiles with
-// stages=0 measurably lost a mainloop stage as a result (256x256x64 dropped
-// straight to 1 and also tripped the mainloop's Stages>=2 assertion).
-// Borrowing the slack leaves sizeof(SharedStorage) completely unchanged.
-#ifndef NVTE_GG_C_AIU_STAGES
-#define NVTE_GG_C_AIU_STAGES 2
-#endif
 
-#if NVTE_GG_C_AIU_SMEM
 #include "cute/arch/copy_ppu.hpp"
 #include "cute/arch/copy_ppu0015_aiu.hpp"
-#endif
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -320,11 +286,6 @@ public:
     class FrgEngine, class FrgLayout,
     class TiledMma,
     class ResidueMNK,
-    // Bytes actually usable from smem_buf onwards (the size of the kernel-side
-    // union). The C prefetch pipeline borrows the union's slack for its second
-    // stage, and the epilogue cannot see how much of it the mainloop occupies,
-    // so this bound can only come from the kernel. 0 = use only the epilogue's
-    // own block.
     class CSmemBytes = cute::Int<0>
   >
   CUTLASS_DEVICE void
@@ -339,26 +300,7 @@ public:
       char* smem_buf,
       CSmemBytes c_smem_bytes = {})
   {
-#if (defined(__CUDACC_RTC__) || defined(NVTE_GG_PROFILE_RTC)) && \
-    NVTE_GG_ATOMIC_C && NVTE_GG_PRELOAD_C && \
-    !NVTE_GG_PROLOGUE_C && NVTE_GG_TRANS_A && !NVTE_GG_TRANS_B && NVTE_GG_OUT_FP32
-    // RTC fp32 NT wgrad only: the host pins alpha=1 and requests beta=1, while
-    // the EVT sees beta=0. Compare the actual per-group C/D address and stride;
-    // anything not aliased stays on the original fragment path.
-    static_assert(IsDirectStoreSupported && cute::is_same_v<ElementC, float> &&
-                  cute::is_same_v<ElementD, float> &&
-                  cute::is_same_v<ElementAccumulator, float>,
-                  "Atomic C requires fp32 pointer-array LinearCombination");
-    auto l = cute::get<3>(blk_coord_mnkl);
-    auto source = get_c_ptr(params, l, true);
-    if (__builtin_expect(source != nullptr, 0) && source == get_d_ptr(params, l) &&
-        get_stride_c(params, l) == get_stride_d(params, l)) {
-      compute_epilogue_atomic(problem_shape_mnkl, blk_shape_MNK, blk_coord_mnkl,
-                              accumulators, tiled_mma, residue_mnk, thread_idx);
-      return;
-    }
-#endif
-#if NVTE_GG_PRELOAD_C && !NVTE_GG_PROLOGUE_C
+#if NVTE_GG_PRELOAD_C
     // Must come before the beta==0 direct short circuit; ptr_C is the host's
     // signal that it wants C folded in.
     if (__builtin_expect(get_c_ptr(params, cute::get<3>(blk_coord_mnkl), true) != nullptr, 0)) {
@@ -371,7 +313,6 @@ public:
       return;
     }
 #endif
-#if !defined(NVTE_GG_DISABLE_DIRECT_EPILOGUE)
     if constexpr (IsDirectStoreSupported) {
       if (!__builtin_expect(is_source_needed(), 0)) {
         compute_epilogue_direct(
@@ -380,7 +321,6 @@ public:
         return;
       }
     }
-#endif
     if (__builtin_expect(is_source_needed(), 0)) {
       compute_epilogue<ProblemShapeMNKL, BlockShapeMNK, BlockCoordMNKL, FrgEngine, FrgLayout, TiledMma, ResidueMNK, true>(
         problem_shape_mnkl, blk_shape_MNK, blk_coord_mnkl, accumulators, tiled_mma, residue_mnk, thread_idx, smem_buf);
@@ -622,91 +562,6 @@ public:
     cst_callbacks.end();
   }
 
-#if (defined(__CUDACC_RTC__) || defined(NVTE_GG_PROFILE_RTC)) && \
-    NVTE_GG_ATOMIC_C && NVTE_GG_PRELOAD_C && \
-    !NVTE_GG_PROLOGUE_C && NVTE_GG_TRANS_A && !NVTE_GG_TRANS_B && NVTE_GG_OUT_FP32
-  template <class ProblemShapeMNKL, class BlockShapeMNK, class BlockCoordMNKL,
-            class FrgEngine, class FrgLayout, class TiledMma, class ResidueMNK>
-  CUTLASS_DEVICE void
-  compute_epilogue_atomic(
-      ProblemShapeMNKL problem_shape_mnkl,
-      BlockShapeMNK blk_shape_MNK,
-      BlockCoordMNKL blk_coord_mnkl,
-      cute::Tensor<FrgEngine, FrgLayout> const& accumulators,
-      TiledMma tiled_mma,
-      ResidueMNK residue_mnk,
-      int thread_idx)
-  {
-    using namespace cute;
-    using X = Underscore;
-    auto M = get<0>(problem_shape_mnkl);
-    auto N = get<1>(problem_shape_mnkl);
-    auto [m_coord, n_coord, k_coord, l_coord] = blk_coord_mnkl;
-    Tensor mD = make_tensor(make_gmem_ptr(get_d_ptr(params, l_coord)),
-                           make_shape(M, N, Int<1>{}), get_stride_d(params, l_coord));
-    Tensor gD_mnl = local_tile(mD, blk_shape_MNK, make_coord(_,_,_), Step<_1,_1,X>{});
-    Tensor gD = gD_mnl(_,_,m_coord,n_coord,0);
-    auto tiled_copy = make_tiled_copy_C(CopyAtomR2S{}, tiled_mma);
-    auto thread_copy = tiled_copy.get_thread_slice(thread_idx);
-    Tensor tCrAcc = thread_copy.retile_S(accumulators);
-    Tensor tCgD = thread_copy.partition_D(gD);
-    Tensor cD = make_identity_tensor(take<0,2>(blk_shape_MNK));
-    Tensor tCcD = thread_copy.partition_D(cD);
-    CUTE_STATIC_ASSERT(size(tCrAcc) == size(tCgD));
-    constexpr int FragSize = decltype(size(tCrAcc(_,0,0)))::value;
-    auto issue = [&](auto rotate) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int m = 0; m < size<1>(tCrAcc); ++m) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < size<2>(tCrAcc); ++j) {
-          // The two 256-thread warp groups interleave their accesses to the N
-          // fragments, still one writer per element. The fragment index is
-          // expanded statically in each branch, so the accumulator is never
-          // indexed dynamically (which would spill).
-          constexpr int NumN = decltype(size<2>(tCrAcc))::value;
-          int n = (j + decltype(rotate)::value * (NumN / 2)) % NumN;
-          Tensor tCrAcc_frag = tCrAcc(_,m,n);
-          Tensor tCgD_frag = tCgD(_,m,n);
-          Tensor tCcD_frag = tCcD(_,m,n);
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < FragSize; ++i) {
-            auto coord = tCcD_frag(i);
-            if (get<0>(coord) < get<0>(residue_mnk) &&
-                get<1>(coord) < get<1>(residue_mnk)) {
-#if NVTE_GG_ATOMIC_GLOBAL && NVTE_GG_ARCH == 89
-              // D is proven to be gmem, so address it explicitly and discard the
-              // result, which skips the per-element generic/TSM test.
-              // The memory clobber stays to stop the compiler from reordering
-              // related memory accesses across this RMW.
-              asm volatile("ppu.atom.global.add.f32 _, [%0], %1;\n"
-                           :: "l"(&tCgD_frag(i)), "f"(tCrAcc_frag(i)) : "memory");
-#else
-              // The returned old value is unused; the underlying op is still an
-              // RMW.
-              atomicAdd(&tCgD_frag(i), tCrAcc_frag(i));
-#endif
-            }
-          }
-        }
-      }
-    };
-#if NVTE_GG_ATOMIC_INTERLEAVE
-    if constexpr (decltype(size(tiled_mma))::value == 512) {
-      if (thread_idx >= 256) {
-        issue(Int<1>{});
-      } else {
-        issue(Int<0>{});
-      }
-    } else {
-      issue(Int<0>{});
-    }
-#else
-    issue(Int<0>{});
-#endif
-  }
-#endif
-
-#if !defined(NVTE_GG_DISABLE_DIRECT_EPILOGUE) || NVTE_GG_PRELOAD_C
   template<
     class ProblemShapeMNKL,
     class BlockShapeMNK,
@@ -812,18 +667,6 @@ public:
         fusion_callbacks.template get_consumer_store_callbacks<true>(cst_args);
     cst_callbacks.begin();
 
-#if NVTE_GG_C_AIU_SMEM
-    // A3-native: instead of every thread issuing a global vector load for C,
-    // an AIU bulk tensor copy moves the whole C block into smem and the MMA-C
-    // fragment is then read from smem. A single AIU instruction moves one cube,
-    // is issued at warp granularity, costs no vreg and is asynchronous, so the
-    // transfer overlaps the accumulate/store work.
-    //
-    // This path imposes hard requirements on C's type, layout and tile shape.
-    // They have to degrade silently rather than static_assert: once this is on
-    // by default every tile reaches here, and a tile_m=128 chunk (kMmaM=2) is
-    // exactly twice the smem tile, so a hard assertion would make small tiles
-    // that are live in production fail at RTC compile time.
     constexpr int kAiuMmaM   = decltype(size<1>(tCaC))::value;
     constexpr int kAiuBlockM = decltype(size<0>(cD))::value;
     constexpr int kAiuBlockN = decltype(size<1>(cD))::value;
@@ -852,17 +695,11 @@ public:
       constexpr int kCubes  = kChunkN / kCubeW;
       constexpr int kCubeElems  = kCubeH * kCubeW;
       constexpr int kChunkElems = kChunkM * kChunkN;
-      // One stage fills smem_epilogue exactly, so the second one lands on the
-      // FusionStorage that follows it. Double buffering is only allowed when
-      // that really is an empty shell AND the union as a whole has room for it.
-      // If either condition fails, fall back to single buffering silently: that
-      // gives up roughly a third of the gain but never runs out of bounds.
+      // Borrow union slack only when FusionStorage is empty, preserving the SMEM ABI.
       constexpr int kChunkBytes  = kChunkElems * int(sizeof(ElementC));
-      constexpr int kWantStages  = NVTE_GG_C_AIU_STAGES;
       constexpr bool kSlackFitsC = sizeof(FusionStorage) <= 1 &&
-                                   int(CSmemBytes::value) >= kWantStages * kChunkBytes;
-      constexpr int kStages =
-          (kWantStages > 1 && kSlackFitsC && kChunks >= kWantStages) ? kWantStages : 1;
+                                   int(CSmemBytes::value) >= 2 * kChunkBytes;
+      constexpr int kStages = (kSlackFitsC && kChunks >= 2) ? 2 : 1;
 
       // Swzl=false selects padz.linear: in smem each cube is stored row-major
       // and the cubes are laid out one after another.
@@ -985,9 +822,7 @@ public:
       cst_callbacks.end();
       return;
     }
-#endif
-    // The fallback path (macro off, non-fp32 C, or a tile shape that fails
-    // kCanStageC) never touches smem.
+    // The fragment fallback for non-fp32 C or ineligible tiles never touches smem.
     (void) smem_buf;
     (void) c_smem_bytes;
 
@@ -1072,7 +907,141 @@ public:
 
     cst_callbacks.end();
   }
-#endif
+
+  // Requires host-proved full M/N tiles and 16B D origins/row strides.
+  template <bool WithC, class TileShapeType, class Coord, class Acc, class Mma>
+  CUTLASS_DEVICE static void compute_contiguous(
+      ElementD* dst, int M, int N, TileShapeType tile_shape, Coord coord,
+      Acc const& acc, Mma mma, int thread_idx, char* c_pool) {
+    using namespace cute;
+    auto stride = make_stride(int64_t(N), _1{}, _0{});
+    Tensor matrix = make_tensor(make_gmem_ptr(dst), make_shape(M, N, _1{}), stride);
+    static_assert(sizeof(decltype(matrix.layout()(make_coord(0, 0, 0)))) >= sizeof(int64_t));
+    Tensor output = local_tile(matrix, tile_shape, make_coord(_, _, _), Step<_1, _1, Underscore>{});
+    Tensor gD = output(_, _, get<0>(coord), get<1>(coord), 0);
+    auto copy_c = make_tiled_copy_C(CopyAtomR2S{}, mma);
+    auto thread = copy_c.get_thread_slice(thread_idx);
+    Tensor tAcc = thread.retile_S(acc);
+    Tensor tDst = thread.partition_D(gD);
+    constexpr int Frag = decltype(size(tAcc(_, 0, 0)))::value;
+    constexpr int MmaM = decltype(size<1>(tAcc))::value;
+    constexpr int MmaN = decltype(size<2>(tAcc))::value;
+    constexpr int BM = decltype(size<0>(gD))::value;
+    constexpr int BN = decltype(size<1>(gD))::value;
+    constexpr int ChunkM = BM / MmaM;
+    constexpr int CubeW = 128 / sizeof(ElementD);
+    constexpr int CubeElems = ChunkM * CubeW;
+    constexpr int ChunkElems = ChunkM * BN;
+    using ChunkLayout = Layout<Shape<Int<ChunkM>, Shape<Int<CubeW>, Int<BN / CubeW>>>,
+                               Stride<Int<CubeW>, Stride<_1, Int<CubeElems>>>>;
+    // noC 不使用 C pool；宽 noC tile 不受有 C chunk 的 32 KiB 预算约束。
+    static_assert(!WithC || ChunkElems * sizeof(ElementD) <= 32768);
+    // Use the same automatic copy grain for D stores and full BF16 C loads.
+    // Prove actual fragment/vector origins, not that a scattered fragment is 16B-wide.
+    auto vector_bytes = [&](auto const& registers, auto const& global) {
+      using CopyOp = typename CPY_Op<typename CopyAtomR2S::Traits>::type;
+      constexpr int CopyBits = sizeof(typename CopyOp::SRegisters) * 8;
+      constexpr int CommonElems = CUTE_STATIC_V(max_common_vector(registers, global));
+      constexpr int AlignBits = CUTE_STATIC_V(
+          gcd(max_alignment(registers), max_alignment(global), Int<CopyBits>{}));
+      constexpr int VectorBits = gcd(CommonElems * sizeof_bits<ElementD>::value, AlignBits);
+      constexpr int VectorBytes = VectorBits / 8;
+      static_assert(VectorBytes >= sizeof(ElementD));
+      static_assert(VectorBytes <= 16 && 16 % VectorBytes == 0);
+      static_assert(Frag % (VectorBytes / sizeof(ElementD)) == 0);
+      // Host proves 16B expert origins and row strides. This static layout
+      // proof completes that guarantee for both WithC and noC fragments.
+      constexpr bool fragment_origins_aligned = []() {
+        using Copy = decltype(copy_c);
+        constexpr auto tv = Copy::get_layoutD_TV();
+        constexpr int CopyM = size<0>(typename Copy::Tiler_MN{});
+        constexpr int CopyN = size<1>(typename Copy::Tiler_MN{});
+        constexpr int Threads = size<0>(tv);
+        constexpr int Vectors = size<1>(tv) / (VectorBytes / sizeof(ElementD));
+        if (CopyN * sizeof(ElementD) % 16 != 0) return false;
+        // Affine TV modes are additive; cache coordinates to bound constexpr evaluation.
+        int value_offsets[Vectors]{};
+        for (int v = 0; v < Vectors; ++v)
+          value_offsets[v] = tv(0, v * (VectorBytes / sizeof(ElementD)));
+        for (int t = 0; t < Threads; ++t) {
+          int thread_offset = tv(t, 0);
+          for (int v = 0; v < Vectors; ++v)
+            if (((thread_offset + value_offsets[v]) / CopyM * sizeof(ElementD)) %
+                VectorBytes != 0) return false;
+        }
+        return true;
+      }();
+      static_assert(fragment_origins_aligned, "host 对齐证明不覆盖此 MMA-C copy 布局。");
+      return Int<VectorBytes>{};
+    };
+    auto store = [&](auto mma_m, auto mma_n, auto const& source) {
+      Tensor a = tAcc(_, mma_m, mma_n);
+      Tensor d = tDst(_, mma_m, mma_n);
+      using Array = cutlass::Array<ElementAccumulator, Frag>;
+      Array combined;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < Frag; ++i) {
+        combined[i] = a(i);
+        if constexpr (WithC) combined[i] += float(source(i));
+      }
+      cutlass::NumericArrayConverter<ElementD, ElementAccumulator, Frag> convert;
+      auto converted = convert(combined);
+      Tensor result = make_tensor(converted.data(), a.layout());
+      (void) vector_bytes(result, d);
+      copy(copy_c, result, d);
+    };
+    if constexpr (WithC && sizeof(ElementD) == 4) {
+      static_assert(BN % CubeW == 0 && MmaM >= 2);
+      using Load = PPU0015_AIU_LOAD<C<CubeElems * sizeof_bits<ElementD>::value>,
+                                    ElementD, false, ChunkM, CubeW, false>;
+      auto* smem = reinterpret_cast<ElementD*>(c_pool);
+      AiuDesc desc;
+      desc.init(reinterpret_cast<const uint8_t*>(dst), M, N, N);
+      auto issue = [&](int chunk, int slot) {
+        int warp = thread_idx / 32;
+        if (warp < BN / CubeW)
+          Load::copy(smem + slot * ChunkElems + warp * CubeElems, dst, desc,
+                     int(get<1>(coord)) * BN + warp * CubeW,
+                     int(get<0>(coord)) * BM + chunk * ChunkM);
+      };
+      issue(0, 0); cp_async_fence();
+      issue(1, 1); cp_async_fence();
+      CUTLASS_PRAGMA_UNROLL
+      for (int s = 0; s < MmaM; ++s) {
+        if (s + 1 < MmaM) {
+          cp_async_wait<1>();
+        } else {
+          cp_async_wait<0>();
+        }
+        __syncthreads();
+        Tensor sm = make_tensor(make_smem_ptr(smem + (s % 2) * ChunkElems), ChunkLayout{});
+        Tensor tSm = thread.partition_D(sm);
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < MmaN; ++n) {
+          Tensor source = make_tensor<ElementD>(shape(tAcc(_, s, n)));
+          copy(CopyAtomR2S{}, tSm(_, 0, n), source);
+          store(s, n, source);
+        }
+        __syncthreads();
+        if (s + 2 < MmaM) { issue(s + 2, s % 2); cp_async_fence(); }
+      }
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < MmaM; ++m) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < MmaN; ++n) {
+          Tensor source = make_tensor<ElementD>(shape(tAcc(_, m, n)));
+          if constexpr (WithC) {
+            Tensor d = tDst(_, m, n);
+            (void) vector_bytes(source, d);
+            copy(copy_c, d, source);
+          }
+          store(m, n, source);
+        }
+      }
+      __syncthreads();
+    }
+  }
 
 private:
   Params params;

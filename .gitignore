@@ -43,3 +43,10 @@ tensor_dumps/
 artifacts/
 .DS_Store
 .claude/
+profile/
+.smoke_venv18/
+include/
+# 保留 include/ 忽略规则，仅豁免 canonical overlay 源码目录。
+!/transformer_engine/common/gemm/actlize_overlay/include/
+.nccl_verify/
+.smoke_venv/

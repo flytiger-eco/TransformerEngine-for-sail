@@ -1146,6 +1146,24 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
     transformer_engine::grouped_gemm::workspace_epoch_bump(current_device);
   };
 
+  // 显式连续布局声明不可经过任何通用后端或静默 fallback。
+  if (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1" &&
+      (transa || !transb)) {
+    NVTE_CHECK(is_sm89 && use_cutlass && use_cutlass_rtc,
+               "NVTE_GG_CONTIGUOUS requires sm89 and the CUTLASS RTC backend.");
+    for (int i = 0; i < num_gemms; ++i) {
+      NVTE_CHECK((bias == nullptr || !transformer_engine::convertNVTETensor(bias[i])->has_data()) &&
+                 (pre_gelu_out == nullptr ||
+                  !transformer_engine::convertNVTETensor(pre_gelu_out[i])->has_data()),
+                 "NVTE_GG_CONTIGUOUS does not support epilogue fusion.");
+    }
+    NVTE_CHECK(cutlass_grouped_gemm_rtc(A, B, D, num_gemms, transa, transb, grad,
+                                       workspace, accumulate, current_device,
+                                       math_sm_count, stream),
+               "NVTE_GG_CONTIGUOUS RTC request failed; fallback is forbidden.");
+    return;
+  }
+
   // Currently only support cutlass group gemm on Hopper Arch
   if (!((is_sm80 || is_sm89 || is_hopper) && use_cutlass)) {
     cublas_path_tagged();

@@ -1818,6 +1818,753 @@ def test_grouped_linear_caller_output_buffers(use_fused_path, supply, monkeypatc
         grouped_linear(x, m_splits, out=bad_out)
 
 
+@pytest.fixture
+def strict_contiguous_env(monkeypatch, tmp_path):
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Strict contiguous RTC grouped GEMM requires SM89.")
+    for name in list(os.environ):
+        if name.startswith("NVTE_GG_"):
+            monkeypatch.delenv(name)
+    for name in (
+        "NVTE_USE_CUTLASS_GROUPED_GEMM",
+        "NVTE_USE_CUTLASS_GROUPED_GEMM_RTC",
+        "NVTE_GG_ALLOW_FP32_ACCUM",
+        "NVTE_FORCE_RTC_NO_FALLBACK",
+        "NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK",
+        "NVTE_GG_CONTIGUOUS",
+    ):
+        monkeypatch.setenv(name, "1")
+    monkeypatch.setenv("NVTE_GG_CONTIGUOUS_BN", "256")
+    monkeypatch.setenv("NVTE_GG_CONTIGUOUS_N_EXPAND", "1")
+    monkeypatch.setenv("NVTE_GG_RTC_CACHE_DIR", str(tmp_path / "rtc"))
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.manual_seed(1234)
+
+
+@pytest.mark.parametrize(
+    "single_grouped_weight,fuse_wgrad_accumulation,delay_wgrad_compute",
+    [
+        pytest.param(True, False, False, id="grouped"),
+        pytest.param(False, False, False, id="packed-discrete"),
+        pytest.param(True, False, True, id="grouped-delayed"),
+        pytest.param(False, False, True, id="packed-discrete-delayed"),
+        pytest.param(True, True, False, id="grouped-main-grad"),
+        pytest.param(True, True, True, id="grouped-delayed-main-grad"),
+        pytest.param(False, True, True, id="packed-discrete-delayed-main-grad"),
+    ],
+)
+@pytest.mark.parametrize(
+    "forward_env,backward_env",
+    [(None, "1"), ("0", None), ("1", "0")],
+    ids=["ppu-unset-to-one", "ppu-zero-to-unset", "explicit-one-to-zero"],
+)
+def test_grouped_linear_strict_contiguous(
+    single_grouped_weight, fuse_wgrad_accumulation, delay_wgrad_compute,
+    forward_env, backward_env, monkeypatch, tmp_path,
+):
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Contiguous grouped GEMM requires SM89.")
+    if forward_env != "1" and not getattr(torch.version, "ppu", None):
+        pytest.skip("Automatic contiguous grouped GEMM requires PPU Torch.")
+
+    def set_contiguous_env(value):
+        if value is None:
+            monkeypatch.delenv("NVTE_GG_CONTIGUOUS", raising=False)
+        else:
+            monkeypatch.setenv("NVTE_GG_CONTIGUOUS", value)
+
+    for name in list(os.environ):
+        if name.startswith("NVTE_GG_"):
+            monkeypatch.delenv(name)
+    for name in (
+        "NVTE_USE_CUTLASS_GROUPED_GEMM",
+        "NVTE_USE_CUTLASS_GROUPED_GEMM_RTC",
+        "NVTE_GG_ALLOW_FP32_ACCUM",
+        _FUSED_GROUPED_GEMM_ENV,
+    ):
+        monkeypatch.setenv(name, "0")
+    set_contiguous_env(forward_env)
+    import transformer_engine.pytorch.module.grouped_linear as grouped_linear_module
+
+    gemm_calls = []
+    original_gemm = grouped_linear_module.general_grouped_gemm_for_grouped_tensor
+
+    def record_gemm(*args, **kwargs):
+        gemm_calls.append((kwargs["layout"], kwargs["use_contiguous_grouped_gemm"]))
+        return original_gemm(*args, **kwargs)
+
+    monkeypatch.setattr(grouped_linear_module, "general_grouped_gemm_for_grouped_tensor", record_gemm)
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", str(int(single_grouped_weight)))
+    monkeypatch.setenv("NVTE_GG_CONTIGUOUS_BN", "128" if fuse_wgrad_accumulation else "256")
+    monkeypatch.setenv("NVTE_GG_CONTIGUOUS_N_EXPAND", "1")
+    monkeypatch.setenv("NVTE_GG_RTC_CACHE_DIR", str(tmp_path / "rtc"))
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.manual_seed(1234)
+
+    splits = [256, 768, 0, 512]
+    num_gemms, in_features, out_features = len(splits), 256, 1024
+    dtype = torch.bfloat16
+    layer = GroupedLinear(
+        num_gemms,
+        in_features,
+        out_features,
+        bias=False,
+        params_dtype=dtype,
+        device="cuda",
+        single_grouped_weight=single_grouped_weight,
+        fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+        delay_wgrad_compute=delay_wgrad_compute,
+    )
+    parameter_ids = [(name, id(param)) for name, param in layer.named_parameters()]
+    params = list(layer.parameters())
+    assert all(param.is_leaf for param in params)
+    assert [name for name, _ in parameter_ids] == (
+        ["weight"] if single_grouped_weight else [f"weight{i}" for i in range(num_gemms)]
+    )
+    weights = (
+        list(layer.weight.quantized_tensors)
+        if single_grouped_weight
+        else [getattr(layer, f"weight{i}") for i in range(num_gemms)]
+    )
+    packed_weight = (0.125 * torch.randn(num_gemms, out_features, in_features, device="cuda")).to(
+        dtype
+    )
+    with torch.no_grad():
+        for weight, value in zip(weights, packed_weight.unbind(0)):
+            if single_grouped_weight:
+                weight.copy_(value)
+            else:
+                weight.data = value
+    weight_ptrs = [weight.data_ptr() for weight in weights]
+    assert weight_ptrs == [
+        weight_ptrs[0] + i * out_features * in_features * packed_weight.element_size()
+        for i in range(num_gemms)
+    ]
+    if single_grouped_weight:
+        assert isinstance(layer.weight, GroupedTensor)
+        assert layer.weight.rowwise_data.data_ptr() == weight_ptrs[0]
+
+    sentinel = 97.0
+    main_backing = None
+    main_views = None
+
+    def bind_main_grad(backing):
+        packed = backing[32:-32].view(num_gemms, out_features, in_features)
+        if single_grouped_weight:
+            layer.weight.main_grad = packed
+        else:
+            for param, view in zip(params, packed.unbind(0)):
+                param.main_grad = view
+        return packed
+
+    if fuse_wgrad_accumulation:
+        main_backing = torch.full(
+            (num_gemms * out_features * in_features + 64,),
+            sentinel,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        main_views = bind_main_grad(main_backing)
+        main_views.fill_(0.75)
+
+    x_base = (0.125 * torch.randn(sum(splits), in_features, device="cuda")).to(dtype)
+    dy = (0.125 * torch.randn(sum(splits), out_features, device="cuda")).to(dtype)
+    split_tensor = torch.tensor(splits, dtype=torch.int64, device="cuda")
+    xs, dys = torch.split(x_base.float(), splits), torch.split(dy.float(), splits)
+    reference_y = torch.cat([xx @ ww.T for xx, ww in zip(xs, packed_weight.float())])
+    reference_dx = torch.cat([dd @ ww for dd, ww in zip(dys, packed_weight.float())])
+    reference_dw = torch.stack([dd.T @ xx for xx, dd in zip(xs, dys)])
+    old_main = None
+    for microbatch in range(2 if fuse_wgrad_accumulation else 1):
+        if microbatch:
+            # An optimizer may replace the owner's buffer between microbatches.
+            old_main = (main_backing, main_backing.clone())
+            main_backing = main_backing.clone()
+            main_views = bind_main_grad(main_backing)
+        main_grad_refs = [param.main_grad for param in params] if fuse_wgrad_accumulation else []
+        for param in params:
+            param.grad = None
+            if fuse_wgrad_accumulation:
+                param.overwrite_main_grad = microbatch == 0
+        before_main = main_backing.clone() if fuse_wgrad_accumulation else None
+        x = x_base.clone().requires_grad_()
+        dgrad_ptrs = []
+        x.register_hook(lambda grad: dgrad_ptrs.append(grad.data_ptr()))
+        out_backing = torch.full(
+            (sum(splits) + 2, out_features), sentinel, dtype=dtype, device="cuda"
+        )
+        dx_backing = torch.full(
+            (sum(splits) + 2, in_features), sentinel, dtype=dtype, device="cuda"
+        )
+        out, dgrad_out = out_backing[1:-1], dx_backing[1:-1]
+        set_contiguous_env(forward_env)
+        gemm_calls.clear()
+        y = layer(
+            x,
+            split_tensor,
+            out=out,
+            dgrad_out=dgrad_out,
+            is_first_microbatch=(microbatch == 0) if fuse_wgrad_accumulation else None,
+        )
+        assert y.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(y.float(), reference_y, rtol=1.6e-2, atol=5e-3)
+        set_contiguous_env(backward_env)
+        y.backward(dy)
+        if delay_wgrad_compute:
+            if fuse_wgrad_accumulation:
+                torch.testing.assert_close(main_backing, before_main, rtol=0, atol=0)
+            assert all(param.grad is None for param in params)
+            set_contiguous_env("0" if backward_env == "1" else "1")
+            layer.backward_dw()
+        assert gemm_calls == [("TN", True), ("NN", True), ("NT", False)]
+        assert dgrad_ptrs == [dgrad_out.data_ptr()]
+        torch.testing.assert_close(x.grad, dgrad_out, rtol=0, atol=0)
+        torch.testing.assert_close(dgrad_out.float(), reference_dx, rtol=1.6e-2, atol=5e-3)
+        if fuse_wgrad_accumulation:
+            actual_dw = main_views
+            expected_dw = reference_dw * (microbatch + 1)
+            assert all(param.grad is None for param in params)
+            for param, saved in zip(params, main_grad_refs):
+                assert type(param.main_grad) is torch.Tensor
+                assert param.main_grad is saved
+            torch.testing.assert_close(actual_dw, expected_dw, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(main_backing[:32], before_main[:32], rtol=0, atol=0)
+            torch.testing.assert_close(main_backing[-32:], before_main[-32:], rtol=0, atol=0)
+        else:
+            if single_grouped_weight:
+                grad = layer.weight.grad
+                assert grad is not None
+                grad = getattr(grad, "rowwise_data", grad)
+                actual_dw = grad.view(num_gemms, out_features, in_features)
+            else:
+                assert all(param.grad is not None for param in params)
+                actual_dw = torch.stack([param.grad for param in params])
+            torch.testing.assert_close(actual_dw.float(), reference_dw, rtol=1.6e-2, atol=5e-3)
+        torch.testing.assert_close(actual_dw[2], torch.zeros_like(actual_dw[2]), rtol=0, atol=0)
+        for backing in (out_backing, dx_backing):
+            guards = backing[[0, -1]]
+            torch.testing.assert_close(guards, torch.full_like(guards, sentinel), rtol=0, atol=0)
+        if old_main is not None:
+            torch.testing.assert_close(*old_main, rtol=0, atol=0)
+        torch.testing.assert_close(x.detach(), x_base, rtol=0, atol=0)
+        current_weights = (
+            list(layer.weight.quantized_tensors)
+            if single_grouped_weight
+            else [getattr(layer, f"weight{i}") for i in range(num_gemms)]
+        )
+        torch.testing.assert_close(torch.stack(current_weights), packed_weight, rtol=0, atol=0)
+        assert [(name, id(param)) for name, param in layer.named_parameters()] == parameter_ids
+        assert [weight.data_ptr() for weight in current_weights] == weight_ptrs
+        if single_grouped_weight:
+            assert layer.weight.rowwise_data.data_ptr() == weight_ptrs[0]
+
+    if delay_wgrad_compute:
+        for param in params:
+            param.grad = None
+        before_main = main_views.clone() if fuse_wgrad_accumulation else None
+        set_contiguous_env(forward_env)
+        y = layer(x_base.clone().requires_grad_(), split_tensor)
+        set_contiguous_env(backward_env)
+        y.backward(dy)
+        replacement = GroupedLinear(
+            num_gemms, in_features, out_features, bias=False, params_dtype=dtype,
+            device="cuda", single_grouped_weight=single_grouped_weight,
+        )
+        replacements = list(replacement.parameters())
+        for i, param in enumerate(replacements):
+            setattr(layer, "weight" if single_grouped_weight else f"weight{i}", param)
+        layer.backward_dw()
+        torch.cuda.synchronize()
+        assert all(param.grad is None for param in replacements)
+        assert [id(param) for param in layer.parameters()] == [id(param) for param in replacements]
+        if fuse_wgrad_accumulation:
+            torch.testing.assert_close(main_views, before_main + reference_dw, rtol=1e-4, atol=1e-5)
+        else:
+            if single_grouped_weight:
+                grad = params[0].grad
+                grad = getattr(grad, "rowwise_data", grad)
+                actual_dw = grad.view(num_gemms, out_features, in_features)
+            else:
+                actual_dw = torch.stack([param.grad for param in params])
+            torch.testing.assert_close(actual_dw.float(), reference_dw, rtol=1.6e-2, atol=5e-3)
+
+
+@pytest.mark.parametrize("single_grouped_weight", [True, False], ids=["grouped", "packed-discrete"])
+@pytest.mark.parametrize("delay_wgrad_compute", [False, True], ids=["immediate", "delayed"])
+@pytest.mark.parametrize("overlap", [True, False], ids=["alias-reject", "disjoint-allowed"])
+def test_grouped_linear_strict_contiguous_dgrad_input_storage(
+    single_grouped_weight, delay_wgrad_compute, overlap, strict_contiguous_env, monkeypatch
+):
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", str(int(single_grouped_weight)))
+    monkeypatch.setenv("NVTE_GG_CONTIGUOUS_BN", "128")
+    splits = [256, 768, 0, 512]
+    num_gemms, in_features, out_features = len(splits), 256, 1024
+    tokens, dtype, sentinel = sum(splits), torch.bfloat16, 97.0
+    layer = GroupedLinear(
+        num_gemms, in_features, out_features, bias=False, params_dtype=dtype, device="cuda",
+        single_grouped_weight=single_grouped_weight, fuse_wgrad_accumulation=True,
+        delay_wgrad_compute=delay_wgrad_compute,
+    )
+    params = list(layer.parameters())
+    parameter_ids = [(name, id(param)) for name, param in layer.named_parameters()]
+    weights = (
+        list(layer.weight.quantized_tensors) if single_grouped_weight else params
+    )
+    packed_weight = (
+        0.125 * torch.randn(num_gemms, out_features, in_features, device="cuda")
+    ).to(dtype)
+    with torch.no_grad():
+        for weight, value in zip(weights, packed_weight.unbind(0)):
+            if single_grouped_weight:
+                weight.copy_(value)
+            else:
+                weight.data = value
+    weight_ptrs = [weight.data_ptr() for weight in weights]
+    main_backing = torch.full(
+        (num_gemms * out_features * in_features + 64,), sentinel,
+        dtype=torch.float32, device="cuda",
+    )
+    main = main_backing[32:-32].view(num_gemms, out_features, in_features)
+    main.fill_(0.75)
+    main_views = [main] if single_grouped_weight else list(main.unbind(0))
+    for param, view in zip(params, main_views):
+        param.main_grad = view
+        param.overwrite_main_grad = True
+    input_backing = torch.full(
+        (2 * tokens + 3, in_features), sentinel, dtype=dtype, device="cuda"
+    )
+    x = input_backing[1:tokens + 1].detach().requires_grad_()
+    with torch.no_grad():
+        x.copy_((0.125 * torch.randn_like(x.float())).to(dtype))
+    dgrad_out = x.detach() if overlap else input_backing[tokens + 2:-1]
+    assert dgrad_out.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+    if overlap:
+        assert dgrad_out.data_ptr() == x.data_ptr()
+    else:
+        assert x.data_ptr() + x.numel() * x.element_size() <= dgrad_out.data_ptr()
+    out_backing = torch.full((tokens + 2, out_features), sentinel, dtype=dtype, device="cuda")
+    out = out_backing[1:-1]
+    dy = (0.125 * torch.randn_like(out.float())).to(dtype)
+    split_tensor = torch.tensor(splits, dtype=torch.int64, device="cuda")
+    before_input = input_backing.clone()
+    xs, dys = torch.split(x.detach().float(), splits), torch.split(dy.float(), splits)
+    reference_y = torch.cat([xx @ ww.T for xx, ww in zip(xs, packed_weight.float())])
+    reference_dx = torch.cat([dd @ ww for dd, ww in zip(dys, packed_weight.float())])
+    reference_dw = torch.stack([dd.T @ xx for xx, dd in zip(xs, dys)])
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=activities) as forward_prof:
+        y = layer(x, split_tensor, out=out, dgrad_out=dgrad_out, is_first_microbatch=True)
+        torch.cuda.synchronize()
+    forward_kernels = [
+        event.name for event in forward_prof.events()
+        if event.name.startswith("nvte_grouped_gemm3_")
+    ]
+    assert len(forward_kernels) == 1, forward_kernels
+    assert y.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(y.float(), reference_y, rtol=1.6e-2, atol=5e-3)
+    torch.testing.assert_close(input_backing, before_input, rtol=0, atol=0)
+    before_output, before_main = out_backing.clone(), main_backing.clone()
+    with torch.profiler.profile(activities=activities) as backward_prof:
+        if overlap:
+            with pytest.raises(ValueError, match="NVTE_GG_CONTIGUOUS.*overlap saved input"):
+                y.backward(dy)
+        else:
+            y.backward(dy)
+        torch.cuda.synchronize()
+    backward_kernels = [
+        event.name for event in backward_prof.events()
+        if event.name.startswith("nvte_grouped_gemm3_")
+    ]
+    if overlap:
+        assert not backward_kernels, backward_kernels
+        torch.testing.assert_close(input_backing, before_input, rtol=0, atol=0)
+        torch.testing.assert_close(main_backing, before_main, rtol=0, atol=0)
+        assert x.grad is None
+    else:
+        assert len(backward_kernels) == (1 if delay_wgrad_compute else 2), backward_kernels
+        if delay_wgrad_compute:
+            torch.testing.assert_close(main_backing, before_main, rtol=0, atol=0)
+            layer.backward_dw()
+        torch.testing.assert_close(x.grad, dgrad_out, rtol=0, atol=0)
+        torch.testing.assert_close(dgrad_out.float(), reference_dx, rtol=1.6e-2, atol=5e-3)
+        torch.testing.assert_close(x.detach(), before_input[1:tokens + 1], rtol=0, atol=0)
+        torch.testing.assert_close(main, reference_dw, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(
+            input_backing[[0, tokens + 1, -1]], before_input[[0, tokens + 1, -1]],
+            rtol=0, atol=0,
+        )
+        for guard in (slice(0, 32), slice(-32, None)):
+            torch.testing.assert_close(main_backing[guard], before_main[guard], rtol=0, atol=0)
+    torch.testing.assert_close(out_backing, before_output, rtol=0, atol=0)
+    assert all(param.grad is None and param.is_leaf for param in params)
+    assert [(name, id(param)) for name, param in layer.named_parameters()] == parameter_ids
+    assert all(param.main_grad is view for param, view in zip(params, main_views))
+    current_weights = (
+        list(layer.weight.quantized_tensors) if single_grouped_weight else list(layer.parameters())
+    )
+    assert [weight.data_ptr() for weight in current_weights] == weight_ptrs
+    torch.testing.assert_close(torch.stack(current_weights), packed_weight, rtol=0, atol=0)
+    if single_grouped_weight:
+        assert layer.weight.rowwise_data.data_ptr() == weight_ptrs[0]
+
+
+@pytest.mark.parametrize("contiguous_env", [None, "0", "1"], ids=["unset", "zero", "explicit"])
+def test_grouped_linear_strict_contiguous_reject_member_shapes(
+    contiguous_env, strict_contiguous_env, monkeypatch
+):
+    if contiguous_env != "1" and not getattr(torch.version, "ppu", None):
+        pytest.skip("Automatic contiguous grouped GEMM requires PPU Torch.")
+    if contiguous_env is None:
+        monkeypatch.delenv("NVTE_GG_CONTIGUOUS")
+    else:
+        monkeypatch.setenv("NVTE_GG_CONTIGUOUS", contiguous_env)
+    monkeypatch.setenv(_FUSED_GROUPED_GEMM_ENV, "0")
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+    splits = [256, 768, 0, 512]
+    num_gemms, in_features, out_features = len(splits), 256, 1024
+    dtype, sentinel = torch.bfloat16, 97.0
+    layer = GroupedLinear(
+        num_gemms, in_features, out_features, bias=False, params_dtype=dtype, device="cuda",
+        single_grouped_weight=True, fuse_wgrad_accumulation=True,
+    )
+    weight = layer.weight
+    members = [torch.nn.Parameter(member) for member in weight.quantized_tensors]
+    weight.quantized_tensors = members
+    parameter_ids = [(name, id(param)) for name, param in layer.named_parameters()]
+    member_ids = [id(member) for member in members]
+    payload, logical_shape = weight.rowwise_data, weight.logical_shape
+    before_payload = payload.clone()
+    rows = [2 * out_features, 0, out_features, out_features]
+    offsets = [0]
+    for row in rows:
+        offsets.append(offsets[-1] + row * in_features)
+    weight.first_dims = torch.tensor(rows, dtype=torch.int64, device="cuda")
+    weight.tensor_offsets = torch.tensor(offsets, dtype=torch.int64, device="cuda")
+    weight.offsets = offsets
+    weight.tensor_shapes = [(row, in_features) for row in rows]
+    with torch.no_grad():
+        for member, shape, start, end in zip(
+            members, weight.tensor_shapes, offsets[:-1], offsets[1:]
+        ):
+            member.data = payload[start:end].view(shape)
+    assert sum(rows) == logical_shape[0] and offsets[-1] == payload.numel()
+    assert weight.logical_shape == logical_shape and weight.rowwise_data is payload
+    assert [id(member) for member in weight.quantized_tensors] == member_ids
+    for member, shape, offset in zip(members, weight.tensor_shapes, offsets):
+        assert isinstance(member, torch.nn.Parameter) and member.is_leaf
+        assert tuple(member.shape) == shape
+        assert member.untyped_storage().data_ptr() == payload.untyped_storage().data_ptr()
+        assert member.storage_offset() == payload.storage_offset() + offset
+    input_backing = torch.full(
+        (sum(splits) + 2, in_features), sentinel, dtype=dtype, device="cuda"
+    )
+    x = input_backing[1:-1].detach().requires_grad_()
+    out_backing = torch.full(
+        (sum(splits) + 2, out_features), sentinel, dtype=dtype, device="cuda"
+    )
+    dx_backing = torch.full_like(input_backing, sentinel)
+    main_backing = torch.full(
+        (payload.numel() + 64,), sentinel, dtype=torch.float32, device="cuda"
+    )
+    weight.main_grad = main_backing[32:-32].view(num_gemms, out_features, in_features)
+    backings = [input_backing, out_backing, dx_backing, main_backing]
+    before = [backing.clone() for backing in backings]
+    split_tensor = torch.tensor(splits, dtype=torch.int64, device="cuda")
+    with torch.profiler.profile(activities=[
+        torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA,
+    ]) as prof:
+        with pytest.raises(ValueError, match="NVTE_GG_CONTIGUOUS.*weights.*shape"):
+            layer(x, split_tensor, out=out_backing[1:-1], dgrad_out=dx_backing[1:-1])
+        torch.cuda.synchronize()
+    kernels = [event.name for event in prof.events() if event.name.startswith("nvte_grouped_gemm3_")]
+    assert not kernels, kernels
+    for backing, saved in zip(backings, before):
+        torch.testing.assert_close(backing, saved, rtol=0, atol=0)
+    torch.testing.assert_close(payload, before_payload, rtol=0, atol=0)
+    assert x.grad is None and weight.grad is None and weight.is_leaf
+    assert [(name, id(param)) for name, param in layer.named_parameters()] == parameter_ids
+    assert [id(member) for member in weight.quantized_tensors] == member_ids
+
+
+@pytest.mark.parametrize("single_grouped_weight", [True, False], ids=["grouped", "packed-discrete"])
+def test_grouped_linear_strict_contiguous_delayed_grad_accumulation(
+    single_grouped_weight, strict_contiguous_env, monkeypatch
+):
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", str(int(single_grouped_weight)))
+    splits = [256, 768, 0, 512]
+    num_gemms, in_features, out_features = len(splits), 256, 1024
+    dtype, sentinel = torch.bfloat16, 97.0
+    layer = GroupedLinear(
+        num_gemms, in_features, out_features, bias=False, params_dtype=dtype, device="cuda",
+        single_grouped_weight=single_grouped_weight, fuse_wgrad_accumulation=False,
+        delay_wgrad_compute=True,
+    )
+    params = list(layer.parameters())
+    parameter_ids = [(name, id(param)) for name, param in layer.named_parameters()]
+    weights = list(layer.weight.quantized_tensors) if single_grouped_weight else params
+    packed_weight = (
+        0.125 * torch.randn(num_gemms, out_features, in_features, device="cuda")
+    ).to(dtype)
+    with torch.no_grad():
+        for weight, value in zip(weights, packed_weight.unbind(0)):
+            if single_grouped_weight:
+                weight.copy_(value)
+            else:
+                weight.data = value
+    weight_ptrs = [weight.data_ptr() for weight in weights]
+    if single_grouped_weight:
+        assert layer.weight.rowwise_data.data_ptr() == weight_ptrs[0]
+    input_backing = torch.full(
+        (sum(splits) + 2, in_features), sentinel, dtype=dtype, device="cuda"
+    )
+    x = input_backing[1:-1].detach().requires_grad_()
+    with torch.no_grad():
+        x.copy_((0.125 * torch.randn_like(x.float())).to(dtype))
+    before_input = input_backing.clone()
+    dy = (0.125 * torch.randn(sum(splits), out_features, device="cuda")).to(dtype)
+    split_tensor = torch.tensor(splits, dtype=torch.int64, device="cuda")
+    xs, dys = torch.split(x.detach().float(), splits), torch.split(dy.float(), splits)
+    reference_y = torch.cat([xx @ ww.T for xx, ww in zip(xs, packed_weight.float())])
+    reference_dx = torch.cat([dd @ ww for dd, ww in zip(dys, packed_weight.float())])
+    reference_dw = torch.stack([dd.T @ xx for xx, dd in zip(xs, dys)])
+    previous_dw = None
+    for microbatch in range(2):
+        out_backing = torch.full(
+            (sum(splits) + 2, out_features), sentinel, dtype=dtype, device="cuda"
+        )
+        dx_backing = torch.full_like(input_backing, sentinel)
+        out, dgrad_out = out_backing[1:-1], dx_backing[1:-1]
+        y = layer(x, split_tensor, out=out, dgrad_out=dgrad_out)
+        assert y.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(y.float(), reference_y, rtol=1.6e-2, atol=5e-3)
+        y.backward(dy)
+        if microbatch == 0:
+            assert all(param.grad is None for param in params)
+        else:
+            grads = [getattr(param.grad, "rowwise_data", param.grad) for param in params]
+            actual_dw = grads[0].view_as(packed_weight) if single_grouped_weight else torch.stack(grads)
+            torch.testing.assert_close(actual_dw, previous_dw, rtol=0, atol=0)
+        layer.backward_dw()
+        assert all(param.grad is not None and param.is_leaf for param in params)
+        grads = [getattr(param.grad, "rowwise_data", param.grad) for param in params]
+        actual_dw = grads[0].view_as(packed_weight) if single_grouped_weight else torch.stack(grads)
+        torch.testing.assert_close(
+            actual_dw.float(), reference_dw * (microbatch + 1), rtol=1.6e-2, atol=5e-3
+        )
+        torch.testing.assert_close(actual_dw[2], torch.zeros_like(actual_dw[2]), rtol=0, atol=0)
+        previous_dw = actual_dw.clone()
+        torch.testing.assert_close(dgrad_out.float(), reference_dx, rtol=1.6e-2, atol=5e-3)
+        torch.testing.assert_close(
+            x.grad.float(), reference_dx * (microbatch + 1), rtol=1.6e-2, atol=5e-3
+        )
+        torch.testing.assert_close(input_backing, before_input, rtol=0, atol=0)
+        for backing in (out_backing, dx_backing):
+            guards = backing[[0, -1]]
+            torch.testing.assert_close(guards, torch.full_like(guards, sentinel), rtol=0, atol=0)
+        assert [(name, id(param)) for name, param in layer.named_parameters()] == parameter_ids
+        current_weights = (
+            list(layer.weight.quantized_tensors) if single_grouped_weight else list(layer.parameters())
+        )
+        assert [weight.data_ptr() for weight in current_weights] == weight_ptrs
+        torch.testing.assert_close(torch.stack(current_weights), packed_weight, rtol=0, atol=0)
+        if single_grouped_weight:
+            assert layer.weight.rowwise_data.data_ptr() == weight_ptrs[0]
+
+
+@pytest.mark.parametrize("contiguous_env", [None, "0", "1"], ids=["unset", "zero", "explicit"])
+@pytest.mark.parametrize(
+    "invalid", ["bool-splits", "float-splits", "negative-splits", "sum-splits",
+                "fulltile", "independent-weights", "noncontiguous-input"]
+)
+def test_grouped_linear_contiguous_contract_errors(
+    contiguous_env, invalid, strict_contiguous_env, monkeypatch
+):
+    if contiguous_env != "1" and not getattr(torch.version, "ppu", None):
+        pytest.skip("Automatic contiguous grouped GEMM requires PPU Torch.")
+    if contiguous_env is None:
+        monkeypatch.delenv("NVTE_GG_CONTIGUOUS")
+    else:
+        monkeypatch.setenv("NVTE_GG_CONTIGUOUS", contiguous_env)
+    monkeypatch.setenv(_FUSED_GROUPED_GEMM_ENV, "0")
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
+    layer = GroupedLinear(2, 256, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
+    params = list(layer.parameters())
+    packed = torch.randn(2, 256, 256, dtype=torch.bfloat16, device="cuda")
+    if invalid != "independent-weights":
+        for param, view in zip(params, packed.unbind(0)):
+            param.data = view
+    weight_ptrs = [param.data_ptr() for param in params]
+    x = torch.randn(512, 256, dtype=torch.bfloat16, device="cuda")
+    splits = [256, 256]
+    if invalid == "bool-splits":
+        splits = [True, 511]
+    elif invalid == "float-splits":
+        splits = torch.tensor([256.5, 255.5], device="cpu")
+    elif invalid == "negative-splits":
+        splits = [-256, 768]
+    elif invalid == "sum-splits":
+        splits = [256, 0]
+    elif invalid == "fulltile":
+        splits = [255, 257]
+    elif invalid == "noncontiguous-input":
+        x = x.t().contiguous().t()
+    backing = torch.full((514, 256), 97.0, dtype=torch.bfloat16, device="cuda")
+    before = backing.clone()
+    with pytest.raises((ValueError, RuntimeError), match="NVTE_GG_CONTIGUOUS"):
+        layer(x, splits, out=backing[1:-1])
+    torch.testing.assert_close(backing, before, rtol=0, atol=0)
+    assert [id(param) for param in layer.parameters()] == [id(param) for param in params]
+    assert [param.data_ptr() for param in params] == weight_ptrs
+    assert not layer.single_grouped_weight
+
+
+@pytest.mark.parametrize("contiguous_env", [None, "0", "1"], ids=["unset", "zero", "explicit"])
+@pytest.mark.parametrize(
+    "feature", ["bias", "fp8", "calibration", "primary-quantized", "debug", "offloading",
+                "save-original-input", "fp16", "fp32"]
+)
+def test_grouped_linear_contiguous_unsupported_features_keep_legacy(
+    contiguous_env, feature, strict_contiguous_env, monkeypatch
+):
+    import transformer_engine.pytorch.module.grouped_linear as grouped_linear_module
+
+    if contiguous_env != "1" and not getattr(torch.version, "ppu", None):
+        pytest.skip("Automatic contiguous grouped GEMM requires PPU Torch.")
+    if contiguous_env is None:
+        monkeypatch.delenv("NVTE_GG_CONTIGUOUS")
+    else:
+        monkeypatch.setenv("NVTE_GG_CONTIGUOUS", contiguous_env)
+    monkeypatch.setenv(_FUSED_GROUPED_GEMM_ENV, "0")
+    layer = GroupedLinear(2, 256, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
+    dtype = {"fp16": torch.float16, "fp32": torch.float32}.get(feature, torch.bfloat16)
+    x = torch.empty(512, 256, dtype=dtype, device="cuda")
+    if feature == "bias":
+        layer.use_bias = True
+    elif feature == "fp8":
+        monkeypatch.setattr(FP8GlobalStateManager, "is_fp8_enabled", lambda: True)
+    elif feature == "calibration":
+        monkeypatch.setattr(FP8GlobalStateManager, "is_fp8_calibration", lambda: True)
+    elif feature == "primary-quantized":
+        layer.primary_weights_in_fp8 = True
+    elif feature == "debug":
+        monkeypatch.setattr(layer, "is_debug_iter", lambda: True)
+    elif feature == "offloading":
+        monkeypatch.setattr(grouped_linear_module, "is_cpu_offload_enabled", lambda: True)
+    elif feature == "save-original-input":
+        layer.save_original_input = True
+
+    class LegacyPreparationReached(Exception):
+        pass
+
+    def legacy_prepare(*args, **kwargs):
+        raise LegacyPreparationReached
+
+    monkeypatch.setattr(layer, "prepare_forward", legacy_prepare)
+    if contiguous_env == "1":
+        with pytest.raises(ValueError, match="NVTE_GG_CONTIGUOUS"):
+            layer(x, [256, 256])
+    else:
+        with pytest.raises(LegacyPreparationReached):
+            layer(x, [256, 256])
+
+
+@pytest.mark.parametrize(
+    "input_dtype,compute_dtype,expected",
+    [(torch.bfloat16, torch.float16, "legacy"),
+     (torch.float32, torch.bfloat16, "input"),
+     (torch.bfloat16, None, "split")],
+    ids=["autocast-fp16", "autocast-bf16-actual-fp32", "ignore-stale-activation-dtype"],
+)
+def test_grouped_linear_contiguous_current_precision(
+    input_dtype, compute_dtype, expected, strict_contiguous_env, monkeypatch
+):
+    import transformer_engine.pytorch.module.grouped_linear as grouped_linear_module
+
+    if not getattr(torch.version, "ppu", None):
+        pytest.skip("Automatic contiguous grouped GEMM requires PPU Torch.")
+    monkeypatch.setenv("NVTE_GG_CONTIGUOUS", "0")
+    monkeypatch.setenv(_FUSED_GROUPED_GEMM_ENV, "0")
+    layer = GroupedLinear(2, 256, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
+    layer.activation_dtype = torch.float32
+    monkeypatch.setattr(torch, "is_autocast_enabled", lambda: compute_dtype is not None)
+    monkeypatch.setattr(grouped_linear_module, "torch_get_autocast_gpu_dtype", lambda: compute_dtype)
+    x = torch.empty(512, 256, dtype=input_dtype, device="cuda")
+
+    class LegacyPreparationReached(Exception):
+        pass
+
+    def legacy_prepare(*args, **kwargs):
+        raise LegacyPreparationReached
+
+    monkeypatch.setattr(layer, "prepare_forward", legacy_prepare)
+    if expected == "legacy":
+        with pytest.raises(LegacyPreparationReached):
+            layer(x, [256.5, 255.5])
+    else:
+        with pytest.raises(ValueError, match="BF16 input" if expected == "input" else "integers"):
+            layer(x, [256.5, 255.5])
+
+
+@pytest.mark.parametrize("output_quantized", [False, True])
+def test_grouped_linear_contiguous_only_bypasses_legacy_gates_when_selected(
+    output_quantized, monkeypatch
+):
+    from transformer_engine.pytorch.module.grouped_linear import _GroupedLinear
+
+    monkeypatch.setenv("NVTE_GG_CONTIGUOUS", "1")
+    monkeypatch.setenv(_FUSED_GROUPED_GEMM_ENV, "0")
+    kwargs = dict(
+        fp8=False, fp8_calibration=False, debug=False, cpu_offloading=False,
+        backward_override=None, save_original_input=False, activation_dtype=torch.bfloat16,
+        input_quantizers=[None], output_quantizers=[object() if output_quantized else None],
+    )
+    assert not _GroupedLinear._is_grouped_tensor_path_supported(**kwargs)
+    assert not _GroupedLinear._is_grouped_tensor_path_supported(
+        **kwargs, use_contiguous_grouped_gemm=False
+    )
+    if output_quantized:
+        with pytest.raises(ValueError, match="output quantization"):
+            _GroupedLinear._is_grouped_tensor_path_supported(
+                **kwargs, use_contiguous_grouped_gemm=True
+            )
+    else:
+        assert _GroupedLinear._is_grouped_tensor_path_supported(
+            **kwargs, use_contiguous_grouped_gemm=True
+        )
+
+
+@pytest.mark.parametrize("contiguous_env", [None, "0", "1"], ids=["unset", "zero", "explicit"])
+def test_grouped_linear_contiguous_capture_checks_input_device_first(
+    contiguous_env, strict_contiguous_env, monkeypatch
+):
+    import transformer_engine.pytorch.module.grouped_linear as grouped_linear_module
+
+    if contiguous_env != "1" and not getattr(torch.version, "ppu", None):
+        pytest.skip("Automatic contiguous grouped GEMM requires PPU Torch.")
+    if contiguous_env is None:
+        monkeypatch.delenv("NVTE_GG_CONTIGUOUS")
+    else:
+        monkeypatch.setenv("NVTE_GG_CONTIGUOUS", contiguous_env)
+    layer = GroupedLinear(2, 256, 256, bias=False, params_dtype=torch.bfloat16, device="cuda")
+    x = torch.empty(512, 256, dtype=torch.bfloat16, device="cuda")
+    checked_devices = []
+
+    def capturing():
+        checked_devices.append(torch.cuda.current_device())
+        return True
+
+    def premature_metadata(*args, **kwargs):
+        raise AssertionError("Metadata must not be read during contiguous capture")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", capturing)
+    monkeypatch.setattr(grouped_linear_module, "_validate_contiguous_splits", premature_metadata)
+    monkeypatch.setattr(layer, "prepare_forward", premature_metadata)
+    monkeypatch.setattr(layer, "_get_weight_tensors", premature_metadata)
+    with pytest.raises(ValueError, match="CUDA graph capture"):
+        layer(x, torch.tensor([256, 256], dtype=torch.int64, device="cpu"))
+    assert checked_devices == [x.device.index]
+
+
 @pytest.mark.skipif(not _nvfp4_available, reason=_reason_for_no_nvfp4)
 def test_grouped_linear_grouped_tensor_path_skips_non_rht_nvfp4(monkeypatch):
     """Non-RHT NVFP4 falls back to the legacy path; check it stays numerically correct.

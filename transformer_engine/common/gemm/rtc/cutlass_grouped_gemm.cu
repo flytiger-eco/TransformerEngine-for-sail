@@ -53,6 +53,9 @@
 #include "ppu_include.hpp"
 #include "cutlass/gemm/collective/builders/ppu_mma_builder.inl"
 #include "cutlass/epilogue/collective/builders/ppu_builder.inl"
+#if NVTE_GG_CONTIGUOUS_MODE
+#include "cutlass/gemm/kernel/nvte_contiguous_grouped.hpp"
+#endif
 
 #ifndef NVTE_GG_TRANS_A
 #error "NVTE_GG_TRANS_A must be defined"
@@ -114,7 +117,11 @@ using ElementAccumulator = float;
 #if NVTE_GG_WITH_C
 using ElementC = ElementD;
 #else
+#if NVTE_GG_CONTIGUOUS_MODE
+using ElementC = ElementD;
+#else
 using ElementC = void;
+#endif
 #endif
 
 #if NVTE_GG_TRANS_A
@@ -206,8 +213,19 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     StageCountTraits,
     KernelSchedule>::CollectiveOp;
 
+#if NVTE_GG_CONTIGUOUS_MODE
+#ifndef NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX
+#define NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX 512
+#endif
+static_assert(NVTE_GG_CONTIGUOUS_MODE == 1 || NVTE_GG_CONTIGUOUS_MODE == 2);
+using GemmKernel = cutlass::gemm::kernel::NvteContiguousGrouped<
+    CollectiveMainloop, CollectiveEpilogue, bool(NVTE_GG_WITH_C),
+    NVTE_GG_CONTIGUOUS_MODE == 2 ? 4 : 1,
+    NVTE_GG_CONTIGUOUS_MODE == 2 ? NVTE_GG_CONTIGUOUS_N_EXPAND_K_MAX : 512>;
+#else
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+#endif
 
 }  // namespace
 
