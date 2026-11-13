@@ -169,6 +169,11 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count);
 
+void te_contiguous_grouped_gemm(std::vector<py::handle> A, bool transa,
+                                std::vector<py::handle> B, bool transb,
+                                std::vector<at::Tensor> D, std::vector<int64_t> m_splits,
+                                at::Tensor workspace, bool accumulate, int math_sm_count);
+
 py::object te_general_grouped_gemm_for_grouped_tensor(
     py::handle A, bool transa, py::handle B, bool transb, py::handle D, py::object bias,
     std::optional<at::Tensor> bias_scale, at::Tensor alpha, at::Tensor beta,

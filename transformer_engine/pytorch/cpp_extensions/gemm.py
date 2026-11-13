@@ -7,6 +7,7 @@
 from typing import Iterable, Optional, Tuple, Union, List
 import os
 import functools
+from numbers import Integral
 import torch
 import transformer_engine_torch as tex
 from ..constants import TE_DType, DType
@@ -274,6 +275,177 @@ def general_gemm(
     return out, bias_grad, gelu_input, extra_output
 
 
+def _use_contiguous_grouped_gemm(device: torch.device, *, supported: bool = True) -> bool:
+    if os.getenv("NVTE_GG_CONTIGUOUS", "0") == "1":
+        return True
+    return (
+        supported
+        and getattr(torch.version, "ppu", None) is not None
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device) == (8, 9)
+    )
+
+
+def _validate_contiguous_splits(splits, groups, total_tokens=None):
+    if isinstance(splits, torch.Tensor):
+        if splits.ndim != 1 or splits.numel() != groups or splits.dtype not in (
+            torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8
+        ):
+            raise ValueError("NVTE_GG_CONTIGUOUS requires one integer split per expert")
+        if splits.is_cuda:
+            with torch.cuda.device(splits.device):
+                if torch.cuda.is_current_stream_capturing():
+                    raise ValueError("NVTE_GG_CONTIGUOUS does not support CUDA graph capture")
+        if splits.is_neg() or splits.is_conj():
+            raise ValueError("NVTE_GG_CONTIGUOUS splits have lazy negative/conjugate bits")
+        span = (splits.numel() - 1) * splits.stride(0) + 1 if splits.numel() else 0
+        if (splits.storage_offset() + span) * splits.element_size() > splits.untyped_storage().nbytes():
+            raise ValueError("NVTE_GG_CONTIGUOUS splits exceed storage capacity")
+        splits = splits.tolist()
+    if not isinstance(splits, (list, tuple)) or len(splits) != groups:
+        raise ValueError("NVTE_GG_CONTIGUOUS requires one integer split per expert")
+    if any(isinstance(s, bool) or not isinstance(s, Integral) or s < 0 for s in splits):
+        raise ValueError("NVTE_GG_CONTIGUOUS splits must be nonnegative integers")
+    if total_tokens is not None and sum(splits) != total_tokens:
+        raise ValueError("NVTE_GG_CONTIGUOUS sum(m_splits) must match the ragged token length")
+    return list(splits)
+
+
+def _validate_contiguous_grouped_gemm(A, B, out, quantization_params, layout, m_splits=None):
+    if layout not in ("TN", "NN", "NT"):
+        raise ValueError("NVTE_GG_CONTIGUOUS requires TN, NN or NT layout")
+    groups = len(A)
+    if not groups or len(B) != groups or len(out) != groups:
+        raise ValueError("NVTE_GG_CONTIGUOUS requires nonempty, equal-length A/B/out lists")
+    if groups > 2**31 - 1:
+        raise ValueError("NVTE_GG_CONTIGUOUS group count exceeds INT_MAX")
+    if len(quantization_params) != groups or any(q is not None for q in quantization_params):
+        raise ValueError("NVTE_GG_CONTIGUOUS does not support quantization")
+    operands = (("A", A, (torch.bfloat16,)),
+                ("B", B, (torch.bfloat16,)),
+                ("out", out, (torch.bfloat16, torch.float32)))
+    for name, tensors, _ in operands:
+        if any(type(t) is not torch.Tensor for t in tensors):
+            raise ValueError(f"NVTE_GG_CONTIGUOUS {name} requires ordinary Tensor views")
+    device = A[0].device
+    if device.type == "cuda":
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                raise ValueError("NVTE_GG_CONTIGUOUS does not support CUDA graph capture")
+    for name, tensors, dtypes in operands:
+        storage = tensors[0].untyped_storage()
+        offset = tensors[0].storage_offset()
+        dtype = tensors[0].dtype
+        for i, t in enumerate(tensors):
+            if t.is_neg() or t.is_conj():
+                raise ValueError(f"NVTE_GG_CONTIGUOUS {name} group {i} has lazy negative/conjugate bits")
+            if (t.device != device or t.device.type != "cuda" or t.dtype != dtype
+                    or t.dtype not in dtypes or t.ndim != 2 or not t.is_contiguous()
+                    or t.untyped_storage()._cdata != storage._cdata
+                    or t.storage_offset() != offset):
+                raise ValueError(f"NVTE_GG_CONTIGUOUS {name} group {i} must be packed adjacent "
+                                 "views of one storage, with uniform device/dtype")
+            if any(dim > 2**31 - 1 - 256 for dim in t.shape):
+                raise ValueError(f"NVTE_GG_CONTIGUOUS {name} group {i} dimension overflow")
+            offset += t.numel()
+            if offset * t.element_size() > storage.nbytes():
+                raise ValueError(f"NVTE_GG_CONTIGUOUS {name} group {i} exceeds storage capacity")
+            if t.numel() and t.data_ptr() % 16:
+                raise ValueError(f"NVTE_GG_CONTIGUOUS {name} group {i} requires 16-byte alignment")
+    shapes = []
+    for i, (a, b, d) in enumerate(zip(A, B, out)):
+        m, k = (b.shape[1], b.shape[0]) if layout[1] == "T" else b.shape
+        n, ak = a.shape if layout[0] == "T" else (a.shape[1], a.shape[0])
+        if ak != k or tuple(d.shape) != (m, n):
+            raise ValueError(f"NVTE_GG_CONTIGUOUS {layout} group {i} incompatible matrix dimensions")
+        if m and n:
+            for axis, extent in zip("MNK", (m, n, k)):
+                if extent % 256:
+                    raise ValueError(f"NVTE_GG_CONTIGUOUS {layout} group {i} "
+                                     f"M/N/K={m}/{n}/{k}: {axis} must be a multiple of 256")
+        shapes.append((m, n, k))
+    fixed = (0, 1) if layout == "NT" else (1, 2)
+    if any(any(s[i] != shapes[0][i] for i in fixed) for s in shapes):
+        raise ValueError("NVTE_GG_CONTIGUOUS requires fixed M/N for NT, fixed N/K otherwise")
+    d_start = out[0].untyped_storage().data_ptr() + out[0].storage_offset() * out[0].element_size()
+    d_end = d_start + sum(d.numel() for d in out) * out[0].element_size()
+    for name, tensors in (("A", A), ("B", B)):
+        start = tensors[0].untyped_storage().data_ptr() + tensors[0].storage_offset() * tensors[0].element_size()
+        end = start + sum(t.numel() for t in tensors) * tensors[0].element_size()
+        if d_start < d_end and start < end and d_start < end and start < d_end:
+            raise ValueError(f"NVTE_GG_CONTIGUOUS out must not overlap {name} storage")
+    split_axis = 2 if layout == "NT" else 0
+    expected_splits = [s[split_axis] for s in shapes]
+    if m_splits is not None:
+        splits = _validate_contiguous_splits(m_splits, groups)
+        for i, (actual, expected) in enumerate(zip(splits, expected_splits)):
+            if actual != expected:
+                raise ValueError(f"NVTE_GG_CONTIGUOUS {layout} group {i} split {actual} "
+                                 f"does not match logical {'K' if split_axis == 2 else 'M'}={expected}")
+    return expected_splits
+
+
+def _contiguous_grouped_tensor_views(operand, name):
+    if isinstance(operand, (list, tuple)):
+        if any(type(t) not in (torch.Tensor, torch.nn.Parameter) for t in operand):
+            raise ValueError(f"NVTE_GG_CONTIGUOUS {name} requires ordinary Tensor views")
+        return [t.detach() if type(t) is torch.nn.Parameter else t for t in operand]
+    if not isinstance(operand, GroupedTensorStorage) or operand.quantizer is not None:
+        raise ValueError(f"NVTE_GG_CONTIGUOUS {name} requires unquantized GroupedTensor storage")
+    data = operand.rowwise_data
+    if (type(data) is not torch.Tensor or data.ndim != 1 or not data.is_cuda
+            or not data.is_contiguous() or data.dtype != operand.get_dtype()
+            or data.is_neg() or data.is_conj()):
+        raise ValueError(f"NVTE_GG_CONTIGUOUS {name} requires contiguous rowwise storage "
+                         "with matching logical and actual dtype and no lazy negative/conjugate bits")
+    with torch.cuda.device(data.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise ValueError("NVTE_GG_CONTIGUOUS does not support CUDA graph capture")
+    if (data.storage_offset() + data.numel()) * data.element_size() > data.untyped_storage().nbytes():
+        raise ValueError(f"NVTE_GG_CONTIGUOUS {name} rowwise data exceeds storage capacity")
+    groups = operand.num_tensors
+    logical = operand.logical_shape
+    if (not isinstance(groups, Integral) or not 0 < groups <= 2**31 - 1
+            or len(logical) != 2 or min(logical) < 0):
+        raise ValueError(f"NVTE_GG_CONTIGUOUS {name} invalid grouped logical shape/count")
+
+    def metadata(field, count):
+        value = getattr(operand, field)
+        if value is None:
+            return None
+        if (type(value) is not torch.Tensor or value.dtype != torch.int64
+                or value.device != data.device or value.ndim != 1 or value.numel() != count
+                or not value.is_contiguous() or value.is_neg() or value.is_conj()):
+            raise ValueError(f"NVTE_GG_CONTIGUOUS {name} invalid {field}")
+        if (value.storage_offset() + value.numel()) * value.element_size() > value.untyped_storage().nbytes():
+            raise ValueError(f"NVTE_GG_CONTIGUOUS {name} {field} exceeds storage capacity")
+        return value.tolist()
+
+    first = metadata("first_dims", groups)
+    last = metadata("last_dims", groups)
+    offsets = metadata("tensor_offsets", groups + 1)
+    if first is None:
+        if last is None and logical[0] % groups:
+            raise ValueError(f"NVTE_GG_CONTIGUOUS {name} logical rows do not divide experts")
+        first = [logical[0] // groups if last is None else logical[0]] * groups
+    if last is None:
+        last = [logical[1]] * groups
+    if min(first + last) < 0:
+        raise ValueError(f"NVTE_GG_CONTIGUOUS {name} negative expert dimension")
+    shapes = list(zip(first, last))
+    expected = [0]
+    for rows, cols in shapes:
+        expected.append(expected[-1] + rows * cols)
+    if (expected[-1] != data.numel() or expected[-1] != logical[0] * logical[1]
+            or (offsets is not None and offsets != expected)
+            or (operand.offsets is not None and list(operand.offsets) != expected)
+            or (operand.tensor_shapes is not None
+                and [tuple(s) for s in operand.tensor_shapes] != shapes)):
+        raise ValueError(f"NVTE_GG_CONTIGUOUS {name} ragged shape/offset/storage mismatch")
+    return [data.narrow(0, expected[i], rows * cols).view(rows, cols)
+            for i, (rows, cols) in enumerate(shapes)]
+
+
 def general_grouped_gemm(
     A: List[torch.Tensor],
     B: List[torch.Tensor],
@@ -295,6 +467,12 @@ def general_grouped_gemm(
     TN layout Grouped GEMM with fp8 inputs.
     """
     num_gemms = len(A)
+    if os.getenv("NVTE_GG_CONTIGUOUS", "0") == "1":
+        if single_output or use_bias or gelu or D_dtype is not None:
+            raise ValueError("NVTE_GG_CONTIGUOUS does not support single_output or fusion")
+        m_splits = _validate_contiguous_grouped_gemm(
+            A, B, out, quantization_params, layout, m_splits
+        )
 
     transa = layout[0] == "T"
     transb = layout[1] == "T"
@@ -477,15 +655,42 @@ def general_grouped_gemm_for_grouped_tensor(
     grad: bool = False,
     alpha: Optional[torch.Tensor] = None,
     beta: Optional[torch.Tensor] = None,
+    use_contiguous_grouped_gemm: Optional[bool] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
-    """
-    Grouped GEMM using GroupedTensor inputs.
-
-    This uses nvte_grouped_gemm and supports different per-matrix shapes.
-
-    The caller must ensure that GroupedTensor metadata is already compatible with the
-    underlying GEMM implementation (e.g., aligned offsets and output metadata layout).
-    """
+    """GroupedTensor GEMM, defaulting to the strict contiguous backend on PPU sm89."""
+    if use_contiguous_grouped_gemm is None:
+        if os.getenv("NVTE_GG_CONTIGUOUS", "0") == "1":
+            use_contiguous_grouped_gemm = True
+        elif getattr(torch.version, "ppu", None) is not None:
+            if isinstance(B, (list, tuple)):
+                if not B or not isinstance(B[0], torch.Tensor):
+                    raise ValueError("NVTE_GG_CONTIGUOUS requires nonempty Tensor B views")
+                data = B[0]
+            elif isinstance(B, GroupedTensorStorage):
+                data = B.rowwise_data if B.rowwise_data is not None else B.columnwise_data
+                if data is None:
+                    raise ValueError("NVTE_GG_CONTIGUOUS requires B storage")
+            else:
+                raise ValueError("NVTE_GG_CONTIGUOUS requires GroupedTensor B storage")
+            use_contiguous_grouped_gemm = _use_contiguous_grouped_gemm(data.device)
+        else:
+            use_contiguous_grouped_gemm = False
+    if use_contiguous_grouped_gemm:
+        if grad or bias is not None or bias_scale is not None or alpha is not None or beta is not None:
+            raise ValueError("NVTE_GG_CONTIGUOUS does not support fusion or custom alpha/beta")
+        a = _contiguous_grouped_tensor_views(A, "A")
+        b = _contiguous_grouped_tensor_views(B, "B")
+        d = _contiguous_grouped_tensor_views(out, "out")
+        splits = _validate_contiguous_grouped_gemm(a, b, d, [None] * len(a), layout)
+        with torch.cuda.device(a[0].device):
+            workspace = _get_grouped_cublas_workspace(a[0].device.index, layout)
+            sm_count = get_sm_count()
+        tex.te_contiguous_grouped_gemm(
+            a, layout[0] == "T", b, layout[1] == "T", d, splits,
+            workspace, accumulate,
+            sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count))),
+        )
+        return out
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     if grad:
         raise NotImplementedError("grad is not supported for grouped_tensor GEMM yet.")

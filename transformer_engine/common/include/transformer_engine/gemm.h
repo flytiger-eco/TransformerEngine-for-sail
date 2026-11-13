@@ -298,6 +298,10 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
                             bool accumulate, bool use_split_accumulator, int math_sm_count,
                             cudaStream_t stream);
 
+void nvte_contiguous_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor *D,
+                                  int num_gemms, bool transa, bool transb, NVTETensor *workspace,
+                                  bool accumulate, int math_sm_count, cudaStream_t stream);
+
 /*! \brief Return the required size in bytes for the setup workspace of grouped GEMM.
  *
  * The setup workspace stores pointer arrays and per-matrix dimension arrays used

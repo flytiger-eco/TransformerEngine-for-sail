@@ -7,6 +7,8 @@
 #include <pybind11/pybind11.h>
 
 #include <cstdlib>
+#include <climits>
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -163,6 +165,153 @@ inline bool is_plain_torch_tensor(py::handle tensor) {
   using namespace transformer_engine::pytorch::detail;
   return !(IsFloat8Tensor(obj) || IsMXFP8Tensor(obj) || IsFloat8BlockwiseQTensor(obj) ||
            IsNVFP4Tensor(obj));
+}
+
+// Validate ATen metadata before TensorWrapper discards strides and storage identity.
+void validate_contiguous_grouped_gemm(
+    const std::vector<pybind11::handle>& A, bool transa,
+    const std::vector<pybind11::handle>& B, bool transb,
+    const std::optional<std::vector<at::Tensor>>& D, transformer_engine::DType D_type,
+    const std::vector<int64_t>& m_splits, const std::vector<at::Tensor>& bias,
+    bool single_output, const std::vector<at::Tensor>& pre_gelu_out,
+    const std::vector<at::Tensor>& workspace, size_t workspaceSize) {
+  using transformer_engine::DType;
+  NVTE_CHECK(!single_output, "NVTE_GG_CONTIGUOUS does not support single_output.");
+  NVTE_CHECK(!(transa && transb), "NVTE_GG_CONTIGUOUS does not support TT layout.");
+  NVTE_CHECK(!A.empty() && A.size() == B.size() && bias.size() == A.size() &&
+                 pre_gelu_out.size() == A.size() && D.has_value() && D->size() == A.size(),
+             "NVTE_GG_CONTIGUOUS requires matching nonempty tensor lists and explicit D.");
+  NVTE_CHECK(A.size() <= INT_MAX, "NVTE_GG_CONTIGUOUS group count exceeds INT_MAX.");
+  NVTE_CHECK(m_splits.empty() || m_splits.size() == A.size(),
+             "NVTE_GG_CONTIGUOUS splits must be omitted or have one entry per group.");
+  NVTE_CHECK(D_type == DType::kBFloat16 || D_type == DType::kFloat32,
+             "NVTE_GG_CONTIGUOUS requires bf16 or fp32 D_type.");
+  NVTE_CHECK(!workspace.empty(), "NVTE_GG_CONTIGUOUS requires device workspace.");
+  for (const auto& ws : workspace) {
+    NVTE_CHECK(ws.defined() && ws.is_cuda() && ws.scalar_type() == at::kByte && ws.dim() == 1 &&
+                   ws.is_contiguous() && ws.has_storage() && !ws.is_neg() && !ws.is_conj() &&
+                   !ws.key_set().has(c10::DispatchKey::Python) &&
+                   ws.device() == workspace[0].device(),
+               "NVTE_GG_CONTIGUOUS requires a contiguous rank-1 CUDA byte workspace.");
+    NVTE_CHECK(ws.storage_offset() >= 0,
+               "NVTE_GG_CONTIGUOUS workspace has a negative storage_offset.");
+    const auto offset = static_cast<uint64_t>(ws.storage_offset());
+    const auto capacity = ws.storage().nbytes();
+    NVTE_CHECK(offset <= capacity && static_cast<uint64_t>(ws.numel()) <= capacity - offset &&
+                   workspaceSize <= static_cast<size_t>(ws.numel()),
+               "NVTE_GG_CONTIGUOUS workspaceSize exceeds the actual workspace capacity.");
+  }
+
+  struct PackedStorage {
+    const void* impl = nullptr;
+    uint64_t next_offset = 0;
+  };
+  PackedStorage a_storage, b_storage, d_storage;
+  auto check_tensor = [&](const at::Tensor& tensor, const char* operand, size_t group,
+                          at::ScalarType dtype, PackedStorage& packed) {
+    NVTE_CHECK(tensor.defined() && tensor.layout() == at::kStrided && !tensor.is_quantized() &&
+                   tensor.has_storage() && !tensor.is_neg() && !tensor.is_conj() &&
+                   !tensor.key_set().has(c10::DispatchKey::Python),
+               "NVTE_GG_CONTIGUOUS group ", group, " ", operand,
+               " requires ordinary unquantized ATen storage without lazy negative/conjugate bits.");
+    NVTE_CHECK(tensor.dim() == 2 && tensor.is_cuda() &&
+                   tensor.device() == workspace[0].device() && tensor.scalar_type() == dtype &&
+                   tensor.is_contiguous(),
+               "NVTE_GG_CONTIGUOUS group ", group, " ", operand,
+               " requires contiguous rank-2 CUDA storage on the workspace device with dtype ",
+               c10::toString(dtype), ".");
+    for (int64_t dim : tensor.sizes()) {
+      NVTE_CHECK(dim >= 0 && dim <= INT_MAX - 256,
+                 "NVTE_GG_CONTIGUOUS group ", group, " ", operand,
+                 " dimension exceeds INT_MAX-256.");
+    }
+    NVTE_CHECK(tensor.storage_offset() >= 0,
+               "NVTE_GG_CONTIGUOUS group ", group, " ", operand,
+               " has a negative storage_offset.");
+    const auto storage = tensor.storage();
+    const auto offset = static_cast<uint64_t>(tensor.storage_offset());
+    const auto count = static_cast<uint64_t>(tensor.numel());
+    const auto capacity = storage.nbytes() / tensor.element_size();
+    NVTE_CHECK(offset <= capacity && count <= capacity - offset,
+               "NVTE_GG_CONTIGUOUS group ", group, " ", operand,
+               " view exceeds its storage capacity.");
+    if (group == 0) {
+      packed.impl = storage.unsafeGetStorageImpl();
+      packed.next_offset = offset;
+    }
+    // Empty views must also belong to the allocation at the exact packed offset.
+    NVTE_CHECK(storage.unsafeGetStorageImpl() == packed.impl && offset == packed.next_offset,
+               "NVTE_GG_CONTIGUOUS group ", group, " ", operand,
+               " must share one storage allocation with adjacent storage_offset values.");
+    packed.next_offset = offset + count;  // Bounded by storage capacity above.
+    if (count != 0) {
+      const auto ptr = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+      NVTE_CHECK(ptr != 0 && ptr % 16 == 0,
+                 "NVTE_GG_CONTIGUOUS group ", group, " ", operand,
+                 " requires a nonnull 16-byte aligned data pointer.");
+    }
+  };
+  auto ordinary_tensor = [](pybind11::handle tensor, const char* operand, size_t group) {
+    for (const auto& converter : transformer_engine::pytorch::detail::custom_types_converters) {
+      NVTE_CHECK(!std::get<0>(converter)(tensor.ptr()), "NVTE_GG_CONTIGUOUS group ", group, " ",
+                 operand, " requires ordinary unquantized ATen storage.");
+    }
+    try {
+      return pybind11::cast<at::Tensor>(tensor);
+    } catch (const pybind11::cast_error&) {
+      NVTE_ERROR("NVTE_GG_CONTIGUOUS group ", group, " ", operand,
+                 " must be convertible to an ordinary ATen Tensor.");
+    }
+  };
+
+  const bool nt = !transa && transb;
+  int64_t first_m = 0, first_n = 0, first_k = 0;
+  for (size_t i = 0; i < A.size(); ++i) {
+    NVTE_CHECK(bias[i].defined() && pre_gelu_out[i].defined() && bias[i].numel() == 0 &&
+                   pre_gelu_out[i].numel() == 0,
+               "NVTE_GG_CONTIGUOUS group ", i, " does not support bias or pre_gelu fusion.");
+    const auto a = ordinary_tensor(A[i], "A", i);
+    const auto b = ordinary_tensor(B[i], "B", i);
+    const auto& d = (*D)[i];
+    check_tensor(a, "A", i, at::kBFloat16, a_storage);
+    check_tensor(b, "B", i, at::kBFloat16, b_storage);
+    check_tensor(d, "D", i, D_type == DType::kBFloat16 ? at::kBFloat16 : at::kFloat, d_storage);
+
+    // TE's caller order is D = op(B) * op(A), not op(A) * op(B).
+    const int64_t m = b.size(transb ? 1 : 0), k = b.size(transb ? 0 : 1);
+    const int64_t n = a.size(transa ? 0 : 1), ak = a.size(transa ? 1 : 0);
+    NVTE_CHECK(ak == k && d.size(0) == m && d.size(1) == n,
+               "NVTE_GG_CONTIGUOUS group ", i, " has incompatible matrix dimensions.");
+    if (i == 0) {
+      first_m = m;
+      first_n = n;
+      first_k = k;
+    }
+    NVTE_CHECK(n == first_n && (nt ? m == first_m : k == first_k),
+               "NVTE_GG_CONTIGUOUS group ", i,
+               " requires fixed M/N for NT or fixed N/K otherwise.");
+    if (!m_splits.empty()) {
+      NVTE_CHECK(m_splits[i] >= 0 && m_splits[i] == (nt ? k : m),
+                 "NVTE_GG_CONTIGUOUS group ", i, " split must match K for NT or M otherwise.");
+    }
+    if (m > 0 && n > 0) {
+      NVTE_CHECK(m % 256 == 0 && n % 256 == 0 && k % 256 == 0,
+                 "NVTE_GG_CONTIGUOUS ", nt ? "NT" : transa ? "TN" : "NN",
+                 " group ", i, " logical (M,N,K)=(", m, ",", n, ",", k,
+                 ") requires M, N, and K divisible by 256 for nonempty output.");
+    }
+    for (const auto& ws : workspace) {
+      const auto ws_start = reinterpret_cast<uintptr_t>(ws.data_ptr());
+      for (const auto& tensor : {a, b, d}) {
+        const auto start = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+        const auto bytes = static_cast<size_t>(tensor.numel()) * tensor.element_size();
+        NVTE_CHECK(bytes == 0 || workspaceSize == 0 ||
+                       (ws_start <= start ? workspaceSize <= start - ws_start
+                                          : bytes <= ws_start - start),
+                   "NVTE_GG_CONTIGUOUS workspace must not overlap operand storage.");
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -608,6 +757,13 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<at::Tensor> bias, DType bias_type, bool single_output,
     std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count) {
+  if (transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1") {
+    NVTE_CHECK(py::isinstance<py::list>(B) || py::isinstance<py::tuple>(B),
+               "NVTE_GG_CONTIGUOUS requires a packed tensor B list.");
+    const auto packed_B = B.cast<std::vector<py::handle>>();
+    validate_contiguous_grouped_gemm(A, transa, packed_B, transb, D, D_type, m_splits, bias,
+                                     single_output, pre_gelu_out, workspace, workspaceSize);
+  }
   if (single_output && D == std::nullopt) {
     NVTE_ERROR("not implemented, D should be allocated for single output case.");
   }
@@ -779,7 +935,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       }
     }
 
-    if (te_A->numel() == 0 || te_B->numel() == 0) {
+    if ((te_A->numel() == 0 || te_B->numel() == 0) &&
+        transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1") {
       if (!accumulate) {
         if (out_slice_ptr != nullptr) {
           // The slice lies inside (*D)[0], so pin the device instead of querying the pointer.
@@ -903,6 +1060,48 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
   return bias;
 }
 
+void te_contiguous_grouped_gemm(std::vector<py::handle> A, bool transa,
+                                std::vector<py::handle> B, bool transb,
+                                std::vector<at::Tensor> D, std::vector<int64_t> m_splits,
+                                at::Tensor workspace, bool accumulate, int math_sm_count) {
+  NVTE_CHECK(!D.empty() && D[0].defined(),
+             "NVTE_GG_CONTIGUOUS requires nonempty explicit output tensors.");
+  NVTE_CHECK(workspace.defined(), "NVTE_GG_CONTIGUOUS requires device workspace.");
+  const auto empty = at::empty({0}, at::TensorOptions().dtype(at::kByte));
+  const std::vector<at::Tensor> fusion_placeholders(A.size(), empty);
+  validate_contiguous_grouped_gemm(
+      A, transa, B, transb, D, GetTransformerEngineDType(D[0].scalar_type()),
+      m_splits, fusion_placeholders, false, fusion_placeholders, {workspace},
+      static_cast<size_t>(workspace.numel()));
+  at::cuda::CUDAGuard device_guard(workspace.device());
+
+  std::vector<TensorWrapper> te_A_wrappers, te_B_wrappers, te_D_wrappers;
+  std::vector<NVTETensor> te_A_vector, te_B_vector, te_D_vector;
+  te_A_wrappers.reserve(A.size());
+  te_B_wrappers.reserve(A.size());
+  te_D_wrappers.reserve(A.size());
+  te_A_vector.reserve(A.size());
+  te_B_vector.reserve(A.size());
+  te_D_vector.reserve(A.size());
+  const auto none = py::none();
+  for (size_t i = 0; i < A.size(); ++i) {
+    te_A_wrappers.emplace_back(makeTransformerEngineTensor(A[i], none));
+    te_B_wrappers.emplace_back(makeTransformerEngineTensor(B[i], none));
+    te_D_wrappers.emplace_back(makeTransformerEngineTensor(D[i]));
+    te_A_vector.emplace_back(te_A_wrappers.back().data());
+    te_B_vector.emplace_back(te_B_wrappers.back().data());
+    te_D_vector.emplace_back(te_D_wrappers.back().data());
+  }
+  auto te_workspace = makeTransformerEngineTensor(workspace);
+  auto workspace_handle = te_workspace.data();
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_contiguous_grouped_gemm(
+        te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
+        static_cast<int>(A.size()), transa, transb, &workspace_handle,
+        accumulate, math_sm_count, at::cuda::getCurrentCUDAStream());
+  });
+}
+
 py::object te_general_grouped_gemm_for_grouped_tensor(
     py::handle A, bool transa, py::handle B, bool transb, py::handle D, py::object bias,
     std::optional<at::Tensor> bias_scale, at::Tensor alpha, at::Tensor beta,
@@ -910,6 +1109,9 @@ py::object te_general_grouped_gemm_for_grouped_tensor(
     int math_sm_count) {
   using namespace transformer_engine::pytorch::detail;
 
+  NVTE_CHECK(transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1",
+             "NVTE_GG_CONTIGUOUS requires the validated packed-list adapter, not the cuBLAS "
+             "GroupedTensor extension entry.");
   init_extension();
 
   // Ensure that cublasLt handle is created on the correct device,
@@ -974,6 +1176,9 @@ py::object te_general_grouped_gemm_for_discrete_in(py::handle A, bool transa, py
                                                    bool use_split_accumulator, int math_sm_count) {
   using namespace transformer_engine::pytorch::detail;
 
+  NVTE_CHECK(transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1",
+             "NVTE_GG_CONTIGUOUS requires the validated packed-list adapter, not the cuBLAS "
+             "GroupedTensor extension entry.");
   init_extension();
 
   // Ensure that cublasLt handle is created on the correct device,
@@ -1051,6 +1256,9 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
                                                     bool use_split_accumulator, int math_sm_count) {
   using namespace transformer_engine::pytorch::detail;
 
+  NVTE_CHECK(transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") != "1",
+             "NVTE_GG_CONTIGUOUS requires the validated packed-list adapter, not the cuBLAS "
+             "GroupedTensor extension entry.");
   init_extension();
 
   // Ensure that cublasLt handle is created on the correct device,

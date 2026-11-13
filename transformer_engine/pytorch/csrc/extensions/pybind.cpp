@@ -19,6 +19,7 @@
 #include "../common.h"
 #include "../extensions.h"
 #include "common.h"
+#include "common/util/system.h"
 
 namespace transformer_engine::pytorch {
 
@@ -355,10 +356,57 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("quantizer_list"), py::arg("disable_bulk_allocation") = false);
   m.def("get_grouped_gemm_setup_workspace_size", &nvte_get_grouped_gemm_setup_workspace_size,
         "Required workspace size for grouped GEMM setup");
-  m.def("te_general_grouped_gemm", &transformer_engine::pytorch::te_general_grouped_gemm,
+  m.def("te_general_grouped_gemm",
+        [](std::vector<py::handle> A, bool transa, py::handle B, bool transb,
+           std::optional<std::vector<at::Tensor>> D, transformer_engine::DType D_type,
+           py::object raw_splits, std::vector<at::Tensor> bias,
+           transformer_engine::DType bias_type, bool single_output,
+           std::vector<at::Tensor> pre_gelu_out, bool grad,
+           std::vector<at::Tensor> workspace, size_t workspaceSize, bool accumulate,
+           bool use_split_accumulator, int math_sm_count) {
+          const bool contiguous =
+              transformer_engine::getenv<std::string>("NVTE_GG_CONTIGUOUS") == "1";
+          if (contiguous && !raw_splits.is_none()) {
+            NVTE_CHECK(py::isinstance<py::list>(raw_splits) ||
+                           py::isinstance<py::tuple>(raw_splits),
+                       "NVTE_GG_CONTIGUOUS requires an integer split list.");
+            auto integral = py::module_::import("numbers").attr("Integral");
+            for (auto split : raw_splits) {
+              NVTE_CHECK(!PyBool_Check(split.ptr()) && py::isinstance(split, integral),
+                         "NVTE_GG_CONTIGUOUS splits must be nonnegative integers, not bools.");
+            }
+          }
+          auto splits = contiguous && raw_splits.is_none()
+                            ? std::vector<int64_t>{}
+                            : raw_splits.cast<std::vector<int64_t>>();
+          return transformer_engine::pytorch::te_general_grouped_gemm(
+              A, transa, B, transb, D, D_type, splits, bias, bias_type, single_output,
+              pre_gelu_out, grad, workspace, workspaceSize, accumulate,
+              use_split_accumulator, math_sm_count);
+        },
         "Grouped GEMM");
   m.def("te_general_grouped_gemm_single_input",
         &transformer_engine::pytorch::te_general_grouped_gemm, "Grouped GEMM with unsplit input");
+  m.def("te_contiguous_grouped_gemm",
+        [](std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
+           std::vector<at::Tensor> D, py::object raw_splits, at::Tensor workspace,
+           bool accumulate, int math_sm_count) {
+          std::vector<int64_t> splits;
+          if (!raw_splits.is_none()) {
+            NVTE_CHECK(py::isinstance<py::list>(raw_splits) ||
+                           py::isinstance<py::tuple>(raw_splits),
+                       "NVTE_GG_CONTIGUOUS requires an integer split list.");
+            auto integral = py::module_::import("numbers").attr("Integral");
+            for (auto split : raw_splits) {
+              NVTE_CHECK(!PyBool_Check(split.ptr()) && py::isinstance(split, integral),
+                         "NVTE_GG_CONTIGUOUS splits must be nonnegative integers, not bools.");
+            }
+            splits = raw_splits.cast<std::vector<int64_t>>();
+          }
+          transformer_engine::pytorch::te_contiguous_grouped_gemm(
+              A, transa, B, transb, D, splits, workspace, accumulate, math_sm_count);
+        },
+        "Contiguous grouped GEMM");
   m.def("te_general_grouped_gemm_for_grouped_tensor",
         &transformer_engine::pytorch::te_general_grouped_gemm_for_grouped_tensor,
         "Grouped GEMM for GroupedTensor");
