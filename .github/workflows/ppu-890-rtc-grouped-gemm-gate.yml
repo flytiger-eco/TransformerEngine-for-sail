@@ -142,7 +142,7 @@ jobs:
           print(f'::notice::RTC GroupGemm: run={run}, policy={policy}, base={base}, head={head}')
           PY
 
-      - name: 查找 ppu-890-build 产出的 head wheel（可选加速）
+      - name: 等待 ppu-890-build 产出 head wheel（可选加速）
         id: buildwheel
         if: steps.scope.outputs.run == 'true'
         shell: bash
@@ -151,16 +151,47 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # 反查同一 head SHA 上最近成功的 ppu-890-build run；gate 与 build 由同一 push 同时触发，
-          # build 可能尚未完成——找不到就留空，pod 内回退本地构建，gate 不因等待 build 而失败。
-          RUN_KEY=$(gh api \
-            "repos/${{ github.repository }}/actions/workflows/ppu-build-890.yml/runs?head_sha=${HEAD_SHA}&status=success&per_page=10" \
-            --jq '[.workflow_runs[] | select(.event == "pull_request")] | first | "\(.id)-\(.run_attempt)"' || true)
-          if [[ -n "${RUN_KEY}" && "${RUN_KEY}" != "null" ]]; then
+          # gate 与 build 由同一 push 同时触发，build 需 ~15 分钟；在 runner（CPU）上轮询等待，
+          # 不占 PPU 资源。查到成功的 build run 即用其 NAS 产物；超时/失败/被取消都留空，
+          # pod 内回退本地构建，gate 不因等待 build 而失败。
+          # 注意等待上限须小于 cluster-task 240 分钟超时，也须小于 build 产物被后续 re-run 覆盖的窗口。
+          WAIT_SECONDS=$((25 * 60))
+          POLL_INTERVAL=30
+          DEADLINE=$((SECONDS + WAIT_SECONDS))
+          RUN_KEY=""
+          BUILD_RUN_STATUS=""
+          while (( SECONDS < DEADLINE )); do
+            # 先看本 head SHA 的 build run 的最新状态（含 in_progress/queued）
+            BUILD_RUN_STATUS=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/ppu-build-890.yml/runs?head_sha=${HEAD_SHA}&per_page=10" \
+              --jq '[.workflow_runs[] | select(.event == "pull_request")] | first | "\(.id) \(.run_attempt) \(.status) \(.conclusion)"' || true)
+            if [[ -z "${BUILD_RUN_STATUS}" || "${BUILD_RUN_STATUS}" == "null" ]]; then
+              # 尚无 build run（极少见：触发顺序问题）；继续等到超时
+              echo "::notice::暂未发现 ppu-890-build run，继续等待"
+            else
+              read -r RUN_ID RUN_ATTEMPT STATUS CONCLUSION <<< "${BUILD_RUN_STATUS}"
+              case "${STATUS}" in
+                completed)
+                  if [[ "${CONCLUSION}" == "success" ]]; then
+                    RUN_KEY="${RUN_ID}-${RUN_ATTEMPT}"
+                    echo "::notice::ppu-890-build 已成功（${RUN_KEY}），复用 wheel：te-ci/${RUN_KEY}"
+                    break
+                  fi
+                  # build 失败/取消：不再等，直接回退本地构建
+                  echo "::notice::ppu-890-build 已结束（${STATUS}/${CONCLUSION}），head arm 将本地构建"
+                  break
+                  ;;
+                *)
+                  echo "::notice::ppu-890-build 进行中（${STATUS}），等待..."
+                  ;;
+              esac
+            fi
+            sleep "${POLL_INTERVAL}"
+          done
+          if [[ -n "${RUN_KEY}" ]]; then
             echo "subdir=te-ci/${RUN_KEY}" >> "$GITHUB_OUTPUT"
-            echo "::notice::复用 ppu-890-build wheel：te-ci/${RUN_KEY}"
           else
-            echo "::notice::未找到已完成的 ppu-890-build run，head arm 将本地构建"
+            echo "::notice::等待 ppu-890-build 超时或其未成功，head arm 将本地构建"
           fi
 
       - name: 同一 890P 上构建和配对测试 base/head
