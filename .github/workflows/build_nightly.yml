@@ -19,6 +19,8 @@ defaults:
 env:
   ARTIFACT_DIR: "dist"
   WHEEL_NAME: "transformer_engine-2.18.0-cp312-cp312-linux_x86_64.whl"
+  PKG_PREFIX: "transformer_engine-2.18-oe-cuda13.0-pytorch"
+  PKG_SUFFIX: "-ubuntu2404-py312"
   NVTE_NO_LOCAL_VERSION: "1"
   NVTE_FRAMEWORK: "pytorch"
   NVTE_WITH_NCCL_EP: "0"
@@ -45,10 +47,21 @@ env:
 
 jobs:
   build:
+    name: "Build PPU package (pytorch ${{ matrix.pytorch_version }})"
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    env:
+      PYTORCH_VERSION: ${{ matrix.pytorch_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pytorch_version: "2.11.0"
+            image: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001"
+          - pytorch_version: "2.13.0"
+            image: "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
     container:
-      image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001
+      image: ${{ matrix.image }}
       options: --user root
     steps:
       - name: "Check out source code and submodules"
@@ -66,7 +79,7 @@ jobs:
           GIT_CONFIG_VALUE_0: ${{ github.workspace }}
         run: |
           mkdir -p "${ARTIFACT_DIR}"
-          git rev-parse HEAD > "${ARTIFACT_DIR}/commit"
+          git rev-parse HEAD > "${ARTIFACT_DIR}/commit-pytorch${PYTORCH_VERSION}"
           {
             ${{ env.ENV_SETUP }}
             pip3 install -U packaging==24.2 pybind11==3.1.0
@@ -74,23 +87,38 @@ jobs:
             pip3 wheel -v --no-build-isolation --no-deps . -w "${ARTIFACT_DIR}"
           } 2>&1 | tee "${ARTIFACT_DIR}/ppu_build.log"
           if [[ ! -f "${ARTIFACT_DIR}/${WHEEL_NAME}" ]]; then
-            echo "Error: Expected wheel ${WHEEL_NAME} not found; aborting upload." >&2
+            echo "Error: Expected wheel ${WHEEL_NAME} not found; aborting package creation." >&2
             exit 1
           fi
           ls -lh "${ARTIFACT_DIR}"
 
-      - name: "Upload wheels and source revision"
+      - name: "Package wheel into a versioned tarball"
+        run: |
+          set -euo pipefail
+          pkg_name="${PKG_PREFIX}${PYTORCH_VERSION}${PKG_SUFFIX}.tar.gz"
+          pkg_path="${ARTIFACT_DIR}/${pkg_name}"
+          tar -czf "${pkg_path}" -C "${ARTIFACT_DIR}" "${WHEEL_NAME}"
+          if ! tar -tzf "${pkg_path}" | grep -qx "${WHEEL_NAME}"; then
+            echo "Error: ${pkg_name} does not contain ${WHEEL_NAME}." >&2
+            exit 1
+          fi
+          # Only the tarball is published; drop the bare wheel from the artifact set.
+          rm -f "${ARTIFACT_DIR}/${WHEEL_NAME}"
+          echo "Package: ${pkg_name}"
+          ls -lh "${ARTIFACT_DIR}"
+
+      - name: "Upload package and source revision"
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.WHEEL_NAME }}
+          name: nightly-pkg-pytorch${{ matrix.pytorch_version }}
           path: |
-            dist/${{ env.WHEEL_NAME }}
-            dist/commit
+            dist/*.tar.gz
+            dist/commit-pytorch*
           if-no-files-found: error
           retention-days: 7
 
   publish:
-    name: "Publish wheels to the nightly-build release"
+    name: "Publish packages to the nightly-build release"
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -104,28 +132,30 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: "nightly-build"
     steps:
-      - name: "Download wheels and source revision from this build"
+      - name: "Download packages from this build"
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.WHEEL_NAME }}
+          pattern: nightly-pkg-*
           path: dist
+          merge-multiple: true
 
-      - name: "Upload assets to the nightly-build release"
+      - name: "Upload packages to the nightly-build release"
         run: |
           set -euo pipefail
-          wheel_asset="${ARTIFACT_DIR}/${WHEEL_NAME}"
-          if [[ ! -f "${wheel_asset}" ]]; then
-            echo "Error: Expected wheel ${WHEEL_NAME} not found; aborting release upload." >&2
+          shopt -s nullglob
+          assets=("${ARTIFACT_DIR}"/*.tar.gz)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "Error: No package found under ${ARTIFACT_DIR}; aborting release upload." >&2
             exit 1
           fi
-          echo "Release asset: ${WHEEL_NAME}"
+          echo "Release assets: ${assets[*]}"
           if ! gh release view "${RELEASE_TAG}" > /dev/null 2>&1; then
             echo "Release ${RELEASE_TAG} not found; creating it."
             gh release create "${RELEASE_TAG}" \
               --target "${GITHUB_SHA}" \
               --title "Nightly Build" \
-              --notes "Rolling release holding the latest nightly PPU wheels." \
+              --notes "Rolling release holding the latest nightly PPU packages." \
               --prerelease
           fi
           echo "Target release: ${RELEASE_TAG}"
-          gh release upload "${RELEASE_TAG}" "${wheel_asset}" --clobber
+          gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
