@@ -185,7 +185,25 @@ PY
 }
 
 build_arm base "$SCRATCH/base" "$BASE_SHA" "${WHEEL_REUSE:+$WHEEL_REUSE/cache-$BASE_SHA}" 2>&1 | tee "$OUT/base-build.log"
-build_arm head "$SOURCE" "$(git -C "$SOURCE" rev-parse HEAD)" "${WHEEL_REUSE:+$WHEEL_REUSE/build-$(git -C "$SOURCE" rev-parse HEAD)}" 2>&1 | tee "$OUT/head-build.log"
+
+# head：等待并行的 ppu-890-build wheel（若在等待中）。workflow 的后台子 shell 正在把
+# build 产物发布到复用目录（wheels/build-<sha>/）；等它完成（pid 文件消失或产物就绪），
+# 再调 build_arm head——复用命中则跳过本地编译，未命中（超时/失败）则本地构建。
+HEAD_SHA=$(git -C "$SOURCE" rev-parse HEAD)
+if [[ -n "${WHEEL_REUSE:-}" && -f "$OUT/.head-wait.pid" ]]; then
+    WAIT_PID=$(cat "$OUT/.head-wait.pid")
+    while kill -0 "$WAIT_PID" 2>/dev/null; do
+        sleep 10
+    done
+    # 后台等待已结束：看结果决定继续复用还是回退（build_arm 内部会校验 commit）。
+    if [[ -f "$WHEEL_REUSE/build-$HEAD_SHA/commit" ]] \
+       && ls "$WHEEL_REUSE/build-$HEAD_SHA"/transformer_engine*.whl >/dev/null 2>&1; then
+        echo "[RTC CI] head 等待到 ppu-890-build wheel：$WHEEL_REUSE/build-$HEAD_SHA"
+    else
+        echo "[RTC CI] head 未等到 build wheel（超时/失败），head arm 本地构建"
+    fi
+fi
+build_arm head "$SOURCE" "$HEAD_SHA" "${WHEEL_REUSE:+$WHEEL_REUSE/build-$HEAD_SHA}" 2>&1 | tee "$OUT/head-build.log"
 
 # 固定从 head 取同一份 harness/case；不能用 base 自己的旧测试替代。
 cd "$SCRATCH"

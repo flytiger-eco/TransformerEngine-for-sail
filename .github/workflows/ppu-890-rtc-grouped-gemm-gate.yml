@@ -142,7 +142,7 @@ jobs:
           print(f'::notice::RTC GroupGemm: run={run}, policy={policy}, base={base}, head={head}')
           PY
 
-      - name: 等待 ppu-890-build 产出 head wheel（可选加速）
+      - name: 定位 ppu-890-build 的产物目录（可选加速）
         id: buildwheel
         if: steps.scope.outputs.run == 'true'
         shell: bash
@@ -151,57 +151,44 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # gate 与 build 由同一 push 同时触发，build 需 ~15 分钟；在 runner（CPU）上轮询等待，
-          # 不占 PPU 资源。查到成功的 build run 即用其 NAS 产物；超时/失败/被取消都留空，
-          # pod 内回退本地构建，gate 不因等待 build 而失败。
-          # 注意：runner 容器（actions-runner 镜像）没有 gh CLI，用 python + REST API 轮询。
-          # 等待上限须小于 cluster-task 240 分钟超时，也须小于 build 产物被后续 re-run 覆盖的窗口。
+          # 同一 push 同时触发 gate 和 ppu-890-build；build 产物约 15~55 分钟后才出现在 NAS。
+          # 这里不等待：只把「候选 build 产物目录」传给 pod，由 pod 内 test.sh 边编译 base 边
+          # 轮询该目录（commit 文件由 build 最后写入，出现即构建完成），head 等 wheel 出现
+          # 或超时后回退本地构建。等待在 pod 内与 base 编译并行，不额外占 PPU 时间。
+          # 注意：runner 容器（actions-runner 镜像）没有 gh CLI，用 python + REST API 查询。
           python3 - <<'PY'
-          import json, os, time, urllib.request
+          import json, os, urllib.request
 
           token = os.environ['GH_TOKEN']
           repo = os.environ['GITHUB_REPOSITORY']
           head_sha = os.environ['HEAD_SHA']
           api = f"https://api.github.com/repos/{repo}/actions/workflows/ppu-build-890.yml/runs?head_sha={head_sha}&per_page=10"
 
-          import functools
-          print = functools.partial(print, flush=True)
-
-          def query():
-              req = urllib.request.Request(api, headers={
-                  'Authorization': f'Bearer {token}',
-                  'Accept': 'application/vnd.github+json',
-              })
-              with urllib.request.urlopen(req, timeout=30) as resp:
-                  runs = json.load(resp)['workflow_runs']
-              pr_runs = [r for r in runs if r['event'] == 'pull_request']
-              return pr_runs[0] if pr_runs else None
-
-          deadline = time.time() + 60 * 60
-          subdir = ''
-          while time.time() < deadline:
-              try:
-                  run = query()
-              except Exception as e:
-                  print(f'::notice::查询 ppu-890-build 失败（{e}），重试...')
-                  run = None
-              if run is None:
-                  print('::notice::暂未发现 ppu-890-build run，继续等待')
-              elif run['status'] == 'completed':
-                  if run['conclusion'] == 'success':
-                      subdir = f"te-ci/{run['id']}-{run['run_attempt']}"
-                      print(f"::notice::ppu-890-build 已成功（{run['id']}-{run['run_attempt']}），复用 wheel：{subdir}")
-                  else:
-                      print(f"::notice::ppu-890-build 已结束（{run['status']}/{run['conclusion']}），head arm 将本地构建")
-                  break
+          req = urllib.request.Request(api, headers={
+              'Authorization': f'Bearer {token}',
+              'Accept': 'application/vnd.github+json',
+          })
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              runs = json.load(resp)['workflow_runs']
+          pr_runs = [r for r in runs if r['event'] == 'pull_request']
+          run = pr_runs[0] if pr_runs else None
+          if run is None:
+              print('::notice::暂未发现 ppu-890-build run，head arm 将本地构建')
+          elif run['status'] == 'completed':
+              if run['conclusion'] == 'success':
+                  subdir = f"te-ci/{run['id']}-{run['run_attempt']}"
+                  print(f"::notice::ppu-890-build 已成功（{run['id']}-{run['run_attempt']}），复用 wheel：{subdir}")
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                      output.write(f'subdir={subdir}\n')
               else:
-                  print(f"::notice::ppu-890-build 进行中（{run['status']}），等待...")
-              time.sleep(30)
-          if subdir:
+                  print(f"::notice::ppu-890-build 已结束（{run['status']}/{run['conclusion']}），head arm 将本地构建")
+          else:
+              # build 进行中：pod 内轮询等待（与 base 编译并行），上限 60 分钟。
+              subdir = f"te-ci/{run['id']}-{run['run_attempt']}"
+              print(f"::notice::ppu-890-build 进行中（{run['status']}），pod 内等待 wheel：{subdir}")
               with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
                   output.write(f'subdir={subdir}\n')
-          else:
-              print('::notice::等待 ppu-890-build 超时或其未成功，head arm 将本地构建')
+                  output.write('wait_in_pod=true\n')
           PY
 
       - name: 同一 890P 上构建和配对测试 base/head
@@ -235,19 +222,50 @@ jobs:
             git -C "$SRC" remote add origin '${{ env.TE_REPO }}'
             git -C "$SRC" fetch --no-tags origin '${{ steps.scope.outputs.head_sha }}' '${{ steps.scope.outputs.base_sha }}'
             git -C "$SRC" checkout --detach '${{ steps.scope.outputs.head_sha }}'
-            # head 侧：若 ppu-890-build 已产出同一 head SHA 的 wheel，则拷入复用目录跳过本地编译。
-            # 拷贝可能被并发的 NAS 清理打断（build 产物生命周期不归 gate 管）：
-            # 失败只丢弃已拷内容并回退本地构建，绝不让可选加速中断 gate。
+            # head 侧：若 ppu-890-build 已产出（或将产出）同一 head SHA 的 wheel，等待其出现并
+            # 拷入复用目录，head arm 跳过本地编译。等待与 base 编译并行（后台子 shell）；
+            # 拷贝可能被并发的 NAS 清理打断（build 产物生命周期不归 gate 管）：失败只丢弃
+            # 已拷内容并回退本地构建，绝不让可选加速中断 gate。
             REUSE='${{ env.POD_WHEEL_REUSE }}'
             BUILD_SUBDIR='${{ steps.buildwheel.outputs.subdir }}'
+            HEAD_WAIT_LOG="$OUT/head-wait.log"
             if [[ -n "${BUILD_SUBDIR}" ]]; then
-              SRC_DIR="/mnt/wl_nas/${BUILD_SUBDIR}"
-              if [[ -f "${SRC_DIR}/commit" ]] && grep -qx '${{ steps.scope.outputs.head_sha }}' "${SRC_DIR}/commit" \
-                 && ls "${SRC_DIR}"/transformer_engine*.whl >/dev/null 2>&1; then
+              (
+                SRC_DIR="/mnt/wl_nas/${BUILD_SUBDIR}"
                 HEAD_SHA='${{ steps.scope.outputs.head_sha }}'
                 DEST="$REUSE/build-$HEAD_SHA"
-                # 冷缓存时 $REUSE 可能尚不存在（仅 test.sh 发布 base 缓存时才创建）；
-                # 目录创建失败或暂存失败都只回退本地构建，不中断 gate。
+                # 已发布的有效缓存不可覆盖（可能有别的任务正在读）；同名目录已存在视为命中。
+                if [[ -d "$DEST" ]]; then
+                  echo "[RTC CI] 复用目录已存在，保持不变：$DEST"
+                  exit 0
+                fi
+                # build 最后一个动作是写 commit 文件；commit 出现且匹配即构建完成。
+                if [[ -f "$SRC_DIR/commit" ]] && grep -qx "$HEAD_SHA" "$SRC_DIR/commit" \
+                   && ls "$SRC_DIR"/transformer_engine*.whl >/dev/null 2>&1; then
+                  : # build 已完成，直接进入拷贝
+                else
+                  # build 进行中：轮询 commit 出现（与 base 编译并行，不占额外资源）
+                  WAIT_SECONDS=$((60 * 60))
+                  POLL_INTERVAL=30
+                  FOUND=""
+                  while (( SECONDS < WAIT_SECONDS )); do
+                    if [[ -f "$SRC_DIR/commit" ]] && grep -qx "$HEAD_SHA" "$SRC_DIR/commit" \
+                       && ls "$SRC_DIR"/transformer_engine*.whl >/dev/null 2>&1; then
+                      FOUND=1
+                      break
+                    fi
+                    if [[ ! -d "$SRC_DIR" ]]; then
+                      echo "[RTC CI] build 产物目录消失（失败/被清理），head arm 将本地构建"
+                      exit 0
+                    fi
+                    sleep "$POLL_INTERVAL"
+                  done
+                  if [[ -z "${FOUND}" ]]; then
+                    echo "[RTC CI] 等待 ppu-890-build wheel 超时（60 分钟），head arm 将本地构建"
+                    exit 0
+                  fi
+                fi
+                # 拷贝 + 校验 + 原子发布；任何失败回退本地构建。
                 STAGE=""
                 if mkdir -p "$REUSE"; then
                   STAGE=$(mktemp -d "$REUSE/.staging-XXXXXX" 2>/dev/null) || STAGE=""
@@ -255,7 +273,6 @@ jobs:
                 if [[ -n "$STAGE" ]] && cp -a "$SRC_DIR/." "$STAGE/" \
                    && [[ -f "$STAGE/commit" ]] && grep -qx "$HEAD_SHA" "$STAGE/commit" \
                    && ls "$STAGE"/transformer_engine*.whl >/dev/null 2>&1; then
-                  # 已发布的有效缓存不可覆盖（可能有别的任务正在读）；同名目录已存在视为命中。
                   if [[ -d "$DEST" ]]; then
                     echo "[RTC CI] 复用目录已存在，保持不变：$DEST"
                   else
@@ -267,9 +284,8 @@ jobs:
                   echo "[RTC CI] 复用目录创建/暂存/拷贝/校验未通过，head arm 将本地构建"
                 fi
                 [[ -n "$STAGE" ]] && rm -rf "$STAGE" 2>/dev/null || true
-              else
-                echo "[RTC CI] build 产物校验未通过（commit 不匹配或缺失），head arm 将本地构建"
-              fi
+              ) >> "$HEAD_WAIT_LOG" 2>&1 &
+              echo $! > "$OUT/.head-wait.pid"
             fi
             bash "$SRC/qa/L0_pytorch_grouped_gemm_rtc/test.sh" "$SRC" \
               '${{ steps.scope.outputs.base_sha }}' "$OUT" "$REUSE" 2>&1 | tee "$OUT/campaign.log"
