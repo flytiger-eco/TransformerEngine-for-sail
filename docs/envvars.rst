@@ -297,8 +297,14 @@ Kernel Configuration
 .. envvar:: NVTE_USE_CUTLASS_GROUPED_GEMM
 
    :Type: ``int`` (0 or 1)
-   :Default: ``0``
-   :Description: Use CUTLASS implementation for grouped GEMM operations instead of cuBLAS. When set to ``1``, enables CUTLASS grouped GEMM kernels, which may provide better performance for certain workloads on Hopper (SM90) GPUs.
+   :Default: ``1``
+   :Description: Use CUTLASS implementation for grouped GEMM operations instead of cuBLAS. Enabled by default on SM80/SM89/SM90, where the grouped GEMM dispatcher selects the CUTLASS array GEMM or the NVRTC-JIT (RTC) kernels; unsupported inputs (fp8, fused epilogues, unaligned shapes) still fall back to cuBLAS per call. Set to ``0`` to route every grouped GEMM through the cuBLAS multi-stream path.
+
+.. envvar:: NVTE_GG_ALLOW_FP32_ACCUM
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``1``
+   :Description: Allow the CUTLASS RTC grouped GEMM arm to serve fp32 destinations with ``accumulate=true`` (the wgrad case, where the gradient is accumulated into an fp32 ``main_grad``). Enabled by default as the fp32 epilogue exists only in the RTC arm. Set to ``0`` to send those calls to cuBLAS.
 
 .. envvar:: NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK
 

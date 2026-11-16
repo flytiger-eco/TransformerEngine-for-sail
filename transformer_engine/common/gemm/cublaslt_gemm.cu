@@ -1089,7 +1089,9 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   const bool is_hopper = (transformer_engine::cuda::sm_arch(current_device) == 90);
   const bool is_sm80 = (transformer_engine::cuda::sm_arch(current_device) == 80);
   const bool is_sm89 = (transformer_engine::cuda::sm_arch(current_device) == 89);
-  const bool use_cutlass = transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", false);
+  // CUTLASS/RTC grouped GEMM is the default backend on sm80/sm89/sm90; the
+  // cuBLAS multi-stream path remains one export away (NVTE_USE_CUTLASS_GROUPED_GEMM=0).
+  const bool use_cutlass = transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", true);
   const bool use_cutlass_rtc =
       transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM_RTC", true);
   const bool sm80_disable_alignment_check =
@@ -1146,7 +1148,8 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
     transformer_engine::grouped_gemm::workspace_epoch_bump(current_device);
   };
 
-  // Currently only support cutlass group gemm on Hopper Arch
+  // CUTLASS grouped GEMM is implemented for sm80/sm89 (PPU array GEMM and the
+  // NVRTC-JIT arm) and sm90 (TMA); anywhere else falls back to cuBLAS.
   if (!((is_sm80 || is_sm89 || is_hopper) && use_cutlass)) {
     cublas_path_tagged();
     return;
@@ -1261,22 +1264,22 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
     // covers both dtype classes: its epilogue is instantiated for a 16-bit and
     // for an fp32 destination.
     //
-    // Exception: an fp32 destination with accumulate=true (wgrad into an fp32
-    // main_grad) still defaults to cuBLAS. The gate was added for a defect that
-    // corrupted D over the first M tile; the cause was later found on the host
-    // side, where an fp32 request was dispatched twice (the 16-bit launcher ran
-    // first and overwrote the leading rows of D, so the fp32 launcher read back
-    // an already clobbered source). The single mutually exclusive dispatch in
+    // fp32 destinations with accumulate=true (wgrad into an fp32 main_grad) are
+    // served by the RTC arm by default: it is the only backend that accumulates
+    // C in fp32 without splitting the reduction across per-group launches.
+    // The historical opt-in gate existed for a defect that corrupted D over the
+    // first M tile; the cause was found on the host side, where an fp32 request
+    // was dispatched twice (the 16-bit launcher ran first and overwrote the
+    // leading rows of D, so the fp32 launcher read back an already clobbered
+    // source). The single mutually exclusive dispatch in
     // cutlass_grouped_gemm_rtc() fixes that, and
     // test_grouped_wgrad_rtc_inplace covers the first and later M tiles against
-    // an fp32 reference. The gate is kept as a conservative default for now:
-    // flipping it changes the backend every wgrad takes, which is a separate
-    // decision from landing the kernel.
+    // an fp32 reference.
     //
-    // NVTE_GG_ALLOW_FP32_ACCUM=1 routes fp32 accumulate through the RTC path.
+    // NVTE_GG_ALLOW_FP32_ACCUM=0 opts fp32 accumulate back out to cuBLAS.
     const bool rtc_handles_accum =
         !(dtype_cls == 2 && accumulate) ||
-        transformer_engine::getenv<bool>("NVTE_GG_ALLOW_FP32_ACCUM", false);
+        transformer_engine::getenv<bool>("NVTE_GG_ALLOW_FP32_ACCUM", true);
     if (use_cutlass_rtc && (is_sm80 || is_sm89) && rtc_handles_accum) {
       const bool ok = cutlass_grouped_gemm_rtc(
           A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
