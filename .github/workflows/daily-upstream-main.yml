@@ -13,17 +13,10 @@ on:
         description: Open a synchronization PR (only allowed from main)
         type: boolean
         default: false
-  workflow_call:
-    inputs:
-      publish:
-        description: Open a synchronization PR from the default-branch dispatcher
-        type: boolean
-        default: false
-    secrets:
-      SYNC_PR_TOKEN:
-        description: Optional repository-scoped Contents and Pull requests write token
-        required: false
-# The only cron lives in daily-upstream-main-dispatch.yml on v2.18-SAIL.
+  schedule:
+    # 16:00 UTC = 00:00 Asia/Shanghai.
+    # Active after this workflow is merged and main becomes the default branch.
+    - cron: '0 16 * * *'
 
 permissions:
   contents: read
@@ -341,12 +334,12 @@ jobs:
           retention-days: 7
 
       - name: Report dry-run mode
-        if: steps.merge.outputs.changed == 'true' && !(inputs.publish && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/v2.18-SAIL') && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'))
+        if: steps.merge.outputs.changed == 'true' && !(github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)))
         run: echo 'Dry-run only; no branch was pushed and no synchronization PR was created.' >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     needs: merge
-    if: needs.merge.outputs.changed == 'true' && github.repository == 'flytiger-eco/TransformerEngine-for-sail' && inputs.publish && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/v2.18-SAIL') && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: needs.merge.outputs.changed == 'true' && github.repository == 'flytiger-eco/TransformerEngine-for-sail' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -370,11 +363,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
           CUSTOM_PR_TOKEN_CONFIGURED: ${{ secrets.SYNC_PR_TOKEN != '' }}
-          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          PUBLISH_REQUESTED: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
         run: |
           set -euo pipefail
           [[ "$PUBLISH_REQUESTED" == 'true' ]] || exit 1
-          [[ "$GITHUB_REF" == 'refs/heads/main' || "$GITHUB_REF" == 'refs/heads/v2.18-SAIL' ]] || exit 1
+          [[ "$GITHUB_REF" == 'refs/heads/main' ]] || exit 1
           [[ "$GITHUB_EVENT_NAME" == 'schedule' || "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]] || exit 1
           [[ "$GITHUB_REPOSITORY" == 'flytiger-eco/TransformerEngine-for-sail' ]] || exit 1
           [[ "$SYNC_BRANCH:$UPSTREAM_BRANCH" == 'main:main' ]] || exit 1
