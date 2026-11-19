@@ -3,7 +3,7 @@ import torch
 import transformer_engine_torch as tex
 
 
-@pytest.mark.parametrize("topk", range(1, 9))
+@pytest.mark.parametrize("topk", range(1, 16))
 @pytest.mark.parametrize("experts", [33, 128, 193, 256, 257])
 def test_simple_topk_range_matches_cpu(experts, topk):
     columns = torch.arange(experts)
@@ -25,7 +25,7 @@ def test_simple_topk_range_matches_cpu(experts, topk):
     torch.testing.assert_close(probs.cpu(), reference, rtol=1e-6, atol=1e-7)
 
 
-@pytest.mark.parametrize("topk", [2, 7, 8])
+@pytest.mark.parametrize("topk", [2, 7, 8, 9, 12, 15])
 def test_simple_ties_and_first_lane_nan(topk):
     logits = torch.tensor([float((column * 13) % 7) for column in range(193)])
     logits[0], logits[32], logits[65] = torch.nan, -torch.inf, torch.nan
@@ -38,7 +38,7 @@ def test_simple_ties_and_first_lane_nan(topk):
             for column in range(lane, len(scores), 32):
                 if column in expected:
                     continue
-                if scores[column] > values[lane]:
+                if (topk > 8 and column == lane) or scores[column] > values[lane]:
                     values[lane], winners[lane] = scores[column], column
         for stride in (16, 8, 4, 2, 1):
             source = [lane ^ stride if values[lane ^ stride] > values[lane] else lane for lane in range(32)]

@@ -4,7 +4,7 @@ import transformer_engine_torch as tex
 
 
 @pytest.mark.parametrize("experts", [31, 33, 64, 127, 129, 192, 193, 255, 256, 257])
-@pytest.mark.parametrize("topk", [1, 4])
+@pytest.mark.parametrize("topk", [1, 4, 9, 12, 15])
 @pytest.mark.parametrize("scale", [1.2, -0.75])
 def test_postsoftmax_vjp_matches_bitmap(experts, topk, scale):
     generator = torch.Generator().manual_seed(317 + experts + topk)

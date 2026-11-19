@@ -72,6 +72,49 @@ __device__ __forceinline__ void cached_small_topk(const CompType *scores, int si
   }
 }
 
+template <int Tiles, bool Full>
+__device__ __forceinline__ void cached_naive_topk(CompType *scores, int size, int topk,
+                                                  int *indices, CompType *values, int lane_id) {
+  constexpr unsigned int warp = 0xffffffffu;
+  constexpr CompType empty = -std::numeric_limits<CompType>::infinity();
+  int logical_lane = __brev(static_cast<unsigned int>(lane_id)) >> 27;
+  CompType candidates[Tiles];
+#pragma unroll
+  for (int tile = 0; tile < Tiles; ++tile) {
+    int offset = logical_lane + tile * kThreadsPerWarp;
+    candidates[tile] = Full || offset < size ? scores[offset] : empty;
+  }
+  if (topk > 8 && __ballot_sync(warp, isnan(candidates[0]))) {
+    return naive_topk_and_mask_generic(scores, size, topk, indices, values, lane_id);
+  }
+#pragma unroll 1
+  for (int rank = 0; rank < topk; ++rank) {
+    CompType value = empty;
+    int index = logical_lane;
+#pragma unroll
+    for (int tile = 0; tile < Tiles; ++tile) {
+      if (candidates[tile] > value) {
+        value = candidates[tile];
+        index = logical_lane + tile * kThreadsPerWarp;
+      }
+    }
+    CompType maximum = value;
+    for (int stride = kThreadsPerWarp / 2; stride > 0; stride /= 2) {
+      CompType peer = __shfl_xor_sync(warp, maximum, stride);
+      if (peer > maximum) maximum = peer;
+    }
+    int winner = __ffs(__ballot_sync(warp, value == maximum)) - 1;
+    if (lane_id == winner) {
+      indices[rank] = index;
+      values[rank] = value;
+#pragma unroll
+      for (int tile = 0; tile < Tiles; ++tile) {
+        if (index == logical_lane + tile * kThreadsPerWarp) candidates[tile] = empty;
+      }
+    }
+  }
+}
+
 // =============================================================================
 // Simple forward kernel — exact upstream structure (no async loader, no
 // persistent grid, runtime score_function dispatch).  Faster for small topk
@@ -80,7 +123,7 @@ __device__ __forceinline__ void cached_small_topk(const CompType *scores, int si
 
 template <typename DataType, typename BiasType, NVTERoutingMapFormat RoutingMapFormat,
           TopkFuncType TopkFunc = TopkFuncType::Naive, typename IndexType = int32_t,
-          int CachedTiles = 0, bool Full = false>
+          int CachedTiles = 0, bool Full = false, bool UseSmallTopk = false>
 __global__ void fused_topk_forward_simple_kernel(
     const DataType *logits, int num_tokens, int num_experts, int topk, bool use_pre_softmax,
     int num_groups, int group_topk, float scaling_factor, int score_function,
@@ -206,8 +249,13 @@ __global__ void fused_topk_forward_simple_kernel(
     if (group_topk > 0) {
       int group_size = num_experts / num_groups;
       for (int i = 0; i < num_groups; i++) {
-        topk_and_mask<TopkFunc>(scores + i * group_size, group_size, topk / group_topk,
-                                topk_indices, topk_scores, lane_id);
+        if (!UseSmallTopk && CachedTiles != 0 && group_size <= kThreadsPerWarp && topk / group_topk > 8) {
+          cached_naive_topk<1, false>(scores + i * group_size, group_size, topk / group_topk,
+                                     topk_indices, topk_scores, lane_id);
+        } else {
+          topk_and_mask<TopkFunc>(scores + i * group_size, group_size, topk / group_topk,
+                                  topk_indices, topk_scores, lane_id);
+        }
         __syncwarp();
         if (lane_id == 0) {
           CompType tmp = 0.0;
@@ -231,8 +279,11 @@ __global__ void fused_topk_forward_simple_kernel(
       __syncwarp();
       final_scores = masked_scores;
     }
-    if constexpr (CachedTiles != 0) {
+    if constexpr (UseSmallTopk) {
       cached_small_topk<CachedTiles, Full>(final_scores, num_experts, topk, topk_indices,
+                                           topk_scores, lane_id);
+    } else if constexpr (CachedTiles != 0) {
+      cached_naive_topk<CachedTiles, Full>(final_scores, num_experts, topk, topk_indices,
                                            topk_scores, lane_id);
     } else {
       topk_and_mask<TopkFunc>(final_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
@@ -695,8 +746,13 @@ void fused_topk_with_score_function_forward_kernel_launcher(
 
     if constexpr (std::is_same_v<DataType, CompType> && std::is_same_v<BiasType, CompType> &&
                   RoutingMapFormat == NVTE_ROUTING_MAP_FORMAT_BYTEMAP) {
-      if (topk > 1 && topk <= 8 && num_experts > kThreadsPerWarp && num_experts <= 8 * kThreadsPerWarp) {
+      if (topk > 1 && num_experts > kThreadsPerWarp && num_experts <= 8 * kThreadsPerWarp) {
         dispatch_router_tiles(num_experts, [&](auto tiles, auto full) {
+          if (topk <= 8) {
+            return launch_simple(fused_topk_forward_simple_kernel<
+                                 DataType, BiasType, RoutingMapFormat, TopkFuncType::Naive, int32_t,
+                                 decltype(tiles)::value, decltype(full)::value, true>);
+          }
           launch_simple(fused_topk_forward_simple_kernel<DataType, BiasType, RoutingMapFormat,
                         TopkFuncType::Naive, int32_t, decltype(tiles)::value,
                         decltype(full)::value>);
@@ -1240,7 +1296,7 @@ void fused_topk_with_score_function_backward_kernel_launcher(
 #if defined(__HGGC__)
   if constexpr (std::is_same_v<DataType, CompType> &&
                 RoutingMapFormat == NVTE_ROUTING_MAP_FORMAT_BYTEMAP) {
-    if (topk <= 8 && num_experts <= 8 * kThreadsPerWarp && score_function == 1 && !use_pre_softmax) {
+    if (topk < 16 && num_experts <= 8 * kThreadsPerWarp && score_function == 1 && !use_pre_softmax) {
       dispatch_router_tiles(num_experts, [&](auto tiles, auto full) {
         fused_topk_backward_postsoftmax_register_kernel<decltype(tiles)::value, decltype(full)::value>
             <<<total_blocks, kThreadsPerBlock, 0, stream>>>(routing_map, intermediate_output,
