@@ -38,7 +38,6 @@ env:
   UPSTREAM_REPOSITORY: NVIDIA/TransformerEngine
   TRACKING_ISSUE: '65'
   GIT_CONFIG_NOSYSTEM: '1'
-  GIT_CONFIG_GLOBAL: /dev/null
   GIT_ATTR_NOSYSTEM: '1'
 
 jobs:
@@ -333,7 +332,7 @@ jobs:
             > "$RUNNER_TEMP/sync-candidate/metadata.json"
           printf 'Candidate validated; no GPU/PPU build or hardware tests were run.\n' >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.merge.outputs.changed == 'true'
         with:
           name: te-upstream-main-candidate
@@ -360,7 +359,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: te-upstream-main-candidate
           path: ${{ runner.temp }}/sync-candidate
