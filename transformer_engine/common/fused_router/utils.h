@@ -420,6 +420,35 @@ __device__ inline void naive_topk_and_mask_smallk(CompType *scores, int data_siz
                                                   int *topk_indices, CompType *topk_scores,
                                                   int lane_id) {
   static_assert(K > 0 && K <= 8, "K must be in [1, 8]");
+  if (data_size <= kThreadsPerWarp) {
+    // 每 lane 至多一个候选：只加载一次，以有效标志代替 selected[K] 逐项检查。
+    // 保留原 strict > 比较、初始索引和 shuffle 顺序，含相等值和 -inf 的行为。
+    bool available = lane_id < data_size;
+    CompType cached = available ? scores[lane_id] : -std::numeric_limits<CompType>::infinity();
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      CompType val = -std::numeric_limits<CompType>::infinity();
+      int index = (lane_id < data_size) ? lane_id : -1;
+      if (available && cached > val) val = cached;
+      for (int s = kThreadsPerWarp / 2; s > 0; s /= 2) {
+        auto shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
+        auto shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
+        if (shuffled_val > val) {
+          val = shuffled_val;
+          index = shuffled_index;
+        }
+      }
+      CompType chosen_val = __shfl_sync(0xffffffff, val, 0);
+      int chosen_index = __shfl_sync(0xffffffff, index, 0);
+      if (lane_id == 0) {
+        topk_indices[k] = chosen_index;
+        topk_scores[k] = chosen_val;
+      }
+      available = available && lane_id != chosen_index;
+      __syncwarp();
+    }
+    return;
+  }
   int selected[K];
 #pragma unroll
   for (int i = 0; i < K; ++i) {
