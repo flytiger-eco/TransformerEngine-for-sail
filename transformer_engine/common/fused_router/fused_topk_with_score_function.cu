@@ -777,10 +777,9 @@ void fused_topk_with_score_function_forward_kernel_launcher(
   } else {
     // Optimized path: async loader + persistent grid + radix topk.
 #if defined(__HGGC__)
-    if constexpr (std::is_same_v<DataType, CompType> && std::is_same_v<BiasType, CompType> &&
-                  RoutingMapFormat == NVTE_ROUTING_MAP_FORMAT_BYTEMAP) {
+    if constexpr (cache_scores) {
       if (num_experts <= 8 * kThreadsPerWarp) {
-        dispatch_router_tiles(num_experts, [&](auto tiles, auto full) {
+        dispatch_forward_router_tiles<DataType>(num_experts, [&](auto tiles, auto full) {
           auto cached = [&](auto function) {
             launch(fused_topk_with_score_function_forward_kernel<DataType, BiasType, RoutingMapFormat,
                    TopkFuncType::Radix, decltype(function)::value, int32_t, decltype(tiles)::value,
@@ -1328,8 +1327,7 @@ void fused_topk_with_score_function_backward_kernel_launcher(
 
 #if defined(__HGGC__)
   if constexpr (RoutingMapFormat == NVTE_ROUTING_MAP_FORMAT_BYTEMAP) {
-    if ((std::is_same_v<DataType, CompType> || topk <= 8 || topk < get_radix_topk_threshold()) &&
-        num_experts <= 8 * kThreadsPerWarp && score_function == 1 && !use_pre_softmax) {
+    if (num_experts <= 8 * kThreadsPerWarp && score_function == 1 && !use_pre_softmax) {
       dispatch_router_tiles(num_experts, [&](auto tiles, auto full) {
         fused_topk_backward_postsoftmax_register_kernel<DataType, decltype(tiles)::value, decltype(full)::value>
             <<<total_blocks, kThreadsPerBlock, 0, stream>>>(routing_map, intermediate_output,
