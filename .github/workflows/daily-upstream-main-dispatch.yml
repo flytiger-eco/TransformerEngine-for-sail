@@ -1,0 +1,32 @@
+# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# See LICENSE for license information.
+
+name: Daily upstream main synchronization
+
+on:
+  schedule:
+    # GitHub runs scheduled workflows only from the default branch v2.18-SAIL.
+    # 16:00 UTC = 00:00 Asia/Shanghai. Merge the worker PR to main first.
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Open a draft main synchronization PR instead of a dry-run
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync-main:
+    if: github.repository == 'flytiger-eco/TransformerEngine-for-sail' && github.ref == 'refs/heads/v2.18-SAIL'
+    uses: flytiger-eco/TransformerEngine-for-sail/.github/workflows/daily-upstream-main.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      copilot-requests: write
+    with:
+      publish: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+    secrets:
+      SYNC_PR_TOKEN: ${{ secrets.SYNC_PR_TOKEN }}
