@@ -4,9 +4,6 @@
 name: Copilot upstream main synchronization
 
 on:
-  push:
-    branches: ['ci/daily-upstream-main']
-    paths: ['.github/workflows/daily-upstream-main.yml']
   workflow_dispatch:
     inputs:
       publish:
