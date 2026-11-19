@@ -4,7 +4,7 @@ import transformer_engine_torch as tex
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("topk", [1, 2, 7, 8])
+@pytest.mark.parametrize("topk", [1, 2, 7, 8, 9, 12, 15])
 @pytest.mark.parametrize("experts,groups,keep", [(192, 8, 1), (193, None, None)])
 @pytest.mark.parametrize("function", ["softmax", "sigmoid", "sqrtsoftplus"])
 def test_lowp_routing_matches_bitmap(dtype, topk, experts, groups, keep, function):
@@ -36,7 +36,7 @@ def test_lowp_routing_matches_bitmap(dtype, topk, experts, groups, keep, functio
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("topk", [1, 2, 7, 8])
+@pytest.mark.parametrize("topk", [1, 2, 7, 8, 9, 12, 15])
 def test_lowp_postsoftmax_matches_fp64(dtype, topk):
     experts = 192
     columns = torch.arange(experts)

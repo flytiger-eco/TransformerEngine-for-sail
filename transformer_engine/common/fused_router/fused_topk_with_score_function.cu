@@ -758,18 +758,16 @@ void fused_topk_with_score_function_forward_kernel_launcher(
     };
 
     if constexpr (cache_scores) {
-      if ((std::is_same_v<DataType, CompType> || topk <= 8) && topk > 1 &&
-          num_experts > kThreadsPerWarp && num_experts <= 8 * kThreadsPerWarp) {
+      if (topk > 1 && num_experts > kThreadsPerWarp && num_experts <= 8 * kThreadsPerWarp) {
         dispatch_forward_router_tiles<DataType>(num_experts, [&](auto tiles, auto full) {
           if (topk <= 8) {
             return launch_simple(fused_topk_forward_simple_kernel<
                                  DataType, BiasType, RoutingMapFormat, TopkFuncType::Naive, int32_t,
                                  decltype(tiles)::value, decltype(full)::value, true>);
           }
-          if constexpr (std::is_same_v<DataType, CompType>) {
-            launch_simple(fused_topk_forward_simple_kernel<DataType, BiasType, RoutingMapFormat,
-                          TopkFuncType::Naive, int32_t, decltype(tiles)::value, decltype(full)::value>);
-          }
+          launch_simple(fused_topk_forward_simple_kernel<DataType, BiasType, RoutingMapFormat,
+                        TopkFuncType::Naive, int32_t, decltype(tiles)::value,
+                        decltype(full)::value>);
         });
         return;
       }
@@ -1330,7 +1328,7 @@ void fused_topk_with_score_function_backward_kernel_launcher(
 
 #if defined(__HGGC__)
   if constexpr (RoutingMapFormat == NVTE_ROUTING_MAP_FORMAT_BYTEMAP) {
-    if ((std::is_same_v<DataType, CompType> || topk <= 8) &&
+    if ((std::is_same_v<DataType, CompType> || topk <= 8 || topk < get_radix_topk_threshold()) &&
         num_experts <= 8 * kThreadsPerWarp && score_function == 1 && !use_pre_softmax) {
       dispatch_router_tiles(num_experts, [&](auto tiles, auto full) {
         fused_topk_backward_postsoftmax_register_kernel<DataType, decltype(tiles)::value, decltype(full)::value>
