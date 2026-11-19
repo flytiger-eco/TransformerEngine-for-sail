@@ -359,7 +359,7 @@ __global__ void fused_topk_forward_simple_kernel(
 
 template <typename DataType, typename BiasType, NVTERoutingMapFormat RoutingMapFormat,
           TopkFuncType TopkFunc = TopkFuncType::Naive, int ScoreFunc = 0,
-          typename IndexType = int32_t>
+          typename IndexType = int32_t, int CachedTiles = 0, bool Full = false>
 __global__ void fused_topk_with_score_function_forward_kernel(
     const DataType *logits, int num_tokens, int num_experts, int topk, bool use_pre_softmax,
     int num_groups, int group_topk, float scaling_factor, const BiasType *expert_bias,
@@ -543,7 +543,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
       int group_size = num_experts / num_groups;
       // Top2
       for (int i = 0; i < num_groups; i++) {
-        topk_and_mask<TopkFunc>(
+        topk_and_mask<TopkFunc, CachedTiles, Full>(
             /*scores ptr = */ scores + i * group_size,
             /*data size = */ group_size,
             /*topk = */ topk / group_topk,
@@ -563,7 +563,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
       }
 
       // select the topk groups
-      topk_and_mask<TopkFunc>(
+      topk_and_mask<TopkFunc, CachedTiles, Full>(
           /*scores ptr = */ group_scores,
           /*data size = */ num_groups,
           /*topk = */ group_topk,
@@ -580,10 +580,10 @@ __global__ void fused_topk_with_score_function_forward_kernel(
         }
       }
       __syncwarp();
-      topk_and_mask<TopkFunc>(masked_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
+      topk_and_mask<TopkFunc, CachedTiles, Full>(masked_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
 
     } else {
-      topk_and_mask<TopkFunc>(scores, num_experts, topk, topk_indices, topk_scores, lane_id);
+      topk_and_mask<TopkFunc, CachedTiles, Full>(scores, num_experts, topk, topk_indices, topk_scores, lane_id);
     }
     __syncwarp();
 
@@ -764,6 +764,27 @@ void fused_topk_with_score_function_forward_kernel_launcher(
                                                    TopkFuncType::Naive>);
   } else {
     // Optimized path: async loader + persistent grid + radix topk.
+#if defined(__HGGC__)
+    if constexpr (std::is_same_v<DataType, CompType> && std::is_same_v<BiasType, CompType> &&
+                  RoutingMapFormat == NVTE_ROUTING_MAP_FORMAT_BYTEMAP) {
+      if (num_experts <= 8 * kThreadsPerWarp) {
+        dispatch_router_tiles(num_experts, [&](auto tiles, auto full) {
+          auto cached = [&](auto function) {
+            launch(fused_topk_with_score_function_forward_kernel<DataType, BiasType, RoutingMapFormat,
+                   TopkFuncType::Radix, decltype(function)::value, int32_t, decltype(tiles)::value,
+                   decltype(full)::value>);
+          };
+          switch (score_function) {
+            case 0: return cached(std::integral_constant<int, 0>{});
+            case 1: return cached(std::integral_constant<int, 1>{});
+            case 2: return cached(std::integral_constant<int, 2>{});
+            default: NVTE_ERROR("Unsupported score_function: ", score_function);
+          }
+        });
+        return;
+      }
+    }
+#endif
     switch (score_function) {
       case 0:
         launch(fused_topk_with_score_function_forward_kernel<DataType, BiasType, RoutingMapFormat,
@@ -1296,7 +1317,7 @@ void fused_topk_with_score_function_backward_kernel_launcher(
 #if defined(__HGGC__)
   if constexpr (std::is_same_v<DataType, CompType> &&
                 RoutingMapFormat == NVTE_ROUTING_MAP_FORMAT_BYTEMAP) {
-    if (topk < 16 && num_experts <= 8 * kThreadsPerWarp && score_function == 1 && !use_pre_softmax) {
+    if (num_experts <= 8 * kThreadsPerWarp && score_function == 1 && !use_pre_softmax) {
       dispatch_router_tiles(num_experts, [&](auto tiles, auto full) {
         fused_topk_backward_postsoftmax_register_kernel<decltype(tiles)::value, decltype(full)::value>
             <<<total_blocks, kThreadsPerBlock, 0, stream>>>(routing_map, intermediate_output,

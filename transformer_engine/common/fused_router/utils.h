@@ -572,11 +572,104 @@ __device__ inline void naive_topk_and_mask(CompType *scores, int data_size, int 
   }
 }
 
-template <TopkFuncType TopkFunc>
+template <int Tiles, bool Full>
+__device__ __forceinline__ void radix_topk_cached(const CompType *scores, int size, int topk,
+                                                  int *indices, CompType *values, int lane_id) {
+  constexpr unsigned int full = 0xffffffffu;
+  unsigned int keys[Tiles];
+#pragma unroll
+  for (int tile = 0; tile < Tiles; ++tile) {
+    const int offset = tile * kThreadsPerWarp + lane_id;
+    keys[tile] = Full || offset < size ? float_to_ordered_uint(scores[offset]) : 0u;
+  }
+  unsigned int prefix = 0, mask = 0;
+  int remaining = topk, survivors = Full ? Tiles * kThreadsPerWarp : size;
+#pragma unroll 1
+  for (unsigned int bit = 1u << 31; bit && survivors > 1; bit >>= 1) {
+    mask |= bit;
+    const unsigned int high_prefix = prefix | bit;
+    int high = 0;
+#pragma unroll
+    for (int tile = 0; tile < Tiles; ++tile) {
+      high += (keys[tile] & mask) == high_prefix;
+    }
+    high = warp_allreduce_sum(high);
+    if (remaining <= high) {
+      prefix = high_prefix;
+      survivors = high;
+    } else {
+      remaining -= high;
+      survivors -= high;
+    }
+  }
+  int next_greater = 0, next_equal = topk - remaining;
+  const unsigned int lower = (1u << lane_id) - 1;
+#pragma unroll
+  for (int tile = 0; tile < Tiles; ++tile) {
+    const int index = tile * kThreadsPerWarp + lane_id;
+    const bool valid = Full || index < size;
+    const unsigned int candidate = keys[tile] & mask;
+    const unsigned int greater = __ballot_sync(full, valid && candidate > prefix);
+    const unsigned int equal = __ballot_sync(full, valid && candidate == prefix);
+    const int position = candidate > prefix ? next_greater + __popc(greater & lower)
+                                            : next_equal + __popc(equal & lower);
+    if (valid && candidate >= prefix && position < topk) {
+      indices[position] = index;
+      values[position] = scores[index];
+    }
+    next_greater += __popc(greater);
+    next_equal += __popc(equal);
+  }
+  __syncwarp();
+}
+
+template <int Tiles, bool Full>
+__device__ __forceinline__ void cached_radix_select(CompType *scores, int data_size, int topk,
+                                                    int *indices, CompType *values, int lane_id) {
+  if (data_size > kThreadsPerWarp) {
+    if constexpr (Full) {
+      if (data_size != Tiles * kThreadsPerWarp) {
+        return radix_topk_and_mask(scores, data_size, topk, indices, values, lane_id);
+      }
+    }
+    return radix_topk_cached<Tiles, Full>(scores, data_size, topk, indices, values, lane_id);
+  }
+  constexpr unsigned int full = 0xffffffffu;
+  const bool valid = lane_id < data_size;
+  const CompType value = valid ? scores[lane_id] : 0.0f;
+  const unsigned int key = float_to_ordered_uint(value);
+  unsigned int candidates = __ballot_sync(full, valid);
+  int rank = topk;
+  for (unsigned int bit = 1u << 31; bit && (candidates & (candidates - 1)); bit >>= 1) {
+    const unsigned int ones = candidates & __ballot_sync(full, (key & bit) != 0);
+    const int count = __popc(ones);
+    if (rank <= count) {
+      candidates = ones;
+    } else {
+      candidates ^= ones;
+      rank -= count;
+    }
+  }
+  const unsigned int cutoff = __shfl_sync(full, key, __ffs(candidates) - 1);
+  const unsigned int greater = __ballot_sync(full, valid && key > cutoff);
+  const unsigned int equal = __ballot_sync(full, valid && key == cutoff);
+  const unsigned int lower = (1u << lane_id) - 1;
+  const int position = key > cutoff ? __popc(greater & lower)
+                                    : __popc(greater) + __popc(equal & lower);
+  if (valid && key >= cutoff && position < topk) {
+    indices[position] = lane_id;
+    values[position] = value;
+  }
+  __syncwarp();
+}
+
+template <TopkFuncType TopkFunc, int Tiles = 0, bool Full = false>
 __device__ __forceinline__ void topk_and_mask(CompType *scores, int data_size, int topk,
                                               int *topk_indices, CompType *topk_scores,
                                               int lane_id) {
-  if constexpr (TopkFunc == TopkFuncType::Radix)
+  if constexpr (Tiles != 0)
+    return cached_radix_select<Tiles, Full>(scores, data_size, topk, topk_indices, topk_scores, lane_id);
+  else if constexpr (TopkFunc == TopkFuncType::Radix)
     return radix_topk_and_mask(scores, data_size, topk, topk_indices, topk_scores, lane_id);
   else
     return naive_topk_and_mask(scores, data_size, topk, topk_indices, topk_scores, lane_id);
