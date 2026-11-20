@@ -54,48 +54,8 @@
 
 #include "cutlass/epilogue/fusion/ppu_callbacks.hpp"
 
-// RTC in-place accumulation folds C into the direct output fragment; the host
-// guarantees alpha==beta==1.
-#ifndef NVTE_GG_PRELOAD_C
-#define NVTE_GG_PRELOAD_C 0
-#endif
-#ifndef NVTE_GG_PROLOGUE_C
-#define NVTE_GG_PROLOGUE_C 0
-#endif
-#ifndef NVTE_GG_ATOMIC_C
-#define NVTE_GG_ATOMIC_C 0
-#endif
-#ifndef NVTE_GG_ATOMIC_GLOBAL
-#define NVTE_GG_ATOMIC_GLOBAL 0
-#endif
-#ifndef NVTE_GG_ATOMIC_INTERLEAVE
-#define NVTE_GG_ATOMIC_INTERLEAVE 0
-#endif
-// A3-native: bulk-prefetch C into smem with an AIU tensor copy instead of a
-// per-thread global vector load. Measured over eight shapes, the ACU tensor
-// core active rate gains a geometric mean of +23.78% and the net cost of C
-// drops to 0.339x, with D bit-identical to the baseline — hence on by default.
-// A tile whose shape does not qualify falls back to the fragment path silently
-// via kCanStageC.
-#ifndef NVTE_GG_C_AIU_SMEM
-#define NVTE_GG_C_AIU_SMEM 1
-#endif
-// Upper bound on the C prefetch pipeline depth. Depth 2 measured a further
-// +6.3% over depth 1 (TFU 59.88 vs 56.33, non-overlapping distributions), so 2
-// is the default. The second stage must be borrowed from the kernel union's
-// slack and must never live in the epilogue's own SharedStorage: that would be
-// subtracted from the 256KB by StageCountAutoCarveout, and 4 of 7 tiles with
-// stages=0 measurably lost a mainloop stage as a result (256x256x64 dropped
-// straight to 1 and also tripped the mainloop's Stages>=2 assertion).
-// Borrowing the slack leaves sizeof(SharedStorage) completely unchanged.
-#ifndef NVTE_GG_C_AIU_STAGES
-#define NVTE_GG_C_AIU_STAGES 2
-#endif
-
-#if NVTE_GG_C_AIU_SMEM
 #include "cute/arch/copy_ppu.hpp"
 #include "cute/arch/copy_ppu0015_aiu.hpp"
-#endif
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -339,26 +299,7 @@ public:
       char* smem_buf,
       CSmemBytes c_smem_bytes = {})
   {
-#if (defined(__CUDACC_RTC__) || defined(NVTE_GG_PROFILE_RTC)) && \
-    NVTE_GG_ATOMIC_C && NVTE_GG_PRELOAD_C && \
-    !NVTE_GG_PROLOGUE_C && NVTE_GG_TRANS_A && !NVTE_GG_TRANS_B && NVTE_GG_OUT_FP32
-    // RTC fp32 NT wgrad only: the host pins alpha=1 and requests beta=1, while
-    // the EVT sees beta=0. Compare the actual per-group C/D address and stride;
-    // anything not aliased stays on the original fragment path.
-    static_assert(IsDirectStoreSupported && cute::is_same_v<ElementC, float> &&
-                  cute::is_same_v<ElementD, float> &&
-                  cute::is_same_v<ElementAccumulator, float>,
-                  "Atomic C requires fp32 pointer-array LinearCombination");
-    auto l = cute::get<3>(blk_coord_mnkl);
-    auto source = get_c_ptr(params, l, true);
-    if (__builtin_expect(source != nullptr, 0) && source == get_d_ptr(params, l) &&
-        get_stride_c(params, l) == get_stride_d(params, l)) {
-      compute_epilogue_atomic(problem_shape_mnkl, blk_shape_MNK, blk_coord_mnkl,
-                              accumulators, tiled_mma, residue_mnk, thread_idx);
-      return;
-    }
-#endif
-#if NVTE_GG_PRELOAD_C && !NVTE_GG_PROLOGUE_C
+#if defined(NVTE_GG_OUT_FP32) && NVTE_GG_OUT_FP32
     // Must come before the beta==0 direct short circuit; ptr_C is the host's
     // signal that it wants C folded in.
     if (__builtin_expect(get_c_ptr(params, cute::get<3>(blk_coord_mnkl), true) != nullptr, 0)) {
@@ -371,7 +312,6 @@ public:
       return;
     }
 #endif
-#if !defined(NVTE_GG_DISABLE_DIRECT_EPILOGUE)
     if constexpr (IsDirectStoreSupported) {
       if (!__builtin_expect(is_source_needed(), 0)) {
         compute_epilogue_direct(
@@ -380,7 +320,6 @@ public:
         return;
       }
     }
-#endif
     if (__builtin_expect(is_source_needed(), 0)) {
       compute_epilogue<ProblemShapeMNKL, BlockShapeMNK, BlockCoordMNKL, FrgEngine, FrgLayout, TiledMma, ResidueMNK, true>(
         problem_shape_mnkl, blk_shape_MNK, blk_coord_mnkl, accumulators, tiled_mma, residue_mnk, thread_idx, smem_buf);
@@ -622,91 +561,7 @@ public:
     cst_callbacks.end();
   }
 
-#if (defined(__CUDACC_RTC__) || defined(NVTE_GG_PROFILE_RTC)) && \
-    NVTE_GG_ATOMIC_C && NVTE_GG_PRELOAD_C && \
-    !NVTE_GG_PROLOGUE_C && NVTE_GG_TRANS_A && !NVTE_GG_TRANS_B && NVTE_GG_OUT_FP32
-  template <class ProblemShapeMNKL, class BlockShapeMNK, class BlockCoordMNKL,
-            class FrgEngine, class FrgLayout, class TiledMma, class ResidueMNK>
-  CUTLASS_DEVICE void
-  compute_epilogue_atomic(
-      ProblemShapeMNKL problem_shape_mnkl,
-      BlockShapeMNK blk_shape_MNK,
-      BlockCoordMNKL blk_coord_mnkl,
-      cute::Tensor<FrgEngine, FrgLayout> const& accumulators,
-      TiledMma tiled_mma,
-      ResidueMNK residue_mnk,
-      int thread_idx)
-  {
-    using namespace cute;
-    using X = Underscore;
-    auto M = get<0>(problem_shape_mnkl);
-    auto N = get<1>(problem_shape_mnkl);
-    auto [m_coord, n_coord, k_coord, l_coord] = blk_coord_mnkl;
-    Tensor mD = make_tensor(make_gmem_ptr(get_d_ptr(params, l_coord)),
-                           make_shape(M, N, Int<1>{}), get_stride_d(params, l_coord));
-    Tensor gD_mnl = local_tile(mD, blk_shape_MNK, make_coord(_,_,_), Step<_1,_1,X>{});
-    Tensor gD = gD_mnl(_,_,m_coord,n_coord,0);
-    auto tiled_copy = make_tiled_copy_C(CopyAtomR2S{}, tiled_mma);
-    auto thread_copy = tiled_copy.get_thread_slice(thread_idx);
-    Tensor tCrAcc = thread_copy.retile_S(accumulators);
-    Tensor tCgD = thread_copy.partition_D(gD);
-    Tensor cD = make_identity_tensor(take<0,2>(blk_shape_MNK));
-    Tensor tCcD = thread_copy.partition_D(cD);
-    CUTE_STATIC_ASSERT(size(tCrAcc) == size(tCgD));
-    constexpr int FragSize = decltype(size(tCrAcc(_,0,0)))::value;
-    auto issue = [&](auto rotate) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int m = 0; m < size<1>(tCrAcc); ++m) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < size<2>(tCrAcc); ++j) {
-          // The two 256-thread warp groups interleave their accesses to the N
-          // fragments, still one writer per element. The fragment index is
-          // expanded statically in each branch, so the accumulator is never
-          // indexed dynamically (which would spill).
-          constexpr int NumN = decltype(size<2>(tCrAcc))::value;
-          int n = (j + decltype(rotate)::value * (NumN / 2)) % NumN;
-          Tensor tCrAcc_frag = tCrAcc(_,m,n);
-          Tensor tCgD_frag = tCgD(_,m,n);
-          Tensor tCcD_frag = tCcD(_,m,n);
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < FragSize; ++i) {
-            auto coord = tCcD_frag(i);
-            if (get<0>(coord) < get<0>(residue_mnk) &&
-                get<1>(coord) < get<1>(residue_mnk)) {
-#if NVTE_GG_ATOMIC_GLOBAL && NVTE_GG_ARCH == 89
-              // D is proven to be gmem, so address it explicitly and discard the
-              // result, which skips the per-element generic/TSM test.
-              // The memory clobber stays to stop the compiler from reordering
-              // related memory accesses across this RMW.
-              asm volatile("ppu.atom.global.add.f32 _, [%0], %1;\n"
-                           :: "l"(&tCgD_frag(i)), "f"(tCrAcc_frag(i)) : "memory");
-#else
-              // The returned old value is unused; the underlying op is still an
-              // RMW.
-              atomicAdd(&tCgD_frag(i), tCrAcc_frag(i));
-#endif
-            }
-          }
-        }
-      }
-    };
-#if NVTE_GG_ATOMIC_INTERLEAVE
-    if constexpr (decltype(size(tiled_mma))::value == 512) {
-      if (thread_idx >= 256) {
-        issue(Int<1>{});
-      } else {
-        issue(Int<0>{});
-      }
-    } else {
-      issue(Int<0>{});
-    }
-#else
-    issue(Int<0>{});
-#endif
-  }
-#endif
 
-#if !defined(NVTE_GG_DISABLE_DIRECT_EPILOGUE) || NVTE_GG_PRELOAD_C
   template<
     class ProblemShapeMNKL,
     class BlockShapeMNK,
@@ -812,7 +667,6 @@ public:
         fusion_callbacks.template get_consumer_store_callbacks<true>(cst_args);
     cst_callbacks.begin();
 
-#if NVTE_GG_C_AIU_SMEM
     // A3-native: instead of every thread issuing a global vector load for C,
     // an AIU bulk tensor copy moves the whole C block into smem and the MMA-C
     // fragment is then read from smem. A single AIU instruction moves one cube,
@@ -858,11 +712,11 @@ public:
       // If either condition fails, fall back to single buffering silently: that
       // gives up roughly a third of the gain but never runs out of bounds.
       constexpr int kChunkBytes  = kChunkElems * int(sizeof(ElementC));
-      constexpr int kWantStages  = NVTE_GG_C_AIU_STAGES;
+      constexpr int kWantStages  = 2;
       constexpr bool kSlackFitsC = sizeof(FusionStorage) <= 1 &&
                                    int(CSmemBytes::value) >= kWantStages * kChunkBytes;
       constexpr int kStages =
-          (kWantStages > 1 && kSlackFitsC && kChunks >= kWantStages) ? kWantStages : 1;
+          (kSlackFitsC && kChunks >= kWantStages) ? kWantStages : 1;
 
       // Swzl=false selects padz.linear: in smem each cube is stored row-major
       // and the cubes are laid out one after another.
@@ -985,9 +839,7 @@ public:
       cst_callbacks.end();
       return;
     }
-#endif
-    // The fallback path (macro off, non-fp32 C, or a tile shape that fails
-    // kCanStageC) never touches smem.
+    // Other tile shapes read C directly into the fragment.
     (void) smem_buf;
     (void) c_smem_bytes;
 
@@ -1072,7 +924,6 @@ public:
 
     cst_callbacks.end();
   }
-#endif
 
   // Host proves 16B D origins and row strides. This completes that proof for
   // the MMA-C copy layout: every fragment this layout emits starts at a

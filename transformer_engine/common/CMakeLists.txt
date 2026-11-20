@@ -131,6 +131,12 @@ set(NVTE_GG_EFFECTIVE_ACTLIZE "${CMAKE_BINARY_DIR}/actlize_effective")
 set(NVTE_GG_EFFECTIVE_ACTLIZE_INCLUDE "${NVTE_GG_EFFECTIVE_ACTLIZE}/include")
 set(NVTE_GG_EFFECTIVE_ACTLIZE_TOOLS_INCLUDE
   "${NVTE_GG_EFFECTIVE_ACTLIZE}/tools/util/include")
+# Rebuild the host and runtime views together when a maintained header changes.
+file(GLOB_RECURSE NVTE_GG_OVERLAY_HEADERS CONFIGURE_DEPENDS
+     "${ACTLIZE_OVERLAY_INCLUDE_DIR}/*.hpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             ${NVTE_GG_OVERLAY_HEADERS}
+             "${CMAKE_CURRENT_SOURCE_DIR}/gemm/rtc/cutlass_grouped_gemm.cu")
 file(COPY "${ACTLIZE_INCLUDE_DIR}/"
      DESTINATION "${NVTE_GG_EFFECTIVE_ACTLIZE_INCLUDE}/")
 file(COPY "${ACTLIZE_OVERLAY_INCLUDE_DIR}/cutlass/"
@@ -248,6 +254,7 @@ list(APPEND transformer_engine_cpp_sources
      transformer_engine.cpp
      fused_attn/fused_attn.cpp
      gemm/config.cpp
+     gemm/cutlass_grouped_gemm_rtc_kernel.cpp
      normalization/common.cpp
      normalization/rtc_dispatch.cpp
      normalization/layernorm/ln_api.cpp
@@ -264,6 +271,9 @@ list(APPEND transformer_engine_cpp_sources
      newton_schulz/newton_schulz.cpp
      )
 
+set(rtc_grouped_gemm_launch_sources
+    gemm/cutlass_grouped_gemm_rtc.cu
+    gemm/cutlass_grouped_gemm_rtc_grouped_tensor.cu)
 list(APPEND transformer_engine_cuda_sources
      common.cu
      multi_tensor/adam.cu
@@ -285,7 +295,7 @@ list(APPEND transformer_engine_cuda_sources
      fused_attn/utils.cu
      gemm/cublaslt_gemm.cu
      gemm/cublaslt_grouped_gemm.cu
-     gemm/cutlass_grouped_gemm_rtc.cu
+     ${rtc_grouped_gemm_launch_sources}
      normalization/layernorm/ln_bwd_semi_cuda_kernel.cu
      normalization/layernorm/ln_fwd_cuda_kernel.cu
      normalization/rmsnorm/rmsnorm_bwd_semi_cuda_kernel.cu
@@ -395,24 +405,16 @@ foreach(cuda_source IN LISTS transformer_engine_cuda_arch_specific_sources)
   endif()
 endforeach()
 
-# The RTC grouped-GEMM host TU mirrors PPU CUTLASS 3.x types (same Traits as
-# the NVRTC kernel template at gemm/rtc/cutlass_grouped_gemm.cu), so it needs
-# CUTLASS 3.x + ppu/ headers and USE_SAIL=1 just like the statically-built
-# PPU paths above. This is a per-source addition because the rtc host TU
-# lives in the main `transformer_engine` target rather than
-# `transformer_engine_groupgemm`.
+# The host launchers and NVRTC use the same PPU CUTLASS definitions for Params
+# and shared storage. Apply those includes only to the launchers in the main target.
 set_property(
-  SOURCE gemm/cutlass_grouped_gemm_rtc.cu
+  SOURCE ${rtc_grouped_gemm_launch_sources}
   APPEND PROPERTY INCLUDE_DIRECTORIES
   "${CUTLASS3_INCLUDE_DIR}"
   "${CUTLASS3_TOOLS_INCLUDE_DIR}")
-# The PPU generation is selected entirely by the ArchTag template argument
-# (cutlass::arch::PPU0010 for sm80, PPU0015 for sm89), which this TU picks at
-# runtime from the device's compute capability -- exactly like the static
-# cutlass_grouped_gemm_ppu.cu path. No preprocessor version macro is involved,
-# so one host TU covers both PPU generations.
+# The ArchTag template argument selects PPU0010 (SM80) or PPU0015 (SM89).
 set_property(
-  SOURCE gemm/cutlass_grouped_gemm_rtc.cu
+  SOURCE ${rtc_grouped_gemm_launch_sources}
   APPEND PROPERTY COMPILE_DEFINITIONS USE_SAIL=1)
 
 # HGTX (PPU's NVTX equivalent) per-launch tag instrumentation for the grouped
@@ -843,12 +845,8 @@ install(DIRECTORY "${CUTLASS3_INCLUDE_DIR}/cutlass"
         DESTINATION include/cutlass3
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp" PATTERN "*.inl"
                        PATTERN "*.cuh")
-# The PPU headers also live at the root of the include dir: the RTC source
-# includes "ppu_include.hpp" directly (which in turn includes
-# "accutlass.hpp"), and resolve_cutlass_include_dir() validates the installed
-# tree by requiring cutlass/cutlass.h *and* ppu_include.hpp next to each
-# other. Without them the installed package cannot resolve the include dir
-# and the RTC arm is disabled at runtime.
+# The shared RTC traits include ppu_include.hpp, which needs accutlass.hpp
+# alongside the installed cutlass/ tree.
 foreach(_ppu_root_header ppu_include.hpp accutlass.hpp)
   if(EXISTS "${CUTLASS3_INCLUDE_DIR}/${_ppu_root_header}")
     install(FILES "${CUTLASS3_INCLUDE_DIR}/${_ppu_root_header}"

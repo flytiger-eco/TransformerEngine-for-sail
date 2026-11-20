@@ -61,11 +61,6 @@
 namespace cutlass::gemm::collective {
 using namespace cute;
 
-// Default for the post-prefetch hook below: callers that have nothing to run
-// between issuing the A/B prefetch and entering the main loop pay nothing.
-struct NoOpAfterPrefetch {
-  CUTLASS_DEVICE void operator()() const {}
-};
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -212,18 +207,14 @@ struct CollectiveMma<
     return cutlass::Status::kSuccess;
   }
 
-  /// Perform a collective-scoped matrix multiply-accumulate. after_prefetch
-  /// runs once the whole A/B prefetch has been issued but before anything
-  /// waits on it, so a caller whose work is independent of smem (seeding the
-  /// accumulator from C, say) gets it overlapped with the AIU transfers.
+  /// Perform a collective-scoped matrix multiply-accumulate.
   template <
     class FrgTensorD,
     class TensorA,
     class TensorB,
     class FrgTensorC,
     class KTileIterator,
-    class ResidueMNK,
-    class AfterPrefetch = NoOpAfterPrefetch
+    class ResidueMNK
   >
   CUTLASS_DEVICE void
   operator() (
@@ -234,8 +225,7 @@ struct CollectiveMma<
       KTileIterator k_tile_iter, int k_tile_count,
       ResidueMNK residue_mnk,
       int thread_idx,
-      char *smem_buf,
-      AfterPrefetch &&after_prefetch = AfterPrefetch{})
+      char *smem_buf)
   {
     using namespace cute;
 
@@ -297,10 +287,6 @@ struct CollectiveMma<
       --k_tile_count;
       ++k_tile;
     }
-
-    // Every stage is now in flight and nothing has waited on it yet, so this
-    // is the one window where caller work rides along with the AIU transfers.
-    after_prefetch();
 
     //
     // MMA Atom partitioning
@@ -706,18 +692,14 @@ struct CollectiveMma<
     return cutlass::Status::kSuccess;
   }
 
-  /// Perform a collective-scoped matrix multiply-accumulate. after_prefetch
-  /// runs once the whole A/B prefetch has been issued but before anything
-  /// waits on it, so a caller whose work is independent of smem (seeding the
-  /// accumulator from C, say) gets it overlapped with the AIU transfers.
+  /// Perform a collective-scoped matrix multiply-accumulate.
   template <
     class FrgTensorD,
     class TensorA,
     class TensorB,
     class FrgTensorC,
     class KTileIterator,
-    class ResidueMNK,
-    class AfterPrefetch = NoOpAfterPrefetch
+    class ResidueMNK
   >
   CUTLASS_DEVICE void
   operator() (
@@ -728,8 +710,7 @@ struct CollectiveMma<
       KTileIterator k_tile_iter, int k_tile_count,
       ResidueMNK residue_mnk,
       int thread_idx,
-      char *smem_buf,
-      AfterPrefetch &&after_prefetch = AfterPrefetch{})
+      char *smem_buf)
   {
     using namespace cute;
 
@@ -785,10 +766,6 @@ struct CollectiveMma<
       --k_tile_count;
       if (k_tile_count > 0) { ++k_tile_iter; }
     }
-
-    // Every stage is now in flight and nothing has waited on it yet, so this
-    // is the one window where caller work rides along with the AIU transfers.
-    after_prefetch();
 
     //
     // MMA Atom partitioning
