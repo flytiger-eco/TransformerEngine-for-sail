@@ -81,3 +81,23 @@ def test_singleton_groups_top1(experts, dtype):
         indices = torch.empty_like(expected, dtype=index_dtype)
         tex.fused_topk_with_score_function_fwd(*args, byte, indices)
         assert torch.equal(indices.long(), expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_small_group_scores_select_by_top_values_in_rank_order(dtype):
+    fmt = int(tex.NVTERoutingMapFormat.BYTEMAP)
+    logits = torch.full((1, 24), -100.0, dtype=dtype, device="cuda")
+    logits[0, :3] = torch.tensor([32768, -32768, 2.0**-10], dtype=dtype, device="cuda")
+    logits[0, 3:6] = 2.0**-12
+    probs, mask, _ = tex.fused_topk_with_score_function_fwd(
+        logits, 3, False, 8, 1, 1.0, "softmax", None, fmt, None
+    )
+    assert mask.nonzero()[:, 1].tolist() == [3, 4, 5]
+    torch.testing.assert_close(probs[mask], torch.full_like(probs[mask], 1 / 3))
+
+    logits = torch.full((1, 16), -100.0, dtype=dtype, device="cuda")
+    logits[0, 0], logits[0, 2], logits[0, 4:6] = 10, 8, 7
+    _, mask, _ = tex.fused_topk_with_score_function_fwd(
+        logits, 2, False, 8, 2, 1.0, "softmax", None, fmt, None
+    )
+    assert mask.nonzero()[:, 1].tolist() == [0, 2]
