@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "cutlass/gemm/kernel/nvte_grouped_gemm_traits.hpp"
@@ -31,6 +33,7 @@ struct StagingSlot {
   cudaEvent_t copied = nullptr;
   bool copy_pending = false;
 };
+}  // namespace
 
 struct DeviceWorkspace {
   std::once_flag init;
@@ -39,6 +42,9 @@ struct DeviceWorkspace {
   char* pinned = nullptr;
 
   std::mutex cache_mutex;
+  std::condition_variable available;
+  WorkspaceGuard* active = nullptr;
+  size_t waiters = 0;
   char* last_workspace = nullptr;
   cudaStream_t last_stream = nullptr;
   std::vector<char> last_params;
@@ -60,6 +66,7 @@ struct DeviceWorkspace {
   }
 };
 
+namespace {
 DeviceWorkspace& device_workspace(int device) {
   static std::mutex mutex;
   static std::map<int, DeviceWorkspace> workspaces;
@@ -74,17 +81,20 @@ class HostStaging {
     std::call_once(device_.init, [&] { device_.init_staging(); });
     if (device_.pinned && param_bytes <= kHostWsSlotSize) {
       const unsigned index = device_.next.fetch_add(1, std::memory_order_relaxed) % kHostWsSlots;
-      slot_ = &device_.slots[index];
-      lock_ = std::unique_lock<std::mutex>(slot_->mutex);
-      if (slot_->copy_pending) {
-        NVTE_CHECK_CUDA(cudaEventSynchronize(slot_->copied));
-        slot_->copy_pending = false;
+      auto& slot = device_.slots[index];
+      lock_ = std::unique_lock<std::mutex>(slot.mutex, std::try_to_lock);
+      if (lock_.owns_lock()) {
+        slot_ = &slot;
+        if (slot_->copy_pending) {
+          NVTE_CHECK_CUDA(cudaEventSynchronize(slot_->copied));
+          slot_->copy_pending = false;
+        }
+        data_ = device_.pinned + index * kHostWsSlotSize;
+        return;
       }
-      data_ = device_.pinned + index * kHostWsSlotSize;
-    } else {
-      heap_.resize(param_bytes);
-      data_ = heap_.data();
     }
+    heap_.resize(param_bytes);
+    data_ = heap_.data();
   }
 
   char* data() const { return data_; }
@@ -101,14 +111,15 @@ class HostStaging {
     }
 
     static const bool cache_enabled = getenv<bool>("NVTE_GG_CACHE_PARAMS", true);
-    std::lock_guard<std::mutex> lock(device_.cache_mutex);
     const bool cacheable = cache_enabled && scratch_unused;
-    if (cacheable && device_.last_workspace == dest && device_.last_stream == stream &&
-        device_.last_params.size() == param_bytes_ &&
-        std::memcmp(device_.last_params.data(), data_, param_bytes_) == 0)
-      return;
-
-    device_.last_workspace = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(device_.cache_mutex);
+      if (cacheable && device_.last_workspace == dest && device_.last_stream == stream &&
+          device_.last_params.size() == param_bytes_ &&
+          std::memcmp(device_.last_params.data(), data_, param_bytes_) == 0)
+        return;
+      device_.last_workspace = nullptr;
+    }
     std::memset(data_ + param_bytes_, 0, total - param_bytes_);
     NVTE_CHECK_CUDA(cudaMemcpyAsync(dest, data_, total, cudaMemcpyHostToDevice, stream));
     if (slot_) {
@@ -121,6 +132,7 @@ class HostStaging {
       slot_->copy_pending = true;
     }
     if (cacheable) {
+      std::lock_guard<std::mutex> lock(device_.cache_mutex);
       device_.last_params.assign(data_, data_ + param_bytes_);
       device_.last_stream = stream;
       device_.last_workspace = dest;
@@ -208,8 +220,7 @@ struct ListGemm {
       sum_n += n;
       sum_k += k;
       if (ne4) {
-        ne4 = a.shape.size() == 2 && b.shape.size() == 2 && d.shape.size() == 2 &&
-              ne4_shape(m, n, k) &&
+        ne4 = ne4_shape(m, n, k) &&
               ((reinterpret_cast<uintptr_t>(a.dptr) | reinterpret_cast<uintptr_t>(b.dptr) |
                 reinterpret_cast<uintptr_t>(d.dptr)) %
                    16 ==
@@ -268,9 +279,9 @@ struct ListGemm {
     return along_n ? dim3(1, blocks, 1) : dim3(blocks, 1, 1);
   }
 
-  void launch(void* params, dim3 default_grid, bool along_n, int threads, int smem) const {
-    const auto compiled = get_or_compile(device, kernel, tile, smem);
-    const auto grid = launch_grid(default_grid, along_n, *compiled, threads);
+  void launch(void* params, dim3 default_grid, bool along_n, int threads,
+              const CompiledKernel& compiled) const {
+    const auto grid = launch_grid(default_grid, along_n, compiled, threads);
     te_profiling::TeProfParam tag;
     if (te_profiling::TeProfilingInterface::Instance().enabled()) {
       std::vector<int> m(groups), n(groups), k(groups);
@@ -289,14 +300,14 @@ struct ListGemm {
     void* args[] = {params};
     {
       te_profiling::TeHgtxGuard guard(tag);
-      NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchKernel, compiled->function, grid.x, grid.y, grid.z,
-                                  threads, 1, 1, compiled->smem_size, static_cast<CUstream>(stream),
+      NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchKernel, compiled.function, grid.x, grid.y, grid.z,
+                                  threads, 1, 1, compiled.smem_size, static_cast<CUstream>(stream),
                                   args, nullptr);
     }
     if (verbose_tile_debug()) {
       NVTE_WARN("RTC grouped GEMM groups=", groups, " tile=", tile.tile_m, "x", tile.tile_n, "x",
                 tile.tile_k, " stages=", tile.stages, " grid=(", grid.x, ",", grid.y,
-                ") threads=", threads, " smem=", compiled->smem_size);
+                ") threads=", threads, " smem=", compiled.smem_size);
     }
   }
 
@@ -325,6 +336,8 @@ struct ListGemm {
     ep.dD = reinterpret_cast<decltype(ep.dD)>(d.ldd);
     NVTE_CHECK(Kernel::can_implement(args), "CUTLASS cannot implement RTC grouped GEMM for ",
                groups, " groups.");
+    const auto compiled = get_or_compile(device, kernel, tile, Kernel::SharedStorageSize);
+    WorkspaceGuard guard(device, &workspace.nvte_tensor, 1, /*reuse_list_descriptors=*/true);
     void* scratch = upload(Kernel::get_workspace_size(args));
     // A pageable staging buffer can move when scratch is appended.
     args.problem_shape.host_problem_shapes = host_shapes();
@@ -333,8 +346,7 @@ struct ListGemm {
     auto params = Kernel::to_underlying_arguments(args, scratch);
     const bool along_n =
         params.scheduler.raster_order_ == decltype(params.scheduler)::RasterOrder::AlongN;
-    launch(&params, Kernel::get_grid_shape(params), along_n, Kernel::MaxThreadsPerBlock,
-           Kernel::SharedStorageSize);
+    launch(&params, Kernel::get_grid_shape(params), along_n, Kernel::MaxThreadsPerBlock, *compiled);
   }
 };
 
@@ -393,13 +405,49 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D, int group
 
 }  // namespace
 
-void invalidate_workspace(int device, uintptr_t begin, uintptr_t end) {
-  auto& workspace = device_workspace(device);
-  std::lock_guard<std::mutex> lock(workspace.cache_mutex);
-  const auto cached = reinterpret_cast<uintptr_t>(workspace.last_workspace);
-  if (cached && cached < end && begin < cached + workspace.last_params.size()) {
-    workspace.last_workspace = nullptr;
+bool WorkspaceGuard::overlaps(uintptr_t address, size_t bytes) const {
+  for (size_t i = 0; i < count_; ++i) {
+    const auto& data = convertNVTETensorCheck(workspaces_[i])->data;
+    const auto start = reinterpret_cast<uintptr_t>(data.dptr);
+    const auto size = data.buffer_size_bytes();
+    if (size && bytes && (start <= address ? address - start < size : start - address < bytes))
+      return true;
   }
+  return false;
+}
+
+WorkspaceGuard::WorkspaceGuard(int device, const NVTETensor* workspaces, size_t count,
+                               bool reuse_list_descriptors)
+    : device_(device_workspace(device)), workspaces_(workspaces), count_(count) {
+  std::unique_lock<std::mutex> lock(device_.cache_mutex);
+  auto available = [&] {
+    for (auto* other = device_.active; other; other = other->next_) {
+      for (size_t i = 0; i < count_; ++i) {
+        const auto& data = convertNVTETensorCheck(workspaces_[i])->data;
+        if (other->overlaps(reinterpret_cast<uintptr_t>(data.dptr), data.buffer_size_bytes()))
+          return false;
+      }
+    }
+    return true;
+  };
+  if (!available()) {
+    ++device_.waiters;
+    device_.available.wait(lock, available);
+    --device_.waiters;
+  }
+  if (!reuse_list_descriptors && device_.last_workspace &&
+      overlaps(reinterpret_cast<uintptr_t>(device_.last_workspace), device_.last_params.size())) {
+    device_.last_workspace = nullptr;
+  }
+  next_ = std::exchange(device_.active, this);
+}
+
+WorkspaceGuard::~WorkspaceGuard() {
+  std::lock_guard<std::mutex> lock(device_.cache_mutex);
+  auto** entry = &device_.active;
+  while (*entry != this) entry = &(*entry)->next_;
+  *entry = next_;
+  if (device_.waiters) device_.available.notify_all();
 }
 
 }  // namespace transformer_engine::grouped_gemm_rtc

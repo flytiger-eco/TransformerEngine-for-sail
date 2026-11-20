@@ -6,6 +6,7 @@
 
 #include <climits>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,11 @@ struct NativeStorage {
   uint64_t capacity;  // elements
   const int64_t *first, *last, *offsets;
   int64_t common_first, common_last;
+};
+
+struct DiscreteOperands {
+  NativeStorage* device;
+  std::vector<NativeStorage> host;
 };
 
 struct NativeSetup {
@@ -253,7 +259,8 @@ constexpr std::pair<int, int> native_launch_geometry() {
 }
 
 template <bool TA, bool TB, bool FP32>
-void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream) {
+void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream,
+                   const DiscreteOperands& lists, NVTETensor workspace) {
   if (cfg.stages == 0) cfg.stages = cfg.tile_m == 128 && cfg.tile_n == 128 ? 2 : 3;
   auto geometry = [&]() -> std::pair<int, int> {
 #define NVTE_NATIVE_MATCH(M, N, K, S) \
@@ -287,6 +294,7 @@ void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream) {
   const int columns = cfg.n_expand ? 4 : 1;
   const int nt = ((n + cfg.tile_n - 1) / cfg.tile_n) / columns;
   const uint64_t group_tiles = uint64_t(mt) * nt;
+  std::optional<WorkspaceGuard> guard;
   if (group_tiles > 0 && group_tiles <= INT_MAX / setup.groups && packed(setup.a, 2) &&
       packed(setup.b, 2) && packed(setup.c, setup.output_bytes) &&
       packed(setup.d, setup.output_bytes) &&
@@ -309,6 +317,12 @@ void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream) {
     params.tiles_per_group = cutlass::FastDivmod(int(group_tiles));
     params.tiles_per_row = cutlass::FastDivmod(nt);
   } else {
+    guard.emplace(cuda::current_device(), &workspace, 1);
+    if (!lists.host.empty()) {
+      NVTE_CHECK_CUDA(cudaMemcpyAsync(lists.device, lists.host.data(),
+                                      lists.host.size() * sizeof(NativeStorage),
+                                      cudaMemcpyHostToDevice, stream));
+    }
     if (setup.packed_in_place) {
       prepare_native_grouped_metadata<true><<<1, kMetadataThreads, 0, stream>>>(setup);
     } else {
@@ -441,18 +455,16 @@ bool try_native_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGr
   if (setup.sms <= 0) setup.sms = 39;
 
   char* memory = static_cast<char*>(ws->data.dptr);
-  // C API callers may reuse all or part of the list descriptor workspace.
-  // Invalidate before the first discrete copy or metadata kernel can write it.
-  invalidate_workspace(device, wrange.first, wrange.first + wrange.second);
   setup.control = reinterpret_cast<NativeControl*>(memory);
   memory += DIVUP_TO_MULTIPLE(sizeof(NativeControl), size_t(128));
   setup.experts = reinterpret_cast<NativeExpert*>(memory);
   memory += DIVUP_TO_MULTIPLE(groups * sizeof(NativeExpert), size_t(128));
+  DiscreteOperands lists{reinterpret_cast<NativeStorage*>(memory), {}};
+  lists.host.reserve(groups * ((A_list != nullptr) + (C_list != nullptr) + (D_list != nullptr)));
   int64_t discrete_rows = 0, discrete_cols = 0;
-  auto stage_discrete = [&](const NVTETensor* tensors, DType dtype) -> const NativeStorage* {
+  auto describe_discrete = [&](const NVTETensor* tensors, DType dtype) -> const NativeStorage* {
     if (!tensors) return nullptr;
-    std::vector<NativeStorage> descriptors;
-    descriptors.reserve(groups);
+    const auto* result = lists.device + lists.host.size();
     for (size_t i = 0; i < groups; ++i) {
       const auto* t = convertNVTETensorCheck(tensors[i]);
       NVTE_CHECK(t->dtype() == dtype && t->data.shape.size() == 2 &&
@@ -475,17 +487,13 @@ bool try_native_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGr
         discrete_cols += s.common_last;
       }
       if (tensors == D_list) check_metadata_disjoint(r);
-      descriptors.push_back(s);
+      lists.host.push_back(s);
     }
-    auto* result = reinterpret_cast<NativeStorage*>(memory);
-    NVTE_CHECK_CUDA(cudaMemcpyAsync(memory, descriptors.data(), groups * sizeof(NativeStorage),
-                                    cudaMemcpyHostToDevice, stream));
-    memory += DIVUP_TO_MULTIPLE(groups * sizeof(NativeStorage), size_t(128));
     return result;
   };
-  setup.b_list = stage_discrete(A_list, DType::kBFloat16);
-  setup.c_list = stage_discrete(C_list, output_dtype);
-  setup.d_list = stage_discrete(D_list, output_dtype);
+  setup.b_list = describe_discrete(A_list, DType::kBFloat16);
+  setup.c_list = describe_discrete(C_list, output_dtype);
+  setup.d_list = describe_discrete(D_list, output_dtype);
   // All tuning inputs are host-visible. In particular, do not read per-expert
   // CUDA shape tensors back to the host to choose a tile.
   const auto [b_rows, b_cols] = average_shape(*b);
@@ -502,11 +510,14 @@ bool try_native_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGr
   }
   auto layout = [&](auto fp32) {
     if (transb)
-      launch_native<true, false, decltype(fp32)::value>(setup, chosen, stream);
+      launch_native<true, false, decltype(fp32)::value>(setup, chosen, stream, lists,
+                                                        workspace_setup);
     else if (transa)
-      launch_native<false, true, decltype(fp32)::value>(setup, chosen, stream);
+      launch_native<false, true, decltype(fp32)::value>(setup, chosen, stream, lists,
+                                                        workspace_setup);
     else
-      launch_native<false, false, decltype(fp32)::value>(setup, chosen, stream);
+      launch_native<false, false, decltype(fp32)::value>(setup, chosen, stream, lists,
+                                                         workspace_setup);
   };
   if (output_dtype == DType::kFloat32)
     layout(std::true_type{});

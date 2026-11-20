@@ -987,9 +987,12 @@ void multi_stream_cublas_gemm(const NVTETensor *A, const NVTETensor *B, NVTETens
                               cudaStream_t stream) {
   using namespace transformer_engine;
 
+  if (num_gemms <= 0) return;
   int num_streams = nvte_get_num_compute_streams();
 
   int num_stream_used = std::min(num_streams, num_gemms);
+  // cuBLAS may use every active compute stream's workspace before it rejoins stream.
+  grouped_gemm_rtc::WorkspaceGuard guard(cuda::current_device(), workspace, num_stream_used);
   // wait for current stream to finish
   NVTE_CHECK_CUDA(cudaEventRecord(detail::get_compute_stream_event(0), stream));
   for (int s = 0; s < num_stream_used; s++) {
@@ -1050,7 +1053,6 @@ void nvte_multi_stream_cublas_gemm(const NVTETensor *A, const NVTETensor *B, NVT
       "Please migrate to nvte_multi_tensor_gemm (with CUTLASS Grouped GEMM support when "
       "applicable).");
 
-  grouped_gemm_rtc::invalidate_workspace(cuda::current_device());
   multi_stream_cublas_gemm(A, B, D, bias, pre_gelu_out, num_gemms, transa, transb, grad, workspace,
                            accumulate, use_split_accumulator, math_sm_count, stream);
 }
@@ -1093,9 +1095,11 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
       for (int i = 0; i < num_gemms; ++i) {
         const auto *te_in = transformer_engine::convertNVTETensorCheck(B[i]);  // input role: M = tokens
         const auto *te_wt = transformer_engine::convertNVTETensorCheck(A[i]);  // weight role: N = out, K = in
-        te_m[i] = transb ? te_in->data.shape[1] : te_in->data.shape[0];
-        te_k[i] = transa ? te_wt->data.shape[1] : te_wt->data.shape[0];
-        te_n[i] = transa ? te_wt->data.shape[0] : te_wt->data.shape[1];
+        const auto [input_rows, input_cols] = te_in->flat_2d_dims();
+        const auto [weight_rows, weight_cols] = te_wt->flat_2d_dims();
+        te_m[i] = transb ? input_cols : input_rows;
+        te_k[i] = transa ? weight_cols : weight_rows;
+        te_n[i] = transa ? weight_rows : weight_cols;
       }
       // Report the real operand dtype. The cuBLAS fallback also serves fp32 and
       // fp8 inputs, so a blanket "fp16" label for every non-bf16 call would
@@ -1120,7 +1124,6 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
           current_device, stream);
     }
     transformer_engine::te_profiling::TeHgtxGuard te_prof_guard(te_prof);
-    transformer_engine::grouped_gemm_rtc::invalidate_workspace(current_device);
     multi_stream_cublas_gemm(A, B, D, bias, pre_gelu_out, num_gemms, transa, transb, grad,
                              workspace, accumulate, use_split_accumulator, math_sm_count, stream);
   };
@@ -1156,7 +1159,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
       const auto &b = convertNVTETensorCheck(B[i])->data;
       const auto &d = convertNVTETensorCheck(D[i])->data;
       if (a.dtype != input_dtype || b.dtype != input_dtype || d.dtype != output_dtype ||
-          a.shape.size() < 2 || b.shape.size() < 2 || d.shape.size() < 2 || a.shape.back() % 8 ||
+          a.shape.size() != 2 || b.shape.size() != 2 || d.shape.size() != 2 || a.shape.back() % 8 ||
           b.shape.back() % 8 || d.shape.back() % 8)
         return false;
       if (!sm80_disable_alignment_check) {
@@ -1191,7 +1194,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
     run_cublas();
     return;
   }
-  grouped_gemm_rtc::invalidate_workspace(current_device);
+  grouped_gemm_rtc::WorkspaceGuard guard(current_device, workspace, 1);
   if (is_hopper) {
     cutlass_grouped_gemm(A, B, D, num_gemms, transa, transb, grad, workspace, accumulate,
                          current_device, math_sm_count, stream);

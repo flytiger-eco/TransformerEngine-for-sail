@@ -27,8 +27,24 @@ size_t native_grouped_gemm_workspace_size(size_t groups);
 bool native_grouped_gemm_supported_device();
 
 namespace grouped_gemm_rtc {
-// Invalidate cached list descriptors overlapping a workspace write. Backends
-// with opaque scratch usage can invalidate the entire device address range.
-void invalidate_workspace(int device, uintptr_t begin = 0, uintptr_t end = UINTPTR_MAX);
+struct DeviceWorkspace;
+
+// Keep writes to overlapping workspace views and their consuming GEMM together
+// on the caller's stream. Acquire after compilation, before the first GPU write.
+class WorkspaceGuard {
+ public:
+  WorkspaceGuard(int device, const NVTETensor* workspaces, size_t count,
+                 bool reuse_list_descriptors = false);
+  ~WorkspaceGuard();
+  WorkspaceGuard(const WorkspaceGuard&) = delete;
+  WorkspaceGuard& operator=(const WorkspaceGuard&) = delete;
+
+ private:
+  bool overlaps(uintptr_t address, size_t bytes) const;
+  DeviceWorkspace& device_;
+  const NVTETensor* workspaces_;
+  size_t count_;
+  WorkspaceGuard* next_;
+};
 }  // namespace grouped_gemm_rtc
 }  // namespace transformer_engine

@@ -16,6 +16,8 @@ vacuously.
 """
 
 import importlib
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 import torch
@@ -363,6 +365,17 @@ def test_direct_grouped_gemm_descriptor_rank(monkeypatch):
     torch.testing.assert_close(out, b, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("rtc", ["0", "1"])
+@pytest.mark.parametrize("batched", ["a", "b", "both"])
+def test_aligned_higher_rank_grouped_gemm(monkeypatch, rtc, batched):
+    monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM_RTC", rtc)
+    a = torch.ones((8, 8, 8) if batched != "b" else (8, 8), device="cuda", dtype=torch.bfloat16)
+    b = torch.ones((8, 8, 8) if batched != "a" else (8, 8), device="cuda", dtype=a.dtype)
+    out = torch.full((*b.shape[:-1], a.numel() // 8), float("nan"), device="cuda", dtype=a.dtype)
+    _direct_grouped_gemm([a], [b], [out])
+    assert torch.all(out == 8)
+
+
 def _reference(inp, weights, grad_out, splits):
     """Forward + backward in fp32, one plain matmul per group."""
     x = inp.detach().clone().float().requires_grad_(True)
@@ -679,6 +692,49 @@ def _expert_views(storage, shapes):
         views.append(data.narrow(0, offset, rows * cols).view(rows, cols))
         offset += rows * cols
     return views
+
+
+@pytest.mark.parametrize("path", ["list", "discrete_in", "discrete_out"])
+def test_shared_workspace_concurrent_submissions(path, monkeypatch):
+    if path != "list" and torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Native GroupedTensor requires PPU sm89")
+    device = torch.cuda.current_device()
+    stream = torch.cuda.Stream()
+    shapes = [(64, 64), (64, 64)]
+    dtype = torch.bfloat16
+    barrier = Barrier(2)
+    with torch.cuda.stream(stream):
+        workspace = gemm_ext.get_cublas_workspace(device, False, True)
+    monkeypatch.setattr(gemm_ext, "_get_grouped_gemm_setup_workspace", lambda *args: workspace[0])
+
+    def worker(scale):
+        with torch.cuda.device(device), torch.cuda.stream(stream):
+            a = _packed_storage(shapes, dtype, mirror=False)
+            b = _packed_storage(shapes, dtype, mirror=False)
+            a.rowwise_data.fill_(scale)
+            b.rowwise_data.fill_(1)
+            av, bv = _expert_views(a, shapes), _expert_views(b, shapes)
+            outputs = [_packed_storage(shapes, dtype, mirror=False) for _ in range(24)]
+            for d in outputs:
+                d.rowwise_data.fill_(float("nan"))
+            for d in outputs:
+                dv = _expert_views(d, shapes)
+                barrier.wait(timeout=60)
+                if path == "list":
+                    _direct_grouped_gemm(av, bv, dv, workspace=workspace)
+                else:
+                    gemm_ext.general_grouped_gemm_for_grouped_tensor(
+                        av if path == "discrete_in" else a, b, dv if path == "discrete_out" else d
+                    )
+            stream.synchronize()
+            for d in outputs:
+                assert torch.all(d.rowwise_data == 64 * scale)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(worker, 1)
+        second = pool.submit(worker, 2)
+        first.result()
+        second.result()
 
 
 @pytest.mark.parametrize("offset", [0, 128])
