@@ -39,7 +39,7 @@ jobs:
           python-version: '3.12'
       - name: 'Lint'
         run: |
-          python -m pip install torch numpy
+          python -m pip install torch numpy wheel
           export PYTHON_ONLY=1
           export TE_PATH=.
           bash ./qa/L0_pytorch_lint/test.sh
