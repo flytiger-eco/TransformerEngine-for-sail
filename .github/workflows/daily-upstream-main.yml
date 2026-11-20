@@ -310,7 +310,7 @@ jobs:
           with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
               summary.write(response['summary'] + '\n')
           PY
-          git commit --signoff -m "Merge ${UPSTREAM_REPOSITORY}:main into repository main"
+          git commit --signoff -m "Merge ${UPSTREAM_REPOSITORY}:main into main"
           [[ "$(git rev-parse HEAD^1)" == "$BASE_SHA" ]] || exit 1
           [[ "$(git rev-parse HEAD^2)" == "$UPSTREAM_SHA" ]] || exit 1
           mkdir -p "$RUNNER_TEMP/sync-candidate"
@@ -430,7 +430,7 @@ jobs:
           EOF
           )
           if PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$PR_BRANCH" \
-            --draft --title "Merge upstream main (${UPSTREAM_SHA:0:12})" --body "$BODY"); then
+            --title "Merge upstream main (${UPSTREAM_SHA:0:12})" --body "$BODY"); then
             :
           else
             create_status=$?
