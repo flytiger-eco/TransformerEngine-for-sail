@@ -2,16 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""Regression tests for the host descriptor cache of `general_grouped_gemm`.
-
-`te_general_grouped_gemm` keeps one descriptor per expert in thread-local
-storage and refreshes it in place when it is handed the same tensor again. The
-identity it compared was `(PyObject*, data_ptr, dtype)`, which a torch view can
-satisfy while carrying a different shape: `GroupedLinear.backward` re-creates
-its split views in every layer and the allocator hands the same address back, so
-an fc1 dgrad could leave a 1024-wide B behind for fc2's dgrad and trip the
-dimension check in `getGemmOutputShape`.
-"""
+"""Regression tests for reusing host descriptors across grouped GEMM calls."""
 
 import pytest
 import torch
@@ -53,12 +44,7 @@ def _dgrad(weights, grad_out_parts, m_splits, k):
 
 
 def test_descriptor_shape_change():
-    """Same PyObject and data_ptr, new shape: the descriptor must be refreshed.
-
-    Deterministic repro of the stale-shape assertion: `resize_` keeps the buffer
-    in place, so the identity the cache compares is unchanged while the width
-    goes 1024 -> 2048.
-    """
+    """Resizing a split view in place must refresh its descriptor dimensions."""
     weight1 = torch.randn(*FC1, device="cuda", dtype=torch.bfloat16)
     weight2 = torch.randn(*FC2, device="cuda", dtype=torch.bfloat16)
     grad_out = torch.randn(M, FC2[0], device="cuda", dtype=torch.bfloat16)
@@ -90,3 +76,30 @@ def test_descriptor_slot_handoff_with_empty_groups():
             torch.testing.assert_close(
                 out.float(), grad_out.float() @ weights[0].float(), rtol=RTOL, atol=ATOL
             )
+
+
+def test_descriptor_reuse_after_fp8(monkeypatch):
+    """Reuse FP8 slots for a flat input and for a list with separate outputs."""
+    if not te.is_fp8_available():
+        pytest.skip("FP8 is required")
+    monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "0")
+    monkeypatch.setenv("NVTE_FORCE_RTC_NO_FALLBACK", "0")
+    w = torch.randint(-2, 3, (64, 128), device="cuda").bfloat16()
+    x = torch.randint(-2, 3, (32, 128), device="cuda").bfloat16()
+    quantizer = te.Float8Quantizer(
+        scale=torch.full((1,), 2.0, device="cuda"),
+        amax=torch.empty(1, device="cuda"),
+        fp8_dtype=te.DType.kFloat8E4M3,
+    )
+    qw, qx = quantizer(-w), quantizer(x)
+    expected = x.float() @ w.float().t()
+    for single_output in (True, False):
+        for a, b, single, reference in (
+            ([qw], [qx], False, -expected),
+            ([w], x if single_output else [x], single_output, expected),
+        ):
+            out = torch.full_like(expected, float("nan"), dtype=torch.bfloat16)
+            general_grouped_gemm(
+                a, b, [out], [None], out.dtype, m_splits=[x.size(0)], single_output=single
+            )
+            torch.testing.assert_close(out.float(), reference, rtol=0, atol=0)

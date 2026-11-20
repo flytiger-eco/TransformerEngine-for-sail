@@ -349,6 +349,20 @@ def test_direct_grouped_gemm_flatten_and_empty(single_output, accumulate, monkey
     _direct_grouped_gemm([], [], [])
 
 
+def test_direct_grouped_gemm_descriptor_rank(monkeypatch):
+    monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "0")
+    monkeypatch.setenv("NVTE_FORCE_RTC_NO_FALLBACK", "0")
+    a = torch.eye(16, device="cuda", dtype=torch.bfloat16)
+    # NVTEShape has room for 15 dimensions. Keep all of B's outer dimensions in D.
+    b = torch.ones((1,) * 13 + (16, 16), device="cuda", dtype=a.dtype)
+    out = torch.zeros_like(b)
+    with pytest.raises(RuntimeError, match="Too many dimensions"):
+        _direct_grouped_gemm([a], [b.unsqueeze(0)], [out])
+    assert torch.count_nonzero(out) == 0
+    _direct_grouped_gemm([a], [b], [out])
+    torch.testing.assert_close(out, b, rtol=0, atol=0)
+
+
 def _reference(inp, weights, grad_out, splits):
     """Forward + backward in fp32, one plain matmul per group."""
     x = inp.detach().clone().float().requires_grad_(True)
