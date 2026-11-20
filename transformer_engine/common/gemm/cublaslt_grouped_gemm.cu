@@ -50,6 +50,218 @@ inline void CreateCublasHandle(cublasLtHandle_t *handle) {
 // BF16 support for grouped GEMM requires cuBLAS 13.3+
 #define CUBLAS_GROUPED_GEMM_VERSION 130300
 
+namespace {
+
+struct NativeBiasStorage {
+  const int64_t *first, *last, *offsets;
+  int64_t common_first, common_last;
+  uint64_t capacity;
+};
+
+struct NativeBiasSlice {
+  uint64_t rows, cols, offset, count;
+};
+
+__device__ void native_bias_require(bool condition, const char *message) {
+  if (!condition) {
+    printf("%s\n", message);
+    __assert_fail(message, __FILE__, __LINE__, __func__);
+  }
+}
+
+__device__ NativeBiasSlice native_bias_slice(const NativeBiasStorage &s, size_t group,
+                                             uint64_t &running) {
+  const int64_t rows = s.first ? s.first[group] : s.common_first;
+  const int64_t cols = s.last ? s.last[group] : s.common_last;
+  native_bias_require(rows >= 0 && cols >= 0, "native grouped bias add: negative dimension");
+  native_bias_require(rows == 0 || uint64_t(cols) <= uint64_t(INT64_MAX) / uint64_t(rows),
+                      "native grouped bias add: dimension product overflow");
+  const uint64_t count = uint64_t(rows) * uint64_t(cols);
+  uint64_t offset = running;
+  if (s.offsets) {
+    const int64_t start = s.offsets[group], end = s.offsets[group + 1];
+    native_bias_require(start >= 0 && end >= start && uint64_t(start) == running &&
+                            count <= uint64_t(end - start),
+                        "native grouped bias add: invalid CSR offsets or overlapping groups");
+    offset = uint64_t(start);
+    running = uint64_t(end);
+  } else {
+    native_bias_require(count <= uint64_t(INT64_MAX) - running,
+                        "native grouped bias add: cumulative offset overflow");
+    running += count;
+  }
+  native_bias_require(offset <= s.capacity && count <= s.capacity - offset &&
+                          running <= s.capacity,
+                      "native grouped bias add: group exceeds storage capacity");
+  return {uint64_t(rows), uint64_t(cols), offset, count};
+}
+
+template <typename T, bool UseScale>
+__global__ void native_grouped_bias_add_kernel(T *output, const T *bias, const float *scale,
+                                               NativeBiasStorage d, NativeBiasStorage b,
+                                               size_t groups, uint64_t scale_count) {
+  if (threadIdx.x == 0) {
+    uint64_t d_end = d.offsets ? uint64_t(d.offsets[0]) : 0;
+    uint64_t b_end = b.offsets ? uint64_t(b.offsets[0]) : 0;
+    uint64_t total_rows = 0, total_elements = 0;
+    for (size_t g = 0; g < groups; ++g) {
+      const auto ds = native_bias_slice(d, g, d_end);
+      const auto bs = native_bias_slice(b, g, b_end);
+      native_bias_require(bs.rows == 1 && bs.cols == ds.cols,
+                          "native grouped bias add: bias shape must be (1, output width)");
+      native_bias_require(ds.rows <= uint64_t(INT64_MAX) - total_rows &&
+                              ds.count <= uint64_t(INT64_MAX) - total_elements,
+                          "native grouped bias add: total rows or elements overflow");
+      total_rows += ds.rows;
+      total_elements += ds.count;
+    }
+    if constexpr (UseScale) {
+      native_bias_require(scale_count == total_rows,
+                          "native grouped bias add: scale size must equal total output rows");
+    }
+  }
+  // Every CTA completes the same full validation before touching output.
+  __syncthreads();
+
+  const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+  uint64_t index = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  uint64_t element_start = 0, row_start = 0;
+  uint64_t d_end = d.offsets ? uint64_t(d.offsets[0]) : 0;
+  uint64_t b_end = b.offsets ? uint64_t(b.offsets[0]) : 0;
+  for (size_t g = 0; g < groups; ++g) {
+    const auto ds = native_bias_slice(d, g, d_end);
+    const auto bs = native_bias_slice(b, g, b_end);
+    const uint64_t element_end = element_start + ds.count;
+    while (index < element_end) {
+      const uint64_t local = index - element_start;
+      const float value = static_cast<float>(output[ds.offset + local]);
+      const float bias_value = static_cast<float>(bias[bs.offset + local % ds.cols]);
+      if constexpr (UseScale) {
+        output[ds.offset + local] =
+            static_cast<T>(fmaf(bias_value, scale[row_start + local / ds.cols], value));
+      } else {
+        output[ds.offset + local] = static_cast<T>(value + bias_value);
+      }
+      index += stride;
+    }
+    element_start = element_end;
+    row_start += ds.rows;
+  }
+}
+
+bool try_native_grouped_bias_add(const NVTEGroupedTensor output, const NVTEGroupedTensor bias,
+                                 const NVTETensor scale, bool use_scale, cudaStream_t stream) {
+  using namespace transformer_engine;
+  if (!native_grouped_gemm_supported_device()) return false;
+  const auto *d = convertNVTEGroupedTensorCheck(output);
+  const auto *b = convertNVTEGroupedTensorCheck(bias);
+  if ((d->dtype() != DType::kBFloat16 && d->dtype() != DType::kFloat32) ||
+      (b->dtype() != DType::kBFloat16 && b->dtype() != DType::kFloat32) ||
+      d->scaling_mode != NVTE_DELAYED_TENSOR_SCALING ||
+      b->scaling_mode != NVTE_DELAYED_TENSOR_SCALING || d->scale_inv.dptr ||
+      d->columnwise_scale_inv.dptr || b->scale_inv.dptr || b->columnwise_scale_inv.dptr) {
+    return false;
+  }
+  NVTE_CHECK(d->dtype() == b->dtype(), "native grouped bias add: output/bias dtypes must match");
+  const size_t groups = d->num_tensors;
+  NVTE_CHECK(groups > 0 && groups < size_t(INT64_MAX) && groups == b->num_tensors,
+             "native grouped bias add: output/bias group counts must be equal and nonzero");
+  int device;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device));
+  auto check_pointer = [&](const void *pointer, size_t alignment) {
+    if (!pointer) return;
+    cudaPointerAttributes attrs{};
+    NVTE_CHECK_CUDA(cudaPointerGetAttributes(&attrs, pointer));
+    NVTE_CHECK(attrs.type == cudaMemoryTypeDevice && attrs.device == device &&
+                   reinterpret_cast<uintptr_t>(pointer) % alignment == 0,
+               "native grouped bias add: storage must be aligned CUDA data on the current device");
+  };
+  auto range = [](const void *pointer, uint64_t count, uint64_t bytes) {
+    const uint64_t start = reinterpret_cast<uintptr_t>(pointer);
+    NVTE_CHECK(count <= (UINT64_MAX - start) / bytes,
+               "native grouped bias add: storage byte range overflow");
+    return std::make_pair(start, count * bytes);
+  };
+  auto disjoint = [](auto x, auto y) {
+    return x.second == 0 || y.second == 0 ||
+           (x.first <= y.first ? x.second <= y.first - x.first
+                               : y.second <= x.first - y.first);
+  };
+  auto metadata = [&](const SimpleTensor &t, size_t count) -> const int64_t * {
+    NVTE_CHECK(t.shape.size() == 1, "native grouped bias add: metadata must be rank 1");
+    if (!t.dptr) {
+      NVTE_CHECK(t.shape[0] == 0, "native grouped bias add: null nonempty metadata");
+      return nullptr;
+    }
+    NVTE_CHECK(t.dtype == DType::kInt64 && t.shape[0] == count,
+               "native grouped bias add: metadata must be int64 with exact group length");
+    check_pointer(t.dptr, sizeof(int64_t));
+    return static_cast<const int64_t *>(t.dptr);
+  };
+  const size_t bytes = typeToSize(d->dtype());
+  auto storage = [&](const GroupedTensor *t) {
+    NVTE_CHECK(t->logical_shape.ndim == 2 && t->data.shape.size() == 1 &&
+                   t->data.dtype == d->dtype() && t->data.shape[0] <= size_t(INT64_MAX) &&
+                   t->logical_shape.data[0] <= size_t(INT64_MAX) &&
+                   t->logical_shape.data[1] <= size_t(INT64_MAX),
+               "native grouped bias add: requires packed rowwise storage and a 2D logical shape");
+    NativeBiasStorage s{};
+    s.capacity = t->data.shape[0];
+    NVTE_CHECK(s.capacity == 0 || t->data.dptr,
+               "native grouped bias add: null nonempty rowwise storage");
+    check_pointer(t->data.dptr, bytes);
+    s.first = metadata(t->first_dims, groups);
+    s.last = metadata(t->last_dims, groups);
+    s.offsets = metadata(t->tensor_offsets, groups + 1);
+    if (!s.first) {
+      NVTE_CHECK(s.last || t->logical_shape.data[0] % groups == 0,
+                 "native grouped bias add: uniform rows must be divisible by group count");
+      s.common_first = s.last ? t->logical_shape.data[0] : t->logical_shape.data[0] / groups;
+    }
+    if (!s.last) s.common_last = t->logical_shape.data[1];
+    return s;
+  };
+  const auto ds = storage(d), bs = storage(b);
+  const auto d_range = range(d->data.dptr, ds.capacity, bytes);
+  NVTE_CHECK(disjoint(d_range, range(b->data.dptr, bs.capacity, bytes)),
+             "native grouped bias add: bias must not overlap output");
+  for (const auto *t : {d, b}) {
+    for (const auto *m : {&t->first_dims, &t->last_dims, &t->tensor_offsets}) {
+      NVTE_CHECK(disjoint(d_range, range(m->dptr, m->shape[0], sizeof(int64_t))),
+                 "native grouped bias add: output must not overlap immutable metadata");
+    }
+  }
+  const float *scale_ptr = nullptr;
+  uint64_t scale_count = 0;
+  if (use_scale) {
+    const auto *s = convertNVTETensorCheck(scale);
+    NVTE_CHECK(s->data.dtype == DType::kFloat32 && s->data.shape.size() == 1 &&
+                   s->data.shape[0] <= size_t(INT64_MAX) &&
+                   (s->data.shape[0] == 0 || s->data.dptr),
+               "native grouped bias add: scale must be a float32 row vector");
+    check_pointer(s->data.dptr, sizeof(float));
+    scale_ptr = static_cast<const float *>(s->data.dptr);
+    scale_count = s->data.shape[0];
+    NVTE_CHECK(disjoint(d_range, range(scale_ptr, scale_count, sizeof(float))),
+               "native grouped bias add: scale must not overlap output");
+  }
+  const int blocks = std::max(1, cuda::sm_count(device));
+  auto launch = [&](auto tag) {
+    constexpr bool UseScale = decltype(tag)::value;
+    TRANSFORMER_ENGINE_TYPE_SWITCH_FP32_BF16(d->dtype(), T, {
+      native_grouped_bias_add_kernel<T, UseScale><<<blocks, 256, 0, stream>>>(
+          static_cast<T *>(d->data.dptr), static_cast<const T *>(b->data.dptr), scale_ptr,
+          ds, bs, groups, scale_count);
+    });
+  };
+  if (use_scale) launch(std::true_type{});
+  else launch(std::false_type{});
+  NVTE_CHECK_CUDA(cudaGetLastError());
+  return true;
+}
+
+}  // namespace
+
 #if CUBLAS_VERSION >= CUBLAS_GROUPED_GEMM_VERSION
 
 namespace {
@@ -1569,6 +1781,10 @@ inline void launch_grouped_gemm_setup(
 
 size_t nvte_get_grouped_gemm_setup_workspace_size(size_t num_tensors) {
   NVTE_API_CALL(nvte_get_grouped_gemm_setup_workspace_size);
+  if (transformer_engine::native_grouped_gemm_supported_device()) {
+    return std::max(transformer_engine::native_grouped_gemm_workspace_size(num_tensors),
+                    grouped_gemm_setup_workspace_size(num_tensors));
+  }
   return grouped_gemm_setup_workspace_size(num_tensors);
 }
 
@@ -1579,6 +1795,11 @@ void nvte_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGroupedT
                        cudaStream_t stream) {
   NVTE_API_CALL(nvte_grouped_gemm);
   using namespace transformer_engine;
+
+  if (try_native_grouped_gemm(A, transa, B, transb, C, D, alpha, beta, workspace_setup,
+                              workspace_cublas, config, stream)) {
+    return;
+  }
 
   // Grouped GEMM requires Blackwell (SM10x and SM110) with cuBLAS 13.3+,
   // or Hopper (SM90) with cuBLAS 13.4+.
@@ -1664,6 +1885,11 @@ void nvte_grouped_gemm_with_discrete_inputA(const NVTETensor *A_list, size_t num
                                             NVTEGroupedMatmulConfig config, cudaStream_t stream) {
   NVTE_API_CALL(nvte_grouped_gemm_with_discrete_inputA);
   using namespace transformer_engine;
+
+  if (try_native_grouped_gemm(nullptr, transa, B, transb, C, D, alpha, beta, workspace_setup,
+                              workspace_cublas, config, stream, A_list, num_a_tensors)) {
+    return;
+  }
 
   // Grouped GEMM requires Blackwell (SM10x and SM110) with cuBLAS 13.3+,
   // or Hopper (SM90) with cuBLAS 13.4+.
@@ -1814,6 +2040,16 @@ void nvte_grouped_gemm_with_discrete_out(const NVTEGroupedTensor A, int transa,
                                          NVTEGroupedMatmulConfig config, cudaStream_t stream) {
   NVTE_API_CALL(nvte_grouped_gemm_with_discrete_out);
   using namespace transformer_engine;
+
+  NVTE_CHECK(num_c_tensors == 0 || num_c_tensors == num_d_tensors,
+             "Grouped GEMM: nonempty C_list and D_list counts must match.");
+  NVTE_CHECK(num_c_tensors == 0 || C_list != nullptr,
+             "Grouped GEMM: C_list is null but num_c_tensors > 0.");
+  if (try_native_grouped_gemm(A, transa, B, transb, nullptr, nullptr, alpha, beta,
+                              workspace_setup, workspace_cublas, config, stream, nullptr, 0,
+                              num_c_tensors == 0 ? nullptr : C_list, D_list, num_d_tensors)) {
+    return;
+  }
 
   // Grouped GEMM requires Blackwell (SM10x and SM110) with cuBLAS 13.3+,
   // or Hopper (SM90) with cuBLAS 13.4+.
@@ -1983,6 +2219,7 @@ void launch_grouped_bias_add(const transformer_engine::GroupedTensor *outputD,
 void nvte_grouped_bias_add(const NVTEGroupedTensor output, const NVTEGroupedTensor bias,
                            cudaStream_t stream) {
   NVTE_API_CALL(nvte_grouped_bias_add);
+  if (try_native_grouped_bias_add(output, bias, nullptr, false, stream)) return;
   using namespace transformer_engine;
   const GroupedTensor *outputD = convertNVTEGroupedTensorCheck(output);
   const GroupedTensor *bias_tensor = convertNVTEGroupedTensorCheck(bias);
@@ -1992,6 +2229,7 @@ void nvte_grouped_bias_add(const NVTEGroupedTensor output, const NVTEGroupedTens
 void nvte_grouped_scaled_bias_add(const NVTEGroupedTensor output, const NVTEGroupedTensor bias,
                                   const NVTETensor scale, cudaStream_t stream) {
   NVTE_API_CALL(nvte_grouped_scaled_bias_add);
+  if (try_native_grouped_bias_add(output, bias, scale, true, stream)) return;
   using namespace transformer_engine;
   const GroupedTensor *outputD = convertNVTEGroupedTensorCheck(output);
   const GroupedTensor *bias_tensor = convertNVTEGroupedTensorCheck(bias);
@@ -2019,6 +2257,11 @@ void nvte_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGroupedT
                        const NVTETensor beta, NVTETensor workspace_setup,
                        NVTETensor workspace_cublas, NVTEGroupedMatmulConfig config,
                        cudaStream_t stream) {
+  if (transformer_engine::try_native_grouped_gemm(A, transa, B, transb, C, D, alpha, beta,
+                                                  workspace_setup, workspace_cublas, config,
+                                                  stream)) {
+    return;
+  }
   NVTE_ERROR("nvte_grouped_gemm requires cuBLAS 13.3+, but compile-time cuBLAS version is ",
              CUBLAS_VERSION, ". Please upgrade to cuBLAS 13.3 (shipped with CUDA 13.2) or newer.");
 }
@@ -2029,6 +2272,11 @@ void nvte_grouped_gemm_with_discrete_inputA(const NVTETensor *A_list, size_t num
                                             const NVTETensor alpha, const NVTETensor beta,
                                             NVTETensor workspace_setup, NVTETensor workspace_cublas,
                                             NVTEGroupedMatmulConfig config, cudaStream_t stream) {
+  if (transformer_engine::try_native_grouped_gemm(
+          nullptr, transa, B, transb, C, D, alpha, beta, workspace_setup, workspace_cublas,
+          config, stream, A_list, num_a_tensors)) {
+    return;
+  }
   NVTE_ERROR(
       "nvte_grouped_gemm_with_discrete_inputA requires cuBLAS 13.3+, but compile-time "
       "cuBLAS version is ",
@@ -2042,6 +2290,15 @@ void nvte_grouped_gemm_with_discrete_out(const NVTEGroupedTensor A, int transa,
                                          const NVTETensor alpha, const NVTETensor beta,
                                          NVTETensor workspace_setup, NVTETensor workspace_cublas,
                                          NVTEGroupedMatmulConfig config, cudaStream_t stream) {
+  NVTE_CHECK(num_c_tensors == 0 || num_c_tensors == num_d_tensors,
+             "Grouped GEMM: nonempty C_list and D_list counts must match.");
+  NVTE_CHECK(num_c_tensors == 0 || C_list != nullptr,
+             "Grouped GEMM: C_list is null but num_c_tensors > 0.");
+  if (transformer_engine::try_native_grouped_gemm(
+          A, transa, B, transb, nullptr, nullptr, alpha, beta, workspace_setup, workspace_cublas,
+          config, stream, nullptr, 0, num_c_tensors == 0 ? nullptr : C_list, D_list, num_d_tensors)) {
+    return;
+  }
   NVTE_ERROR(
       "nvte_grouped_gemm_with_discrete_out requires cuBLAS 13.3+, but compile-time "
       "cuBLAS version is ",
@@ -2050,12 +2307,14 @@ void nvte_grouped_gemm_with_discrete_out(const NVTEGroupedTensor A, int transa,
 
 void nvte_grouped_bias_add(const NVTEGroupedTensor output, const NVTEGroupedTensor bias,
                            cudaStream_t stream) {
+  if (try_native_grouped_bias_add(output, bias, nullptr, false, stream)) return;
   NVTE_ERROR("nvte_grouped_bias_add requires cuBLAS 13.3+, but compile-time cuBLAS version is ",
              CUBLAS_VERSION, ". Please upgrade to cuBLAS 13.3 (shipped with CUDA 13.2) or newer.");
 }
 
 void nvte_grouped_scaled_bias_add(const NVTEGroupedTensor output, const NVTEGroupedTensor bias,
                                   const NVTETensor scale, cudaStream_t stream) {
+  if (try_native_grouped_bias_add(output, bias, scale, true, stream)) return;
   NVTE_ERROR(
       "nvte_grouped_scaled_bias_add requires cuBLAS 13.3+, but compile-time cuBLAS version "
       "is ",
@@ -2063,6 +2322,9 @@ void nvte_grouped_scaled_bias_add(const NVTEGroupedTensor output, const NVTEGrou
 }
 
 size_t nvte_get_grouped_gemm_setup_workspace_size(size_t num_tensors) {
+  if (transformer_engine::native_grouped_gemm_supported_device()) {
+    return transformer_engine::native_grouped_gemm_workspace_size(num_tensors);
+  }
   NVTE_ERROR(
       "nvte_get_grouped_gemm_setup_workspace_size requires cuBLAS 13.3+, but compile-time cuBLAS "
       "version is ",

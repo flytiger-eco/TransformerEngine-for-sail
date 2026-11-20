@@ -1004,12 +1004,31 @@ class GroupedLinear(BasicOperation):
         # Caller-provided output buffer (backward grad-input buffer is read in save_ctx).
         out_buffer = basic_op_kwargs[0].get(OUTPUT_BUFFER_KEY)
 
-        # Dispatch: graph-safe GroupedTensor flow whenever it can be used.
-        # See ``_is_graph_safe_path_supported`` for the gating rationale --
-        # in short it requires Hopper (SM90+) plus a supported dtype /
-        # quantization recipe. Otherwise we fall back to the legacy
-        # ``tex.split_quantize`` + ``general_grouped_gemm`` flow.
-        use_grouped_tensor_path = self._is_graph_safe_path_supported(
+        # Packed BF16 weights use GroupedTensor metadata; the binding selects
+        # the GEMM implementation. Keep the existing graph-safe support otherwise.
+        packed_weights_supported = (
+            self.single_grouped_weight
+            and torch.cuda.get_device_capability(device) == (8, 9)
+            and dtype == torch.bfloat16
+            and self.in_features % 8 == 0
+            and self.out_features % 8 == 0
+            and not is_quantized_tensor(input_)
+            and not self.has_bias
+            and not self._scale_bias
+            and not with_quantized_compute
+            and not self._with_quantized_weight
+            and weight_param.quantizer is None
+            and not FP8GlobalStateManager.is_fp8_calibration()
+            and all(q is None for q in input_quantizers)
+            and all(q is None for q in weight_quantizers)
+            and prev_op_grad_output_quantizer is None
+            and next_op_input_quantizer is None
+            and not is_cpu_offload_enabled()
+        )
+        if packed_weights_supported:
+            with torch.cuda.device(device):
+                packed_weights_supported = not torch.cuda.is_current_stream_capturing()
+        use_grouped_tensor_path = packed_weights_supported or self._is_graph_safe_path_supported(
             with_quantized_compute=with_quantized_compute,
             input_quantizers=input_quantizers,
             dtype=dtype,

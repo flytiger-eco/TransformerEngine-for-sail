@@ -300,11 +300,12 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
 
 /*! \brief Return the required size in bytes for the setup workspace of grouped GEMM.
  *
- * The setup workspace stores pointer arrays and per-matrix dimension arrays used
- * by the grouped GEMM kernel. Its size depends only on the number of tensors (GEMMs)
- * in the group and is independent of matrix dimensions.
+ * The setup workspace stores backend-specific pointer, dimension, and scheduling
+ * metadata. Its size depends on the current device and the number of tensors (GEMMs)
+ * in the group, and is independent of matrix dimensions.
  *
- * Pass the result as the size of the workspace_setup tensor in nvte_grouped_gemm.
+ * Query on the target device and pass the result as the size of the workspace_setup
+ * tensor in nvte_grouped_gemm.
  *
  *  \param[in] num_tensors  Number of tensors (GEMMs) in the group.
  *  \return Required size in bytes for workspace_setup.
@@ -355,9 +356,8 @@ void nvte_compute_grouped_tensor_offsets(const int64_t *first_dims, int64_t *off
 /* EXPERIMENTAL FEATURE AND SUBJECT TO CHANGE. */
 /*! \brief Grouped matrix multiplication: D = alpha * op(A) @ op(B) + beta * C
  *
- * \note Requires cuBLAS 13.2+ (CUDA 13.1+) and Blackwell (SM100) or newer GPU architecture.
- *       Will error at runtime if compiled with an older cuBLAS version or run on
- *       a pre-Blackwell GPU.
+ * \note Availability depends on the build and target device. Vendor grouped GEMM requires
+ *       cuBLAS 13.3+ on Blackwell or 13.4+ on Hopper. PPU sm89 supports unquantized BF16 via RTC.
  *
  * Performs batched GEMM on a collection of matrices with potentially different shapes.
  * All tensors in the group must have compatible dimensions for matrix multiplication.
@@ -378,8 +378,7 @@ void nvte_compute_grouped_tensor_offsets(const int64_t *first_dims, int64_t *off
  *  \param[in]  stream           CUDA stream for the operation.
  *
  * Requirements:
- * - cuBLAS 13.2+ (CUDA 13.1+)
- * - Blackwell (SM100) or newer GPU architecture
+ * - A supported vendor or native grouped GEMM backend
  * - A, B, C (if provided), D must have the same num_tensors
  * - For each i: D[i] = alpha[i] * op(A[i]) @ op(B[i]) + beta[i] * C[i]
  * - Shape compatibility: if transa=false, transb=false:

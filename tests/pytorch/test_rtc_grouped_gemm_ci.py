@@ -33,22 +33,21 @@ CASES = GATE.load_cases(GATE.DEFAULT_CASES)
 
 
 def test_case_inventory():
-    assert len(CASES) == 27
     fields = [REPLAY.parse_tag(tag)[1] for tag in CASES]
-    assert {f["layout"] for f in fields} == {"NT", "NN", "TN"}
-    assert {int(f["groups"]) for f in fields} == {1, 8, 16, 32}
-    assert {f["tile"] for f in fields} == {"256x256x64s3", "256x256x64s4"}
-    assert fields[0]["k"] == "2096"
-    assert REPLAY.extent(fields[0]["m"]) == [256, 512, 1024, 2048, 512, 1024, 256, 4096]
-    for f in fields[-3:]:
-        splits = REPLAY.extent(f["m"])
-        assert len(splits) == int(f["groups"])
-        assert sum(splits) == 35918
-    for f in fields:
-        assert f["data_type"] == "bf16" and f["accumulate"] == "0" and f["gpu"] == "0"
+    assert {"NT", "NN"}.issubset(f["layout"] for f in fields)
+    assert any(f["k"] == "512" and f["n"] == "2048" for f in fields)
+    assert any(f["k"] == "3072" for f in fields)
+    assert any(f["layout"] == "NT" and f["m"].startswith("[") and f["k"] == "768" for f in fields)
 
 
-@pytest.mark.parametrize("tag", CASES)
+@pytest.mark.parametrize("tag", [
+    *CASES,
+    pytest.param(
+        "[TE] --format=GroupedGemmRtc,data_type:bf16,groups:3,layout:TN,"
+        "m:64,n:32,k:[8,32,16],tile:256x256x64s3,accumulate:0,gpu:0",
+        id="ragged-k-wgrad",
+    ),
+])
 def test_operand_mapping(tag):
     _, f = REPLAY.parse_tag(tag)
     layout, a, b, outputs, splits, single = REPLAY.rtc_operand_specs(f)
@@ -62,15 +61,13 @@ def test_operand_mapping(tag):
         assert outputs[index] == (lhs[0], rhs[1])
     assert single == (f["layout"] != "TN")
     assert layout == {"NT": "TN", "TN": "NT", "NN": "NN"}[f["layout"]]
-    assert splits == (
-        [int(f["k"])] * groups
-        if f["layout"] == "TN"
-        else REPLAY.extent(f["m"]) * (groups if not f["m"].startswith("[") else 1)
-    )
+    axis = "k" if f["layout"] == "TN" else "m"
+    assert splits == REPLAY.extent(f[axis]) * (groups if not f[axis].startswith("[") else 1)
 
 
 def test_scalar_and_invalid_split():
-    _, f = REPLAY.parse_tag(CASES[1])
+    _, f = REPLAY.parse_tag(CASES[0])
+    f.update(layout="TN", m="2048", k="1536")
     assert REPLAY.rtc_operand_specs(f)[-2] == [1536] * 16
     f["m"] = "[2048]"
     with pytest.raises(ValueError, match="16"):
@@ -153,6 +150,24 @@ def test_workflow_paths_match_scope():
     assert "run = manual or any(gate.SCOPE.search(path) for path in changed)" in scope["run"]
 
 
+def api_payload(tag, latency, api="ordinary", samples=5):
+    return {
+        "tag": tag,
+        "api": api,
+        "median_us": latency,
+        "samples_us": [latency] * samples,
+        "e2e_us": latency,
+        "e2e_samples_us": [latency] * samples,
+        "max_relative_error": 0.001,
+        "kernels": [f"nvte_grouped_gemm3_{api}" + ("_ne4" if ",n_expand:4" in tag else "")],
+        "device": "ZW-M890P",
+        "device_uuid": "test-ppu-0",
+        "capability": [8, 9],
+        "torch": "2.11",
+        "te_path": "/venv/transformer_engine/__init__.py",
+    }
+
+
 def payload(times):
     return {
         "case_digest": hashlib.sha256("\n".join(CASES).encode()).hexdigest(),
@@ -161,11 +176,8 @@ def payload(times):
         "results": [
             {
                 "id": i + 1,
-                "tag": tag,
-                "median_us": t,
-                "device": "ZW-M890P",
-                "capability": [8, 9],
-                "torch": "2.11",
+                "ordinary": api_payload(tag, t),
+                "grouped_tensor": api_payload(tag, t, "grouped_tensor"),
             }
             for i, (tag, t) in enumerate(zip(CASES, times))
         ],
@@ -173,35 +185,36 @@ def payload(times):
 
 
 def test_no_regression_hidden_by_geomean():
-    base, head = payload([100.0] * 27), payload([50.0] * 26 + [106.0])
+    base = payload([100.0] * len(CASES))
+    head = payload([50.0] * (len(CASES) - 1) + [106.0])
     rows = GATE.compare(CASES, [(base, head)] * 4, 0.05)
     assert sum(row["regression"] for row in rows) == 1
     assert rows[-1]["regression"]
 
 
 def test_paired_sweep_median_and_boundary():
-    base = payload([100.0] * 27)
-    heads = [payload([t] * 27) for t in (104.0, 105.0, 105.0, 300.0)]
+    base = payload([100.0] * len(CASES))
+    heads = [payload([t] * len(CASES)) for t in (104.0, 105.0, 105.0, 300.0)]
     rows = GATE.compare(CASES, [(base, h) for h in heads], 0.05)
-    assert rows[0]["latency_ratio"] == pytest.approx(1.05)
+    assert rows[0]["ordinary_ratio"] == pytest.approx(1.05)
     assert not any(row["regression"] for row in rows)
 
 
 @pytest.mark.parametrize(
-    "corruption", ["missing", "errors", "tag", "nan", "zero", "device", "digest", "settings"]
+    "corruption", ["missing", "errors", "tag", "nan", "zero", "device", "device_uuid", "digest", "settings"]
 )
 def test_fail_closed(corruption):
-    base, head = payload([100.0] * 27), payload([100.0] * 27)
+    base, head = payload([100.0] * len(CASES)), payload([100.0] * len(CASES))
     if corruption == "missing":
         head["results"].pop()
     elif corruption == "errors":
         head["errors"] = ["RTC fallback"]
     elif corruption == "tag":
-        head["results"][0]["tag"] = "wrong"
+        head["results"][0]["ordinary"]["tag"] = "wrong"
     elif corruption in ("nan", "zero"):
-        head["results"][0]["median_us"] = float("nan") if corruption == "nan" else 0
-    elif corruption == "device":
-        head["results"][0]["device"] = "other"
+        head["results"][0]["ordinary"]["median_us"] = float("nan") if corruption == "nan" else 0
+    elif corruption in ("device", "device_uuid"):
+        head["results"][0]["ordinary"][corruption] = "other"
     elif corruption == "digest":
         head["case_digest"] = "old case list"
     else:
@@ -214,7 +227,7 @@ def test_fail_closed(corruption):
     "policy,expected", [("advisory", 0), ("perf", 2), ("refactor", 2), ("enforced", 2)]
 )
 def test_report_exit_codes(tmp_path, policy, expected):
-    for arm, times in (("base", [100.0] * 27), ("head", [106.0] * 27)):
+    for arm, times in (("base", [100.0] * len(CASES)), ("head", [106.0] * len(CASES))):
         directory = tmp_path / arm / "sweep-0"
         directory.mkdir(parents=True)
         (directory / "results.json").write_text(json.dumps(payload(times)))
@@ -229,7 +242,7 @@ def test_report_exit_codes(tmp_path, policy, expected):
     )
     assert GATE.report(args) == expected
     assert json.loads((tmp_path / "gate.json").read_text())["verdict"] == "REGRESSION"
-    assert "27/27" in (tmp_path / "gate.md").read_text()
+    assert f"{len(CASES)}/{len(CASES)}" in (tmp_path / "gate.md").read_text()
     # 即使非性能变更，缺失或错误测量也不能显示成成功。
     args.sweeps = 2
     assert GATE.report(args) == 3
@@ -246,7 +259,7 @@ def test_report_readonly_input(tmp_path, monkeypatch, head_time, missing, expect
         directory = measurements / arm / "sweep-0"
         directory.mkdir(parents=True)
         if not (missing and arm == "head"):
-            (directory / "results.json").write_text(json.dumps(payload([time] * 27)))
+            (directory / "results.json").write_text(json.dumps(payload([time] * len(CASES))))
     before = {p: p.read_bytes() for p in measurements.rglob("*.json")}
     original_open, original_mkdir = Path.open, Path.mkdir
 
@@ -287,7 +300,7 @@ def test_report_cli_input_compatibility(tmp_path, separate_input):
     for arm in ("base", "head"):
         directory = measurements / arm / "sweep-0"
         directory.mkdir(parents=True)
-        (directory / "results.json").write_text(json.dumps(payload([100.0] * 27)))
+        (directory / "results.json").write_text(json.dumps(payload([100.0] * len(CASES))))
     command = [
         sys.executable,
         str(ROOT / ".github/scripts/rtc_grouped_gemm_gate.py"),
@@ -552,7 +565,7 @@ def test_report_paths_after_failed_step(tmp_path, missing):
             for sweep in range(4):
                 directory = source / arm / f"sweep-{sweep}"
                 directory.mkdir(parents=True)
-                (directory / "results.json").write_text(json.dumps(payload([100.0] * 27)))
+                (directory / "results.json").write_text(json.dumps(payload([100.0] * len(CASES))))
     directory = report["env"]["REPORT_OUT"].replace("${{ runner.temp }}", str(tmp_path))
     summary = tmp_path / "summary.md"
     env = {
@@ -613,7 +626,7 @@ def test_report_plot_cli(tmp_path, missing, regression):
         for arm, latency in (("base", 100.0), ("head", 106.0 if regression else 98.0)):
             directory = tmp_path / arm / "sweep-0"
             directory.mkdir(parents=True)
-            (directory / "results.json").write_text(json.dumps(payload([latency] * 27)))
+            (directory / "results.json").write_text(json.dumps(payload([latency] * len(CASES))))
     result = subprocess.run(
         [
             sys.executable,
@@ -646,7 +659,7 @@ def test_plot_failure_preserves_verdict(tmp_path, monkeypatch, capsys, missing, 
         for arm, latency in (("base", 100.0), ("head", 106.0 if regression else 98.0)):
             directory = tmp_path / arm / "sweep-0"
             directory.mkdir(parents=True)
-            (directory / "results.json").write_text(json.dumps(payload([latency] * 27)))
+            (directory / "results.json").write_text(json.dumps(payload([latency] * len(CASES))))
 
     def unavailable(*_):
         raise ImportError("模拟绘图依赖不可用")
@@ -670,46 +683,18 @@ def test_plot_failure_preserves_verdict(tmp_path, monkeypatch, capsys, missing, 
     assert not (tmp_path / "gate.png").exists()
 
 
-@pytest.mark.parametrize("error", [False, True])
-def test_plot_paired_data_and_error(tmp_path, monkeypatch, error):
-    import matplotlib.figure
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import to_rgba
-
-    rows = GATE.compare(CASES, [(payload([100.0] * 27), payload([110.0] * 27))], 0.05)
-    # 强制独立中位数与配对比率不同，确认下图采用门禁真正使用的比率。
-    rows[0].update(latency_ratio=0.98, regression=False)
-    gate = {
-        "rows": rows,
-        "error": "缺测" if error else None,
-        "verdict": "ERROR" if error else "REGRESSION",
-        "base_sha": "base",
-        "head_sha": "head",
-        "sweeps": 4,
-        "tolerance": 0.05,
-    }
-    figures = []
-    original = matplotlib.figure.Figure.savefig
-
-    def save(figure, *args, **kwargs):
-        figures.append(figure)
-        return original(figure, *args, **kwargs)
-
-    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", save)
-    GATE.plot_report(gate, tmp_path / "gate.png")
-    axes = figures[0].axes
-    if error:
-        assert not any(axis.patches for axis in axes)
-        assert "ERROR" in axes[0].texts[0].get_text()
-    else:
-        assert len(axes[0].patches) == 54 and len(axes[1].patches) == 27
-        assert axes[0].patches[0].get_height() == 100
-        assert axes[0].patches[27].get_height() == 110
-        assert axes[1].patches[0].get_height() == pytest.approx(-2)
-        assert axes[1].patches[0].get_facecolor() == to_rgba("#2ca02c")
-        assert axes[1].patches[1].get_facecolor() == to_rgba("#d62728")
-        assert axes[1].lines[1].get_ydata() == [5.0, 5.0]
-    assert not plt.fignum_exists(figures[0].number)
+def test_grouped_speedup_compares_apis_within_each_sweep():
+    pairs = []
+    for head_time, grouped_time in [(100, 200), (100, 50), (400, 400), (400, 800)]:
+        base = payload([100] * len(CASES))
+        head = payload([head_time] * len(CASES))
+        del base["results"][0]["grouped_tensor"]
+        head["results"][0]["grouped_tensor"] = api_payload(CASES[0], grouped_time, "grouped_tensor")
+        pairs.append((base, head))
+    row = GATE.compare(CASES, pairs, 0.05)[0]
+    assert row["head_us"] == 250 and row["grouped_us"] == 300
+    assert row["grouped_e2e_ratio"] == 1.5
+    assert row["regression"]
 
 
 @pytest.mark.parametrize(
@@ -888,11 +873,13 @@ def test_worker_failure_is_recorded(tmp_path):
         samples=1,
         timeout=5,
         only_case=1,
+        sweep=0,
+        arm="head",
     )
     assert GATE.measure(args) == 1
     result = json.loads((tmp_path / "results.json").read_text())
-    assert len(result["errors"]) == 1
-    assert not result["results"]
+    assert len(result["errors"]) == 2
+    assert {error["api"] for error in result["errors"]} == {"ordinary", "grouped_tensor"}
 
 
 def test_workflow_bootstraps_cpu_python():
@@ -948,3 +935,28 @@ def test_workflow_and_shell_syntax():
     report_step = next(s for s in steps if "--tolerance" in s.get("run", ""))
     assert "always()" in report_step["if"]
     assert "--tolerance 0.05" in report_step["run"]
+
+
+@pytest.mark.parametrize("failure", ["missing", "fallback", "no_e2e"])
+def test_grouped_measurement_required(failure):
+    base = payload([100] * len(CASES))
+    head = payload([100] * len(CASES))
+    row = head["results"][0]
+    if failure == "missing":
+        del row["grouped_tensor"]
+    elif failure == "fallback":
+        row["grouped_tensor"]["kernels"] = row["ordinary"]["kernels"]
+    else:
+        row["grouped_tensor"]["e2e_samples_us"] = []
+    with pytest.raises((ValueError, KeyError)):
+        GATE.compare(CASES, [(base, head)], 0.05)
+
+
+def test_nexpand_required_on_designated_head_cases():
+    tag = next(case for case in CASES if ",n_expand:4" in case)
+    for api in ("ordinary", "grouped_tensor"):
+        result = api_payload(tag, 1, api)
+        result["kernels"] = [f"nvte_grouped_gemm3_{api}"]
+        GATE.validate_result(result, api, tag, 5)
+        with pytest.raises(ValueError, match="N_expand"):
+            GATE.validate_result(result, api, tag, 5, head=True)

@@ -836,8 +836,7 @@ message(STATUS "Threads per parallel build job: ${BUILD_THREADS_PER_JOB}")
 install(TARGETS transformer_engine DESTINATION .)
 
 # Install CUTLASS 3.x + PPU headers for runtime NVRTC compilation.
-# At runtime, resolve_cutlass_include_dir() uses the build-time baked path
-# (string_path_cutlass3_include) which points here for installed packages.
+# Wheels resolve this directory relative to the installed shared library.
 install(DIRECTORY "${CUTLASS3_INCLUDE_DIR}/cutlass"
                   "${CUTLASS3_INCLUDE_DIR}/cute"
                   "${CUTLASS3_INCLUDE_DIR}/ppu"

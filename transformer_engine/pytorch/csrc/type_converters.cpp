@@ -218,10 +218,26 @@ GroupedTensorWrapper GroupedTensorFromPyTorchGroupedTensor(py::handle tensor) {
     }
   }
   auto ret = GroupedTensorWrapper(num_tensors, logical_shape, scaling_mode);
+  at::Tensor data_anchor;
+  auto check_data = [&](const at::Tensor &data, const char *field) {
+    NVTE_CHECK(data.is_cuda() && data.is_contiguous(), "GroupedTensor ", field,
+               " must be contiguous CUDA storage");
+    NVTE_CHECK(!data_anchor.defined() || data.device() == data_anchor.device(),
+               "GroupedTensor data fields must be on the same device");
+    if (!data_anchor.defined()) data_anchor = data;
+  };
+  auto check_metadata = [&](const at::Tensor &data, const char *field) {
+    NVTE_CHECK(data.is_cuda() && data.is_contiguous() && data.dim() == 1 &&
+                   data.scalar_type() == at::kLong,
+               "GroupedTensor ", field, " must be a contiguous CUDA int64 vector");
+    NVTE_CHECK(!data_anchor.defined() || data.device() == data_anchor.device(),
+               "GroupedTensor ", field, " must be on the data device");
+  };
 
   // Rowwise data
   if (!tensor.attr("rowwise_data").is_none()) {
     const auto &data = tensor.attr("rowwise_data").cast<at::Tensor>();
+    check_data(data, "rowwise_data");
     DType data_dtype =
         quantizer.is_none() ? GetTransformerEngineDType(data.scalar_type()) : quantizer_dtype;
     ret.set_rowwise_data(data.data_ptr(), data_dtype, getTensorShape(data));
@@ -232,6 +248,7 @@ GroupedTensorWrapper GroupedTensorFromPyTorchGroupedTensor(py::handle tensor) {
   // Columnwise data
   if (!tensor.attr("columnwise_data").is_none()) {
     const auto &data = tensor.attr("columnwise_data").cast<at::Tensor>();
+    check_data(data, "columnwise_data");
     DType data_dtype =
         quantizer.is_none() ? GetTransformerEngineDType(data.scalar_type()) : quantizer_dtype;
     ret.set_columnwise_data(data.data_ptr(), data_dtype, getTensorShape(data));
@@ -275,16 +292,19 @@ GroupedTensorWrapper GroupedTensorFromPyTorchGroupedTensor(py::handle tensor) {
   // Shape metadata
   if (!tensor.attr("first_dims").is_none()) {
     const auto &first_dims = tensor.attr("first_dims").cast<at::Tensor>();
+    check_metadata(first_dims, "first_dims");
     ret.set_first_dims(first_dims.data_ptr(), GetTransformerEngineDType(first_dims.scalar_type()),
                        getTensorShape(first_dims));
   }
   if (!tensor.attr("last_dims").is_none()) {
     const auto &last_dims = tensor.attr("last_dims").cast<at::Tensor>();
+    check_metadata(last_dims, "last_dims");
     ret.set_last_dims(last_dims.data_ptr(), GetTransformerEngineDType(last_dims.scalar_type()),
                       getTensorShape(last_dims));
   }
   if (!tensor.attr("tensor_offsets").is_none()) {
     const auto &tensor_offsets = tensor.attr("tensor_offsets").cast<at::Tensor>();
+    check_metadata(tensor_offsets, "tensor_offsets");
     ret.set_tensor_offsets(tensor_offsets.data_ptr(),
                            GetTransformerEngineDType(tensor_offsets.scalar_type()),
                            getTensorShape(tensor_offsets));

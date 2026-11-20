@@ -40,11 +40,18 @@ def get_cublas_workspace_size_bytes() -> None:
     return 4_194_304
 
 
-@functools.lru_cache(maxsize=None)
 def get_cublas_workspace(device: int, ub: bool, grouped_gemm: bool) -> torch.Tensor:
-    """Returns workspace for cublas GEMM."""
+    """Returns workspace for cublas GEMM, isolated by caller stream for grouped GEMM."""
     assert not (ub and grouped_gemm), "UB is unsupported for grouped GEMM."
+    stream = torch.cuda.current_stream(device).cuda_stream if grouped_gemm else None
+    return _get_cublas_workspace(device, ub, grouped_gemm, stream)
 
+
+@functools.lru_cache(maxsize=None)
+def _get_cublas_workspace(
+    device: int, ub: bool, grouped_gemm: bool, stream: Optional[int]
+) -> torch.Tensor:
+    """Cache mutable grouped descriptors per stream; keep ordinary/UB cache keys unchanged."""
     if ub:
         return torch.empty(
             get_cublas_workspace_size_bytes() * _NUM_MAX_UB_STREAMS,
@@ -422,37 +429,30 @@ def general_grouped_gemm(
     return out, bias, gelu_input
 
 
-@functools.lru_cache(maxsize=None)
 def get_grouped_gemm_setup_workspace_size(num_tensors: int) -> int:
     """Return workspace size for grouped GEMM pointer setup."""
     return tex.get_grouped_gemm_setup_workspace_size(num_tensors)
 
 
 @functools.lru_cache(maxsize=None)
-def _get_fp32_ones_tensor(num_tensors: int, device: torch.device) -> torch.Tensor:
-    """Cached ones tensor."""
-    return torch.ones(num_tensors, dtype=torch.float32, device=device)
+def _grouped_gemm_scalar(value: int, count: int, device: torch.device, stream: int) -> torch.Tensor:
+    """Initialize and reuse default scalars on the same stream as their consumer."""
+    return torch.full((count,), value, dtype=torch.float32, device=device)
 
 
 @functools.lru_cache(maxsize=None)
-def _get_fp32_zeros_tensor(num_tensors: int, device: torch.device) -> torch.Tensor:
-    """Cached zeros tensor."""
-    return torch.zeros(num_tensors, dtype=torch.float32, device=device)
+def _get_grouped_gemm_setup_workspace(
+    device: int, num_tensors: int, stream: int
+) -> torch.Tensor:
+    """Persistent per-stream setup workspace for grouped-tensor GEMM."""
+    with torch.cuda.device(device):
+        size = get_grouped_gemm_setup_workspace_size(num_tensors)
+    return torch.empty(size, dtype=torch.uint8, device=device)
 
 
 @functools.lru_cache(maxsize=None)
-def _get_grouped_gemm_setup_workspace(device: int, num_tensors: int) -> torch.Tensor:
-    """Persistent setup workspace (per-group pointer/dim arrays) for grouped-tensor GEMM."""
-    return torch.empty(
-        get_grouped_gemm_setup_workspace_size(num_tensors),
-        dtype=torch.uint8,
-        device=device,
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def _get_grouped_cublas_workspace(device: int, layout: str) -> torch.Tensor:
-    """Persistent cuBLAS workspace for the grouped-tensor GEMM path, one per GEMM layout.
+def _get_grouped_cublas_workspace(device: int, layout: str, stream: int) -> torch.Tensor:
+    """Persistent cuBLAS workspace for grouped-tensor GEMM, one per stream and layout.
 
     Grouped cuBlasLt GEMM kernels in cuBLAS versions <= 13.7 leave behind stale descriptors in the
     workspace that cause back-to-back GEMM kernels to crash/deadlock on 2nd CUDA-graph replay. As a
@@ -542,26 +542,23 @@ def general_grouped_gemm_for_grouped_tensor(
 
     # Hopper (SM90) uses a single shared alpha/beta scalar;
     # Blackwell+ (SM100) supports per-group alpha/beta arrays.
-    per_group = torch.cuda.get_device_capability() >= (10, 0)
+    per_group = torch.cuda.get_device_capability(device) >= (10, 0)
     num_alphabeta = num_tensors if per_group else 1
 
+    stream = torch.cuda.current_stream(device).cuda_stream
     if alpha is None:
-        alpha = _get_fp32_ones_tensor(num_alphabeta, device)
+        alpha = _grouped_gemm_scalar(1, num_alphabeta, device, stream)
     if beta is None:
-        if accumulate:
-            beta = _get_fp32_ones_tensor(num_alphabeta, device)
-        else:
-            beta = _get_fp32_zeros_tensor(num_alphabeta, device)
+        beta = _grouped_gemm_scalar(int(accumulate), num_alphabeta, device, stream)
 
     if not alpha.is_cuda or not beta.is_cuda:
         raise ValueError("alpha and beta must be CUDA tensors.")
 
-    workspace_setup = _get_grouped_gemm_setup_workspace(device.index, num_tensors)
-    # Each grouped-GEMM layout gets its own persistent cuBLAS workspace: two grouped
-    # GEMMs sharing one workspace can deadlock under CUDA-graph replay (see
-    # _get_grouped_cublas_workspace). wgrad (NT) is the case seen in TE; fprop (TN) and
-    # dgrad (NN) have also been reported to conflict, so all three layouts are isolated.
-    workspace_cublas = _get_grouped_cublas_workspace(device.index, layout)
+    workspace_setup = _get_grouped_gemm_setup_workspace(device.index, num_tensors, stream)
+    # Isolate mutable descriptors across caller streams as well as GEMM layouts.
+    # Sharing layouts can deadlock under CUDA-graph replay (see
+    # _get_grouped_cublas_workspace); TN, NN and NT must remain isolated.
+    workspace_cublas = _get_grouped_cublas_workspace(device.index, layout, stream)
 
     sm_count = get_sm_count()
     sm_count = sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count)))

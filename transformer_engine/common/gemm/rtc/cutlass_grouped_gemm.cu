@@ -54,6 +54,10 @@
 #include "cutlass/gemm/collective/builders/ppu_mma_builder.inl"
 #include "cutlass/epilogue/collective/builders/ppu_builder.inl"
 
+#if NVTE_GG_GROUPED_TENSOR || NVTE_GG_N_EXPAND == 4
+#include "cutlass/gemm/kernel/nvte_grouped_tensor.hpp"
+#endif
+
 #ifndef NVTE_GG_TRANS_A
 #error "NVTE_GG_TRANS_A must be defined"
 #endif
@@ -206,8 +210,17 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     StageCountTraits,
     KernelSchedule>::CollectiveOp;
 
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+using OrdinaryKernel = cutlass::gemm::kernel::GemmUniversal<
     ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+#if NVTE_GG_GROUPED_TENSOR
+using GemmKernel = cutlass::gemm::kernel::NvteNativeGrouped<
+    CollectiveMainloop, CollectiveEpilogue, NVTE_GG_N_EXPAND == 4>;
+#elif NVTE_GG_N_EXPAND == 4
+using GemmKernel = cutlass::gemm::kernel::NvteListNExpand<
+    OrdinaryKernel, CollectiveMainloop, CollectiveEpilogue>;
+#else
+using GemmKernel = OrdinaryKernel;
+#endif
 
 }  // namespace
 

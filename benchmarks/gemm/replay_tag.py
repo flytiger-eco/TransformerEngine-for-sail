@@ -33,6 +33,7 @@ from pathlib import Path
 import re
 import statistics
 import sys
+import time
 
 
 def parse_tag(tag: str):
@@ -83,8 +84,8 @@ def rtc_operand_specs(fields):
     return public_layout, a, b, list(zip(m, n)), splits, layout != "TN"
 
 
-def run_ci_case(tag, output, warmup, iters, samples):
-    """严格对拍并采集单个 RTC kernel 的时间；每个 case 必须独立进程运行。"""
+def run_ci_case(tag, output, warmup, iters, samples, api="ordinary"):
+    """严格对拍并采集 RTC kernel 设备时间。"""
     op, fields = parse_tag(tag)
     if op != "GroupedGemmRtc" or fields["data_type"] != "bf16":
         raise ValueError("CI 仅支持 BF16 RTC case")
@@ -106,15 +107,15 @@ def run_ci_case(tag, output, warmup, iters, samples):
             "NVTE_USE_CUTLASS_GROUPED_GEMM": "1",
             "NVTE_USE_CUTLASS_GROUPED_GEMM_RTC": "1",
             "NVTE_FORCE_RTC_NO_FALLBACK": "1",
-            "NVTE_GG_FORCE_TILE": ",".join(tile.groups()),
-            "PPU_LIB_SHOW_PARAMS": "1",
+            "PPU_LIB_SHOW_PARAMS": "0",
             "PPU_LIB_PERF_INSTRUMENT": "0",
             "PPU_LIB_TFLOPS": "0",
         }
     )
+    os.environ["NVTE_GG_FORCE_TILE"] = ",".join(tile.groups())
     import torch
     import transformer_engine
-    from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
+    from transformer_engine.pytorch.cpp_extensions import gemm
 
     gpu = int(fields["gpu"])
     if not torch.cuda.is_available():
@@ -134,9 +135,40 @@ def run_ci_case(tag, output, warmup, iters, samples):
     torch.backends.cuda.matmul.allow_tf32 = False
     device = f"cuda:{gpu}"
     dtype = torch.bfloat16
-    a = [torch.randn(shape, device=device, dtype=dtype) for shape in a_shapes]
-    b = [torch.randn(shape, device=device, dtype=dtype) for shape in b_shapes]
-    if single:
+
+    def operand(shapes):
+        return [torch.randn(shape, device=device, dtype=dtype) for shape in shapes]
+
+    a, b = operand(a_shapes), operand(b_shapes)
+    if api == "grouped_tensor":
+        from transformer_engine.pytorch.tensor.storage.grouped_tensor_storage import (
+            GroupedTensorStorage,
+        )
+
+        def grouped(tensors):
+            shapes = [tuple(t.shape) for t in tensors]
+            assert len({shape[1] for shape in shapes}) == 1
+            uniform = all(shape == shapes[0] for shape in shapes)
+            offsets = [0]
+            for tensor in tensors:
+                offsets.append(offsets[-1] + tensor.numel())
+            data = torch.cat([t.flatten() for t in tensors])
+            return GroupedTensorStorage(
+                shape=(sum(shape[0] for shape in shapes), shapes[0][1]),
+                dtype=dtype, num_tensors=len(shapes), shapes=shapes, data=data,
+                first_dims=None if uniform else torch.tensor([shape[0] for shape in shapes],
+                                        device=device, dtype=torch.int64),
+                tensor_offsets=None if uniform else torch.tensor(offsets, device=device, dtype=torch.int64),
+                offsets=offsets,
+            )
+
+        grouped_a, grouped_b = grouped(a), grouped(b)
+        out = grouped([torch.full(shape, float("nan"), device=device, dtype=dtype)
+                       for shape in out_shapes])
+        views = [part.view(shape) for part, shape in zip(
+            out.rowwise_data.split([math.prod(shape) for shape in out_shapes]), out_shapes
+        )]
+    elif single:
         out = [
             torch.full((sum(splits), out_shapes[0][1]), float("nan"), device=device, dtype=dtype)
         ]
@@ -146,18 +178,16 @@ def run_ci_case(tag, output, warmup, iters, samples):
         views = out
 
     def run():
-        general_grouped_gemm(
-            a,
-            b,
-            out,
-            [None] * len(a),
-            dtype,
-            layout=public_layout,
-            m_splits=splits,
-            grad=fields["layout"] != "NT",
-            accumulate=False,
-            single_output=single,
-        )
+        if api == "grouped_tensor":
+            gemm.general_grouped_gemm_for_grouped_tensor(
+                grouped_a, grouped_b, out, layout=public_layout,
+            )
+        else:
+            gemm.general_grouped_gemm(
+                a, b, out, [None] * len(a), dtype, layout=public_layout,
+                m_splits=splits, grad=fields["layout"] != "NT",
+                accumulate=False, single_output=single,
+            )
 
     run()
     torch.cuda.synchronize()
@@ -179,6 +209,16 @@ def run_ci_case(tag, output, warmup, iters, samples):
     for _ in range(warmup):
         run()
     torch.cuda.synchronize()
+    # Exclude JIT and profiling overhead. Synchronize once per sample so the
+    # host submission and metadata costs seen by each API enter the same clock.
+    e2e_times = []
+    for _ in range(samples):
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        for _ in range(iters):
+            run()
+        torch.cuda.synchronize()
+        e2e_times.append((time.perf_counter() - started) / iters * 1e6)
     times, names = [], set()
     expected_layout = {"NT": "LA_RM_LB_CM", "NN": "LA_RM_LB_RM", "TN": "LA_CM_LB_RM"}[
         fields["layout"]
@@ -191,21 +231,24 @@ def run_ci_case(tag, output, warmup, iters, samples):
             for _ in range(iters):
                 run()
             torch.cuda.synchronize()
-        kernels = [
-            e
-            for e in prof.events()
-            if e.device_type == torch.autograd.DeviceType.CUDA
-            and e.name.startswith("nvte_grouped_gemm3_")
-        ]
-        if len(kernels) != iters:
-            raise AssertionError(f"期望 {iters} 个 RTC kernel，实际 {len(kernels)}")
+        events = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+        kernels = [e for e in events if e.name.startswith("nvte_grouped_gemm3_")]
+        setups = [e for e in events if "prepare_native_grouped_metadata" in e.name]
+        grouped_api = api == "grouped_tensor"
+        uniform = all(len(set(shapes)) == 1 for shapes in (a_shapes, b_shapes, out_shapes))
+        expected_setups = iters if grouped_api and not uniform else 0
+        if len(kernels) != iters or len(setups) != expected_setups:
+            raise AssertionError(f"{api}: unexpected RTC GEMM/setup count {len(kernels)}/{len(setups)}")
         for event in kernels:
-            if expected_tile not in event.name or expected_layout not in event.name:
-                raise AssertionError(f"RTC 配置不匹配：{event.name}")
-            if "bf16_bf16_bf16_acc_fp32" not in event.name:
-                raise AssertionError(f"RTC dtype 不匹配：{event.name}")
+            if (expected_layout not in event.name or expected_tile not in event.name
+                    or "bf16_bf16_bf16_acc_fp32" not in event.name
+                    or ("_grouped_tensor" in event.name) != grouped_api):
+                raise AssertionError(f"{api}: unexpected RTC kernel {event.name}")
             names.add(event.name)
-        times.append(statistics.median(e.device_time for e in kernels))
+        times.append(statistics.median(
+            kernel.device_time + (setups[i].device_time if setups else 0)
+            for i, kernel in enumerate(kernels)
+        ))
     if not all(math.isfinite(t) and t > 0 for t in times):
         raise AssertionError(f"无效 kernel 时间：{times}")
     flops = sum(
@@ -215,13 +258,17 @@ def run_ci_case(tag, output, warmup, iters, samples):
         )
     )
     result = {
+        "api": api,
         "tag": tag,
         "samples_us": times,
         "median_us": statistics.median(times),
+        "e2e_samples_us": e2e_times,
+        "e2e_us": statistics.median(e2e_times),
         "tflops": flops / statistics.median(times) / 1e6,
         "max_relative_error": max_relative_error,
         "kernels": sorted(names),
         "device": torch.cuda.get_device_name(gpu),
+        "device_uuid": str(torch.cuda.get_device_properties(gpu).uuid),
         "capability": list(capability),
         "torch": torch.__version__,
         "te_path": transformer_engine.__file__,
@@ -240,12 +287,16 @@ def main():
     )
     ap.add_argument("--ci-output", help="输出严格 RTC 对拍和逐 kernel 时间的 JSON")
     ap.add_argument("--profile-samples", type=int, default=5)
+    ap.add_argument("--api", choices=("ordinary", "grouped_tensor"), default="ordinary")
     args = ap.parse_args()
     if args.ci_output:
         if args.no_force_tile:
             ap.error("--ci-output 不允许 --no-force-tile")
-        run_ci_case(args.tag, args.ci_output, args.warmup, args.iters, args.profile_samples)
+        run_ci_case(args.tag, args.ci_output, args.warmup, args.iters, args.profile_samples,
+                    args.api)
         return
+    if args.api != "ordinary":
+        ap.error("CI API 参数需要 --ci-output")
 
     op, f = parse_tag(args.tag)
     if not op.startswith("GroupedGemm"):

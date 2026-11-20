@@ -97,6 +97,17 @@ def _reuse_output(rows: int, cols: int, dtype: torch.dtype, device: torch.device
     return buffer
 
 
+class _SplitGroupedWeight(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight):
+        # Storage views alone have no autograd edge to the registered wrapper Parameter.
+        return tuple(weight.split_into_quantized_tensors())
+
+    @staticmethod
+    def backward(ctx, *grads):
+        return torch.stack(grads)
+
+
 class _GroupedLinear(torch.autograd.Function):
     """GroupedLinear semi-top level module
     Calls custom cuda extensions.
@@ -124,14 +135,17 @@ class _GroupedLinear(torch.autograd.Function):
         activation_dtype: torch.dtype,
         input_quantizers: List[Optional[Quantizer]],
         output_quantizers: List[Optional[Quantizer]],
+        aligned_packed_weights: bool = False,
     ) -> bool:
-        """Whether to use cuBLASLt grouped GEMM through GroupedTensor metadata.
+        """Whether to use grouped GEMM through GroupedTensor metadata.
 
         There are no checks whether split sizes are supported. Splits
         may be in a CUDA tensor, so checking would hurt performance
         and be incompatible with CUDA Graphs.
 
         Supported Compute Capability (CC) and precisions:
+        * PPU (CC 8.9): packed BF16 weights with 16-byte aligned feature strides,
+          outside graph capture.
         * Hopper (CC 9.0): BF16/FP16, FP8 per-tensor current scaling, and FP8
           block scaling (1D/2D, including power-of-2 scales).
         * Blackwell (CC 10.x and 11.0): BF16/FP16/MXFP8/NVFP4 with RHT and FP8
@@ -149,20 +163,18 @@ class _GroupedLinear(torch.autograd.Function):
         Input/weight/grad_output quantizers are assumed to be of the same type, otherwise it would
         trigger a fatal error in the cuBLASLt grouped GEMM check.
         """
-        # 1. Filter by environment variable
+        if (debug or cpu_offloading or fp8_calibration or backward_override is not None
+                or save_original_input or any(q is not None for q in output_quantizers)):
+            return False
+        device_capability = get_device_compute_capability()
+        if device_capability == (8, 9):
+            return (
+                aligned_packed_weights and not fp8 and activation_dtype == torch.bfloat16
+                and all(q is None for q in input_quantizers)
+                and not torch.cuda.is_current_stream_capturing()
+            )
         if not bool(int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))):
             return False
-        # 2. Filter out advanced features
-        if (
-            debug
-            or cpu_offloading
-            or fp8_calibration
-            or backward_override is not None
-            or save_original_input
-        ):
-            return False
-        # 3. Filter by compute capability and cuBLAS version
-        device_capability = get_device_compute_capability()
         if not (9, 0) <= device_capability <= (11, 0):
             return False
         cublaslt_version = tex.get_cublasLt_version()
@@ -170,10 +182,6 @@ class _GroupedLinear(torch.autograd.Function):
             return False
         if device_capability < (10, 0) and cublaslt_version < 130400:
             return False
-        # 4. Output quantization is not supported.
-        if any(q is not None for q in output_quantizers):
-            return False
-        # 5. Filter by quantization recipes.
         if fp8:
             if all(isinstance(q, Float8CurrentScalingQuantizer) for q in input_quantizers):
                 # FP8 per-tensor scaling grouped GEMM on Hopper requires cuBLAS 13.5+.
@@ -348,8 +356,9 @@ class _GroupedLinear(torch.autograd.Function):
         biases: Tuple[torch.Tensor, ...],
         out: Optional[torch.Tensor] = None,
         dgrad_out: Optional[torch.Tensor] = None,
+        grouped_weight: Optional[GroupedTensor] = None,
     ) -> Tuple[torch.Tensor, list]:
-        """Forward path backed by GroupedTensor + cuBLASLt grouped GEMM."""
+        """Forward path backed by GroupedTensor grouped GEMM."""
         num_gemms = len(m_splits)
         device = inp.device
         in_features = weights[0].size(-1)
@@ -380,17 +389,25 @@ class _GroupedLinear(torch.autograd.Function):
             )
 
         columnwise_usage = is_grad_enabled and inp.requires_grad
-        weights_for_gemm, new_workspaces = _GroupedLinear._prepare_weights_for_grouped_tensor_gemm(
-            weights,
-            weight_quantizers,
-            weight_workspaces,
-            with_quantized_compute=fp8,
-            columnwise_usage=columnwise_usage,
-            activation_dtype=activation_dtype,
-            is_first_microbatch=is_first_microbatch,
-            skip_fp8_weight_update=skip_fp8_weight_update,
-            cache_weight=cache_weight,
+        use_packed_weight = (
+            grouped_weight is not None and not fp8 and grouped_weight.quantizer is None
+            and grouped_weight.dtype == activation_dtype
         )
+        if use_packed_weight:
+            weights_for_gemm = grouped_weight
+            new_workspaces = [None] * num_gemms
+        else:
+            weights_for_gemm, new_workspaces = _GroupedLinear._prepare_weights_for_grouped_tensor_gemm(
+                weights,
+                weight_quantizers,
+                weight_workspaces,
+                with_quantized_compute=fp8,
+                columnwise_usage=columnwise_usage,
+                activation_dtype=activation_dtype,
+                is_first_microbatch=is_first_microbatch,
+                skip_fp8_weight_update=skip_fp8_weight_update,
+                cache_weight=cache_weight,
+            )
 
         out = _GroupedLinear._validate_or_alloc_output(
             out,
@@ -442,7 +459,10 @@ class _GroupedLinear(torch.autograd.Function):
             else:
                 grouped_x = None
 
-            weights_to_save = weights_for_gemm if inp.requires_grad else [None] * num_gemms
+            weights_to_save = [weights_for_gemm] if use_packed_weight else weights_for_gemm
+            if not inp.requires_grad:
+                weights_to_save = [None] * len(weights_to_save)
+            ctx.packed_weight_for_dgrad = use_packed_weight
             tensors_to_save, tensor_objects = prepare_for_saving(
                 grouped_x,
                 *weights_to_save,
@@ -461,16 +481,10 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.grad_weight_quantizers = grad_weight_quantizers
             ctx.weights_requires_grad = weight_requires_grad
             if fuse_wgrad_accumulation and ctx.weights_requires_grad:
-                ctx.origin_weight_refs = [weakref.ref(w) for w in weights]
-                ctx.origin_weights_overwrite_main_grad = getattr(
-                    weights[0], "overwrite_main_grad", False
-                )
-                if hasattr(weights[0], "__fsdp_param__"):
-                    ctx.main_grad_funcs = [weights[i].get_main_grad for i in range(num_gemms)]
-                else:
-                    ctx.main_grad_funcs = [
-                        lambda j=i: weights[j].main_grad for i in range(num_gemms)
-                    ]
+                params = [grouped_weight] if grouped_weight is not None else weights
+                ctx.origin_weight_is_grouped = grouped_weight is not None
+                ctx.origin_weight_refs = [weakref.ref(param) for param in params]
+                ctx.origin_weights_overwrite_main_grad = getattr(params[0], "overwrite_main_grad", False)
             ctx.device = device
             ctx.dgrad_out = dgrad_out
             ctx.m_splits = None
@@ -535,6 +549,7 @@ class _GroupedLinear(torch.autograd.Function):
             skip_fp8_weight_update,
             save_original_input,
             debug,
+            grouped_weight,
         ) = non_tensor_args
         if fp8:
             backward_override = FP8GlobalStateManager.get_fp8_recipe().backward_override
@@ -616,6 +631,9 @@ class _GroupedLinear(torch.autograd.Function):
             activation_dtype=activation_dtype,
             input_quantizers=input_quantizers,
             output_quantizers=output_quantizers,
+            aligned_packed_weights=(
+                grouped_weight is not None and in_features % 8 == 0 and weights[0].size(-2) % 8 == 0
+            ),
         ):
             return _GroupedLinear._forward_grouped_tensor(
                 ctx,
@@ -640,6 +658,7 @@ class _GroupedLinear(torch.autograd.Function):
                 biases=biases,
                 out=out,
                 dgrad_out=dgrad_out,
+                grouped_weight=grouped_weight,
             )
 
         # Convert splits to list of ints for compatibility with split functions
@@ -862,23 +881,27 @@ class _GroupedLinear(torch.autograd.Function):
         saved_tensors = restore_from_func_ctx(ctx)
         N = ctx.num_gemms
         grouped_x = saved_tensors[0]
-        weights = saved_tensors[1 : 1 + N]
-        split_sizes = saved_tensors[1 + N]
-        base_split_offsets = saved_tensors[2 + N]
+        end = 2 if ctx.packed_weight_for_dgrad else 1 + N
+        weights = saved_tensors[1:end]
+        split_sizes, base_split_offsets = saved_tensors[end : end + 2]
 
         origin_weights = [None] * N
         main_grads = [None] * N
         if ctx.fuse_wgrad_accumulation and ctx.weights_requires_grad:
-            origin_weight_refs = ctx.origin_weight_refs
-            ctx.origin_weight_refs = None
-            origin_weights = [ref() if ref is not None else None for ref in origin_weight_refs]
-            assert all(
-                w is not None for w in origin_weights
-            ), "weight was removed while fuse_wgrad_accumulation=True"
-            main_grads = [main_grad_func() for main_grad_func in ctx.main_grad_funcs]
-            for origin_weight, main_grad in zip(origin_weights, main_grads):
-                if main_grad is not None:
-                    origin_weight.main_grad = main_grad
+            origin_weights = [ref() for ref in ctx.origin_weight_refs]
+            assert all(w is not None for w in origin_weights), "weight removed during accumulation"
+            main_grads = []
+            for w in origin_weights:
+                if hasattr(w, "__fsdp_param__"):
+                    w.main_grad = w.get_main_grad()
+                main_grads.append(w.main_grad)
+            if ctx.origin_weight_is_grouped:
+                packed_grad = main_grads[0]
+                if isinstance(packed_grad, GroupedTensorStorage):
+                    main_grads = packed_grad.split_into_quantized_tensors()
+                else:
+                    main_grads = list(packed_grad.view(N, ctx.weights_shape_0, ctx.weights_shape_1).unbind())
+                origin_weights *= N
 
         grad_output_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
         dy_2d = cast_if_needed(grad_output_view, ctx.activation_dtype)
@@ -951,7 +974,7 @@ class _GroupedLinear(torch.autograd.Function):
                 dtype=ctx.activation_dtype,
             )
             general_grouped_gemm_for_grouped_tensor(
-                weights,
+                weights[0] if ctx.packed_weight_for_dgrad else weights,
                 grouped_dy,
                 grouped_dgrad,
                 layout="NN",
@@ -1946,6 +1969,7 @@ class GroupedLinear(TransformerEngineBaseModule):
                 skip_fp8_weight_update,
                 self.save_original_input,
                 debug,
+                self._grouped_param_or_none("weight"),
             )
             out, new_workspaces = linear_fn(
                 *autograd_ctx,
@@ -2069,10 +2093,12 @@ class GroupedLinear(TransformerEngineBaseModule):
         """Get the weight tensors of the module."""
         grouped_weight = self._grouped_param_or_none("weight")
         if grouped_weight is not None:
-            weight_tensors = grouped_weight.quantized_tensors
-            if weight_tensors is None:
-                # TODO(ksivaman): Remove this after GEMM integration.
-                weight_tensors = grouped_weight.split_into_quantized_tensors()
+            if grouped_weight.quantizer is None:
+                weight_tensors = list(_SplitGroupedWeight.apply(grouped_weight))
+            else:
+                weight_tensors = grouped_weight.quantized_tensors
+                if weight_tensors is None:
+                    weight_tensors = grouped_weight.split_into_quantized_tensors()
         else:
             weight_tensors = self._get_expert_attrs("weight")
         if not self.fp8 and any(isinstance(w, QuantizedTensorStorage) for w in weight_tensors):
