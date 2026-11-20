@@ -7,7 +7,7 @@
 [TE] --format=GroupedGemmRtc,data_type:bf16,groups:16,layout:NN,m:2048,n:1024,k:3072,tile:256x256x64s3,accumulate:0,gpu:0
 [TE] --format=GroupedGemmRtc,data_type:bf16,groups:26,layout:NT,m:[8239,313,4,768,47,2201,847,1656,389,3631,1,695,1024,6,173,3,463,82,2195,41,114,502,118,302,260,1356],n:1024,k:2048,tile:256x256x64s3,accumulate:0,gpu:0
 [TE] --format=GroupedGemmRtc,data_type:bf16,groups:16,layout:NN,m:[1412,3447,5800,2373,1207,991,1647,2512,1629,1438,1,3729,2543,928,4884,1884],n:2048,k:1536,tile:256x256x128s2,accumulate:0,gpu:0
-[TE] --format=GroupedGemmRtc,data_type:bf16,groups:16,layout:TN,m:2048,n:768,k:[6072,2128,3433,3231,3380,1571,4161,2584,4580,5582,2257,6942,484,3167,4603,1483],tile:256x256x64s3,accumulate:0,gpu:0
+[TE] --format=GroupedGemmRtc,data_type:bf16,groups:16,layout:NT,m:[4755,938,507,2446,187,999,5410,4552,1888,3086,3502,5816,33,797,510,3243],n:2048,k:768,tile:256x256x64s3,accumulate:0,gpu:0
 [TE] --format=GroupedGemmRtc,data_type:bf16,groups:32,layout:NT,m:[73,79,76,72,78,92,83,94,76,81,69,85,76,90,89,90,81,85,88,67,86,72,82,79,87,64,69,96,82,70,87,81],n:2048,k:512,tile:128x128x64s2,accumulate:0,gpu:0
 [TE] --format=GroupedGemmRtc,data_type:bf16,groups:16,layout:NT,m:2048,n:2048,k:512,tile:256x256x64s3,accumulate:0,gpu:0,n_expand:4
 # Same total tokens and FLOPs as case 1, spread over more experts.

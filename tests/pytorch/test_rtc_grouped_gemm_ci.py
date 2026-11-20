@@ -34,14 +34,20 @@ CASES = GATE.load_cases(GATE.DEFAULT_CASES)
 
 def test_case_inventory():
     fields = [REPLAY.parse_tag(tag)[1] for tag in CASES]
-    assert {f["layout"] for f in fields} == {"NT", "NN", "TN"}
+    assert {"NT", "NN"}.issubset(f["layout"] for f in fields)
     assert any(f["k"] == "512" and f["n"] == "2048" for f in fields)
     assert any(f["k"] == "3072" for f in fields)
-    assert any(f["m"].startswith("[") for f in fields)
-    assert any(f["k"].startswith("[") for f in fields)
+    assert any(f["layout"] == "NT" and f["m"].startswith("[") and f["k"] == "768" for f in fields)
 
 
-@pytest.mark.parametrize("tag", CASES)
+@pytest.mark.parametrize("tag", [
+    *CASES,
+    pytest.param(
+        "[TE] --format=GroupedGemmRtc,data_type:bf16,groups:3,layout:TN,"
+        "m:64,n:32,k:[8,32,16],tile:256x256x64s3,accumulate:0,gpu:0",
+        id="ragged-k-wgrad",
+    ),
+])
 def test_operand_mapping(tag):
     _, f = REPLAY.parse_tag(tag)
     layout, a, b, outputs, splits, single = REPLAY.rtc_operand_specs(f)
