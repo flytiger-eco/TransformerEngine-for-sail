@@ -300,11 +300,19 @@ std::shared_ptr<const CompiledKernel> get_or_compile(int device, const KernelCon
                       kernel.output_dtype, kernel.grouped_tensor, tile.tile_m, tile.tile_n,
                       tile.tile_k, tile.stages, tile.n_expand, line_info);
   static std::map<std::decay_t<decltype(key)>, std::shared_ptr<const CompiledKernel>> cache;
-  static std::mutex mutex;
-  std::lock_guard<std::mutex> lock(mutex);
-  if (!disable_cache) {
-    if (auto it = cache.find(key); it != cache.end()) return it->second;
-  }
+  static std::mutex cache_mutex;
+  auto lookup = [&]() -> std::shared_ptr<const CompiledKernel> {
+    if (disable_cache) return {};
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(key);
+    return it == cache.end() ? nullptr : it->second;
+  };
+  if (auto cached = lookup()) return cached;
+
+  // Serialize NVRTC and disk writes. Warm launches only take the map lock.
+  static std::mutex compile_mutex;
+  std::lock_guard<std::mutex> compiling(compile_mutex);
+  if (auto cached = lookup()) return cached;
 
   const auto symbol = kernel_symbol(kernel, tile);
   std::string cubin;
@@ -328,7 +336,10 @@ std::shared_ptr<const CompiledKernel> get_or_compile(int device, const KernelCon
   }
   auto compiled = std::make_shared<CompiledKernel>(device, symbol, cubin, host_smem);
   if (!cache_miss.empty()) save_cached_cubin(cache_miss, cubin);
-  if (!disable_cache) cache.emplace(key, compiled);
+  if (!disable_cache) {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache.emplace(key, compiled);
+  }
   return compiled;
 }
 

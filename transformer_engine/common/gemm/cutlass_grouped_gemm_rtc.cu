@@ -393,10 +393,13 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D, int group
 
 }  // namespace
 
-void invalidate_workspace(int device) {
+void invalidate_workspace(int device, uintptr_t begin, uintptr_t end) {
   auto& workspace = device_workspace(device);
   std::lock_guard<std::mutex> lock(workspace.cache_mutex);
-  workspace.last_workspace = nullptr;
+  const auto cached = reinterpret_cast<uintptr_t>(workspace.last_workspace);
+  if (cached && cached < end && begin < cached + workspace.last_params.size()) {
+    workspace.last_workspace = nullptr;
+  }
 }
 
 }  // namespace transformer_engine::grouped_gemm_rtc

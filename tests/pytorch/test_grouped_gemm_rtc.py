@@ -667,6 +667,42 @@ def _expert_views(storage, shapes):
     return views
 
 
+@pytest.mark.parametrize("offset", [0, 128])
+def test_grouped_tensor_reuses_list_workspace(monkeypatch, offset):
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Native GroupedTensor requires PPU sm89")
+    rows = [8, 16] * 16
+    groups = len(rows)
+    dtype = torch.bfloat16
+    a = _packed_storage([(64, 64)] * groups, dtype, mirror=False)
+    b = _packed_storage([(m, 64) for m in rows], dtype, mirror=True)
+    d = _packed_storage([(m, 64) for m in rows], dtype, mirror=True)
+    av = _expert_views(a, [(64, 64)] * groups)
+    bv = _expert_views(b, [(m, 64) for m in rows])
+    out = [torch.empty_like(x) for x in bv]
+    decoy = [torch.empty_like(x) for x in bv]
+    workspace = gemm_ext.get_cublas_workspace(torch.cuda.current_device(), False, True)[0]
+    monkeypatch.setattr(gemm_ext, "_get_grouped_gemm_setup_workspace",
+                        lambda device, count, stream: workspace[offset:])
+
+    def run_list(dest):
+        general_grouped_gemm(av, bv, dest, [None] * groups, dtype, layout="TN", m_splits=rows)
+
+    run_list(decoy)
+    saved = workspace.clone()
+    run_list(out)
+    gemm_ext.general_grouped_gemm_for_grouped_tensor(a, b, d, layout="TN")
+    # Leave valid descriptors pointing at a different output. A stale cache hit
+    # now writes to the decoy, so the regression fails without a device fault.
+    workspace.copy_(saved)
+    for tensor in out + decoy:
+        tensor.zero_()
+    run_list(out)
+    for actual, expected, other in zip(out, _expert_views(d, [(m, 64) for m in rows]), decoy):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.count_nonzero(other) == 0
+
+
 @pytest.mark.parametrize("api", ["ordinary", "grouped_tensor"])
 @pytest.mark.parametrize("layout,m,n,k,expand", [
     ("NN", 2048, 2048, 512, True),

@@ -441,6 +441,9 @@ bool try_native_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGr
   if (setup.sms <= 0) setup.sms = 39;
 
   char* memory = static_cast<char*>(ws->data.dptr);
+  // C API callers may reuse all or part of the list descriptor workspace.
+  // Invalidate before the first discrete copy or metadata kernel can write it.
+  invalidate_workspace(device, wrange.first, wrange.first + wrange.second);
   setup.control = reinterpret_cast<NativeControl*>(memory);
   memory += DIVUP_TO_MULTIPLE(sizeof(NativeControl), size_t(128));
   setup.experts = reinterpret_cast<NativeExpert*>(memory);

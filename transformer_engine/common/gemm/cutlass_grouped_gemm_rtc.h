@@ -27,7 +27,8 @@ size_t native_grouped_gemm_workspace_size(size_t groups);
 bool native_grouped_gemm_supported_device();
 
 namespace grouped_gemm_rtc {
-// Invalidate staged descriptors when another backend uses the device workspace.
-void invalidate_workspace(int device);
+// Invalidate cached list descriptors overlapping a workspace write. Backends
+// with opaque scratch usage can invalidate the entire device address range.
+void invalidate_workspace(int device, uintptr_t begin = 0, uintptr_t end = UINTPTR_MAX);
 }  // namespace grouped_gemm_rtc
 }  // namespace transformer_engine
