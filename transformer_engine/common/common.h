@@ -25,6 +25,7 @@ static_assert(NVTE_BUILD_NUM_PHILOX_ROUNDS > 0,
 #endif
 
 #include <cuda_runtime_api.h>
+#include <transformer_engine/gemm.h>
 #include <transformer_engine/transformer_engine.h>
 
 #include <algorithm>
@@ -495,7 +496,7 @@ struct GroupedTensor {
   // tensor_offsets[i] = element offset to start of tensor i (cumulative sum of numel for tensors 0..i-1)
   // Usage: tensor_i_ptr = (char*)data.dptr + tensor_offsets[i] * element_size
   // If empty and all_same_shape(): offset[i] = i * M * N (where M, N are common dimensions)
-  SimpleTensor tensor_offsets;  // Device pointer to int64_t array of length num_tensors (or empty)
+  SimpleTensor tensor_offsets;  // Device int64_t CSR array of length num_tensors+1 (or empty)
 
   // Logical shape: conceptual 2D shape of the grouped data (REQUIRED)
   // Represents how the 1D flattened data should be interpreted as 2D
@@ -1195,6 +1196,16 @@ Tensor *convertNVTETensorCheck(const NVTETensor tensor);
 
 GroupedTensor *convertNVTEGroupedTensor(const NVTEGroupedTensor tensor);
 GroupedTensor *convertNVTEGroupedTensorCheck(const NVTEGroupedTensor tensor);
+
+bool try_native_grouped_gemm(
+    const NVTEGroupedTensor A, int transa, const NVTEGroupedTensor B, int transb,
+    const NVTEGroupedTensor C, NVTEGroupedTensor D, const NVTETensor alpha,
+    const NVTETensor beta, NVTETensor workspace_setup, NVTETensor workspace_cublas,
+    NVTEGroupedMatmulConfig config, cudaStream_t stream, const NVTETensor *A_list = nullptr,
+    size_t num_a = 0, const NVTETensor *C_list = nullptr, NVTETensor *D_list = nullptr,
+    size_t num_d = 0);
+size_t native_grouped_gemm_workspace_size(size_t groups);
+bool native_grouped_gemm_supported_device();
 
 // Helper functions for GroupedTensor validation
 void CheckGroupedTensorShapeArrays(const GroupedTensor &t, std::string_view name);

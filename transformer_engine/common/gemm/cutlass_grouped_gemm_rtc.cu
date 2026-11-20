@@ -39,6 +39,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <nvrtc.h>
+#include <transformer_engine/gemm.h>
 #include <transformer_engine/transformer_engine.h>
 
 #include <dlfcn.h>
@@ -52,6 +53,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -81,8 +83,10 @@
 #include "cutlass/epilogue/collective/builders/ppu_builder.inl"
 
 #include "ppu_adaptive_tile.hpp"
+#include "cutlass/gemm/kernel/nvte_grouped_tensor.hpp"
 
 #include "../common.h"
+#include "config.h"
 #include "../util/cuda_driver.h"
 #include "../util/cuda_runtime.h"
 #include "../util/handle_manager.h"
@@ -246,10 +250,13 @@ struct TileConfig {
   // Production launch policy associated with a tuned tile. Zero keeps the
   // architecture-independent occupancy/default grid path.
   int workers_per_cu = 0;
+  bool grouped_tensor = false;
+  bool n_expand = false;
 
   bool operator==(TileConfig const& o) const {
     return tile_m == o.tile_m && tile_n == o.tile_n && tile_k == o.tile_k &&
-           stages == o.stages && with_C == o.with_C;
+           stages == o.stages && with_C == o.with_C &&
+           grouped_tensor == o.grouped_tensor && n_expand == o.n_expand;
   }
 };
 
@@ -922,6 +929,69 @@ TileConfig get_or_query_tile_stages(int avg_m, int avg_n, int avg_k,
   return cfg;
 }
 
+// Single tile policy shared by the ordinary host-array launcher and the native
+// grouped path. Averaging inputs come from host-visible descriptors in both
+// cases; keeping one function means an aligned choice cannot drift apart.
+TileConfig select_grouped_tile(int avg_m, int avg_n, int avg_k, int num_gemms,
+                               bool transa, bool transb, int sm_arch,
+                               int num_sms, bool with_C) {
+  const bool verbose = verbose_tile_debug();
+  TileConfig cfg = get_or_query_tile_stages(avg_m, avg_n, avg_k, num_gemms,
+                                            transa, transb, sm_arch, num_sms,
+                                            with_C);
+  // DeepGemm's memory-bound region analog (m <= 160): when every group's
+  // M fits in half of a 256-row tile, an M-matched 128-row tile removes the
+  // 2x M-direction waste (measured on problem_shapes.txt z=16, mpe=128, NN:
+  // geomean TE/DeepGemm 0.58 -> 0.65). BN follows the tile count: N <= 512
+  // keeps 256-wide tiles (fewer tiles, one wave per expert), N > 512 prefers
+  // 128-wide tiles (2x the tiles for load balance, and the 64 KB smem
+  // footprint lets 3-4 CTAs co-reside per CU -- the occupancy auto path in
+  // launch_grouped_gemm_rtc turns that into the second half of the win,
+  // 0.65 -> 0.81). Skipped when NVTE_GG_FORCE_TILE asks for something
+  // specific.
+  static const std::string force_tile_env_caller =
+      getenv<std::string>("NVTE_GG_FORCE_TILE");
+  if (force_tile_env_caller.empty() && avg_m > 0 && avg_m <= 160) {
+    // A tuned-table entry (a per-case validated winner) outranks the
+    // generic small_m template below; without this guard the template
+    // silently overrides the table for every mpe<=160 shape. Re-querying the
+    // table here is nanoseconds vs. the launch it gates.
+    TileConfig tuned;
+    if (!lookup_tuned_tile(avg_m, avg_n, avg_k, transa, transb, sm_arch,
+                           with_C, &tuned)) {
+      TileConfig small_m{128, (avg_n <= 512) ? 256 : 128, 64, 2, with_C};
+      if (has_host_instantiation(small_m)) {
+        cfg = small_m;
+      }
+    }
+  }
+  if (!is_valid_ppu_tile(cfg)) {
+    if (verbose) {
+      NVTE_WARN("CUTLASS RTC grouped GEMM: heuristic returned invalid PPU "
+                "tile (", cfg.tile_m, ",", cfg.tile_n, ",", cfg.tile_k,
+                ") stages=", cfg.stages,
+                "; falling back to default (256,256,64)/s3.");
+    }
+    cfg = kDefaultTile;
+    cfg.with_C = with_C;
+  }
+
+  // The host must instantiate GemmTraits for the same tile and stage count as
+  // the cubin. Any unsupported pair falls back to the one fixed default rather
+  // than changing only its stage count, so every fallback path is consistent.
+  if (!has_host_instantiation(cfg)) {
+    if (verbose) {
+      NVTE_WARN("CUTLASS RTC grouped GEMM: tile (", cfg.tile_m, ",",
+                cfg.tile_n, ",", cfg.tile_k, ") stages=", cfg.stages,
+                " has no host instantiation; falling back to default "
+                "(256,256,64)/s3.");
+    }
+    cfg = TileConfig{kDefaultTile.tile_m, kDefaultTile.tile_n,
+                     kDefaultTile.tile_k, kDefaultTile.stages, cfg.with_C};
+  }
+  return cfg;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -976,7 +1046,8 @@ std::string make_kernel_symbol(int target_sm_arch, TileConfig const& cfg) {
       "_sm", target_sm_arch,
       "_tb", cfg.tile_m, "x", cfg.tile_n, "x", cfg.tile_k,
       "_s", cfg.stages,
-      "_C", cfg.with_C ? element_short<ED>() : "void");
+      "_C", cfg.with_C ? element_short<ED>() : "void",
+      cfg.grouped_tensor ? "_grouped_tensor" : "", cfg.n_expand ? "_ne4" : "");
 }
 
 template <typename Traits>
@@ -1001,7 +1072,8 @@ std::string make_kernel_label(int target_sm_arch, TileConfig const& cfg) {
       element_name<ED>(), ",", element_name<Acc>(), ">,",
       "C=", cfg.with_C ? element_name<ED>() : "void", ",",
       layout_name<LC>(),
-      "> | sm", target_sm_arch);
+      "> | sm", target_sm_arch,
+      cfg.grouped_tensor ? " | GroupedTensor" : "", cfg.n_expand ? " | N_expand=4" : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,6 +1400,8 @@ std::vector<std::string> make_nvrtc_options(int sm_arch, bool trans_a, bool tran
       concat_strings("-DNVTE_GG_DTYPE=", dtype_id),
       concat_strings("-DNVTE_GG_OUT_FP32=", out_fp32 ? 1 : 0),
       concat_strings("-DNVTE_GG_WITH_C=", cfg.with_C ? 1 : 0),
+      concat_strings("-DNVTE_GG_GROUPED_TENSOR=", cfg.grouped_tensor ? 1 : 0),
+      concat_strings("-DNVTE_GG_N_EXPAND=", cfg.n_expand ? 4 : 1),
       // An fp32 destination folds C in by default; a 16-bit wgrad only does so
       // under an explicit experiment switch, because the bf16 fragment and
       // prologue arms never beat the staged epilogue and the production path
@@ -1368,7 +1442,7 @@ std::vector<std::string> make_nvrtc_options(int sm_arch, bool trans_a, bool tran
       opts.push_back(option);
     }
   }
-  
+
   // Match the flags the statically built PPU CUTLASS TUs get (see
   // CUTLASS_KERNEL_SOURCES and the global CUDA flags in
   // transformer_engine/common/CMakeLists.txt). Without NDEBUG the cubin keeps
@@ -1515,17 +1589,19 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
   constexpr bool out_fp32 =
       std::is_same_v<typename Traits::ElementD, float>;
 
-  // The memo borrows entries from kernel_cache(), which are never erased. The
-  // compile options below are sampled per key on first use:
-  // NVTE_GG_EXTRA_DEFINES / NVTE_GG_NO_EXTRA_NVRTC_FLAGS / NVTE_GG_RTC_LINEINFO.
-  // NVTE_GG_DISABLE_RTC_CACHE bypasses the lookup but does not clear the memo.
   const int device = current_device_ordinal();
   const auto memo_key =
       std::make_tuple(device, sm_arch, trans_a, trans_b, cfg.tile_m, cfg.tile_n,
-                      cfg.tile_k, cfg.stages, cfg.with_C);
+                      cfg.tile_k, cfg.stages, cfg.with_C,
+                      cfg.grouped_tensor, cfg.n_expand);
   static std::map<std::decay_t<decltype(memo_key)>, const CompiledKernel*> memo;
   const bool disable_cache = getenv<bool>("NVTE_GG_DISABLE_RTC_CACHE", false);
-  if (!disable_cache) {
+  // The experiment flags can change between calls. Their full compiler options
+  // already participate in the cubin cache; bypass the shape-only shortcut.
+  const bool memoize = !disable_cache && !std::getenv("NVTE_GG_EXTRA_DEFINES") &&
+                       !std::getenv("NVTE_GG_WGRAD_C_FUSION") && !std::getenv("NVTE_GG_C_EVT_CLASSIC") &&
+                       !std::getenv("NVTE_GG_RTC_LINEINFO") && !std::getenv("NVTE_GG_NO_EXTRA_NVRTC_FLAGS");
+  if (memoize) {
     std::lock_guard<std::mutex> lk(cache_mutex());
     auto it = memo.find(memo_key);
     if (it != memo.end()) return *it->second;
@@ -1536,7 +1612,6 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
 
   const std::string kernel_label = make_kernel_label<Traits>(sm_arch, cfg);
   const std::string kernel_symbol = make_kernel_symbol<Traits>(sm_arch, cfg);
-
   // Build a cache key that includes a digest of the full RTC input (top-level
   // source + every reachable include) and the exact compiler options. This
   // lets TE invalidate its cache whenever any header changes, even though
@@ -1564,7 +1639,7 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
   if (!disable_cache) {
     auto it = cache.find(mem_key);
     if (it != cache.end()) {
-      memo.emplace(memo_key, &it->second);
+      if (memoize) memo.emplace(memo_key, &it->second);
       return it->second;
     }
   }
@@ -1635,7 +1710,7 @@ const CompiledKernel& get_or_compile(int sm_arch, bool trans_a, bool trans_b,
   }
 
   auto [iter, _] = cache.emplace(mem_key, ck);
-  if (!disable_cache) memo.emplace(memo_key, &iter->second);
+  if (memoize) memo.emplace(memo_key, &iter->second);
   return iter->second;
 }
 
@@ -1938,7 +2013,7 @@ void launch_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
   // C in the epilogue itself (paired with -DNVTE_GG_PRELOAD_C=0 in the compile
   // options). Reading the route toggle once is enough: this runs on every
   // launch, and a per-launch getenv is measurable host overhead.
-  static const bool c_evt_classic = getenv<bool>("NVTE_GG_C_EVT_CLASSIC", false);
+  const bool c_evt_classic = getenv<bool>("NVTE_GG_C_EVT_CLASSIC", false);
   if (!c_evt_classic &&
       (OutFp32 || (trans_a && !trans_b &&
         getenv<bool>("NVTE_GG_WGRAD_C_FUSION", false))) && cfg.with_C && beta > 0.0f) {
@@ -2191,10 +2266,27 @@ void launch_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,
 // Public C++ entry point (called from cublaslt_gemm.cu)
 // ---------------------------------------------------------------------------
 
+// The ring issues three initial BK64 stages and writes four full BN256 tiles.
+__host__ __device__ bool ne4_shape(int m, int n, int k) {
+  return m > 0 && m % 256 == 0 && n > 0 && n % 1024 == 0 &&
+         k > 0 && k <= 2048 && k % 256 == 0;
+}
+
+// Four columns per CTA reduce parallelism. Use the ring only if its longer
+// waves can cover the device at least as well as the single-column kernel.
+bool use_ne4(uint64_t tiles, int sms, TileConfig const& cfg) {
+  static const auto forced = getenv<std::string>("NVTE_GG_FORCE_TILE");
+  if (!forced.empty() && !(cfg.tile_m == 256 && cfg.tile_n == 256 &&
+                           cfg.tile_k == 64 && cfg.stages == 3)) return false;
+  auto waves = [sms](uint64_t work) { return (work + sms - 1) / sms; };
+  return tiles > 0 && 18 * waves(tiles) <= 5 * waves(4 * tiles);
+}
+
 bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
               int num_gemms, bool transa, bool transb, NVTETensor* workspace,
               bool accumulate, int device, int math_sm_count,
               cudaStream_t stream) {
+  if (!A || !B || !D || num_gemms <= 0) return false;
   const Tensor* inputA = convertNVTETensorCheck(A[0]);
   const bool is_bf16 = (inputA->data.dtype == DType::kBFloat16);
   const bool is_fp16 = (inputA->data.dtype == DType::kFloat16);
@@ -2214,7 +2306,8 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   const int sm_arch = cuda::sm_arch(device);
   if (sm_arch != 80 && sm_arch != 89) return false;
 
-  if (num_gemms <= 0) return false;
+  bool ne4 = sm_arch == 89 && is_bf16 && !transb && !accumulate;
+  uint64_t expanded_tiles = 0;
 
   // Sweep all groups to collect per-group (M, N, K) and compute averages for
   // the tile heuristic. launch_grouped_gemm_rtc is called with the (A, B)
@@ -2240,6 +2333,16 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
                      : static_cast<int>(tin->data.shape[1]);
     const int n = tb ? static_cast<int>(twt->data.shape[0])
                      : static_cast<int>(twt->data.shape[1]);
+    if (ne4) {
+      const auto* dest = convertNVTETensorCheck(D[i]);
+      ne4 = tin->data.shape.size() == 2 && twt->data.shape.size() == 2 &&
+            dest->data.shape.size() == 2 && ne4_shape(m, n, k) && tin->dtype() == DType::kBFloat16 &&
+            twt->dtype() == DType::kBFloat16 &&
+            (reinterpret_cast<uintptr_t>(tin->data.dptr) |
+             reinterpret_cast<uintptr_t>(twt->data.dptr) |
+             reinterpret_cast<uintptr_t>(dest->data.dptr)) % 16 == 0;
+      expanded_tiles += uint64_t(m / 256) * (n / 1024);
+    }
     sum_m += m;
     sum_n += n;
     sum_k += k;
@@ -2262,72 +2365,14 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   // The PPU epilogue's `ScaleType::Nothing` branch (selected when
   // ElementC_=void in ppu_builder.inl) appears less optimized than the
   // `OnlyAlphaScaling` branch + runtime beta=0 short-circuit.
-  // NVTE_GG_FORCE_WITH_C=0 opts back into the void path for experimentation.
-  // Route toggles are parsed once per process (per-launch istringstream getenv
-  // is measurable host time on this path).
   bool with_C = true;
-  static const std::string with_c_env = getenv<std::string>("NVTE_GG_FORCE_WITH_C");
-  if (!with_c_env.empty()) {
-    with_C = (with_c_env == "1" || with_c_env == "true" || with_c_env == "TRUE");
-  }
-  // The fp32 destination kernel folds the source into the accumulator fragment
-  // and therefore always needs a typed source pointer; ElementC=void would
-  // elide the very load that performs the accumulation.
-  if (out_fp32) {
-    with_C = true;
-  }
-  TileConfig cfg = get_or_query_tile_stages(avg_m, avg_n, avg_k, num_gemms,
-                                            transa, transb, sm_arch, num_sms,
-                                            with_C);
-  // DeepGemm's memory-bound region analog (m <= 160): when every group's
-  // M fits in half of a 256-row tile, an M-matched 128-row tile removes the
-  // 2x M-direction waste (measured on problem_shapes.txt z=16, mpe=128, NN:
-  // geomean TE/DeepGemm 0.58 -> 0.65). BN follows the tile count: N <= 512
-  // keeps 256-wide tiles (fewer tiles, one wave per expert), N > 512 prefers
-  // 128-wide tiles (2x the tiles for load balance, and the 64 KB smem
-  // footprint lets 3-4 CTAs co-reside per CU — the occupancy auto path in
-  // launch_grouped_gemm_rtc turns that into the second half of the win,
-  // 0.65 -> 0.81). Skipped when NVTE_GG_FORCE_TILE asks for something
-  // specific.
-  static const std::string force_tile_env_caller =
-      getenv<std::string>("NVTE_GG_FORCE_TILE");
-  if (force_tile_env_caller.empty() && avg_m > 0 && avg_m <= 160) {
-    // A tuned-table entry (a per-case validated winner) outranks the
-    // generic small_m template below; without this guard the template
-    // silently overrides the table for every mpe<=160 shape. Re-querying the
-    // table here is nanoseconds vs. the launch it gates.
-    TileConfig tuned;
-    if (!lookup_tuned_tile(avg_m, avg_n, avg_k, transa, transb, sm_arch,
-                           with_C, &tuned)) {
-      TileConfig small_m{128, (avg_n <= 512) ? 256 : 128, 64, 2, with_C};
-      if (has_host_instantiation(small_m)) {
-        cfg = small_m;
-      }
-    }
-  }
-  if (!is_valid_ppu_tile(cfg)) {
-    if (verbose_tile_debug()) {
-      NVTE_WARN("CUTLASS RTC grouped GEMM: heuristic returned invalid PPU "
-                "tile (", cfg.tile_m, ",", cfg.tile_n, ",", cfg.tile_k,
-                ") stages=", cfg.stages,
-                "; falling back to default (256,256,64)/s3.");
-    }
-    cfg = kDefaultTile;
-    cfg.with_C = with_C;
-  }
+  TileConfig cfg = select_grouped_tile(avg_m, avg_n, avg_k, num_gemms, transa,
+                                      transb, sm_arch, num_sms, with_C);
 
-  // The host must instantiate GemmTraits for the same tile and stage count as
-  // the cubin. Any unsupported pair falls back to the one fixed default rather
-  // than changing only its stage count, so every fallback path is consistent.
-  if (!has_host_instantiation(cfg)) {
-    if (verbose_tile_debug()) {
-      NVTE_WARN("CUTLASS RTC grouped GEMM: tile (", cfg.tile_m, ",",
-                cfg.tile_n, ",", cfg.tile_k, ") stages=", cfg.stages,
-                " has no host instantiation; falling back to default "
-                "(256,256,64)/s3.");
-    }
-    cfg = TileConfig{kDefaultTile.tile_m, kDefaultTile.tile_n,
-                     kDefaultTile.tile_k, kDefaultTile.stages, cfg.with_C};
+  if (ne4 && use_ne4(expanded_tiles, num_sms, cfg)) {
+    cfg = kDefaultTile;
+    cfg.with_C = true;  // preserve the ordinary GemmUniversal::Params ABI
+    cfg.n_expand = true;
   }
 
   if (verbose_tile_debug()) {
@@ -2417,7 +2462,489 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
   return ok;
 }
 
+namespace {
+using cutlass::gemm::kernel::NativeControl;
+using cutlass::gemm::kernel::NativeExpert;
+using cutlass::gemm::kernel::NativeParams;
+
+struct NativeStorage {
+  void* base;
+  uint64_t capacity;  // elements
+  const int64_t *first, *last, *offsets;
+  int64_t common_first, common_last;
+};
+
+struct NativeSetup {
+  NativeStorage a, b, c, d;
+  const NativeStorage *b_list, *c_list, *d_list;
+  NativeExpert* experts;
+  NativeControl* control;
+  const float *alpha, *beta;
+  int groups, scalar_count, ta, tb, output_bytes, sms, tile_m, tile_n;
+  bool has_c, ne4;
+};
+
+__device__ __forceinline__ void require_metadata(bool valid) {
+  if (!valid) __assert_fail("invalid grouped GEMM metadata", __FILE__, __LINE__, __func__);
+}
+
+struct MatrixSlice {
+  uint64_t ptr;
+  int rows, cols;
+};
+
+// CSR, uniform and discrete operands have independent addresses. Only ragged
+// storage without offsets needs a running prefix in expert order.
+__device__ __forceinline__ MatrixSlice matrix_slice(const NativeStorage& packed,
+                                                    const NativeStorage* list, int group,
+                                                    int bytes, uint64_t& running) {
+  const auto& s = list ? list[group] : packed;
+  int64_t rows = s.first ? s.first[group] : s.common_first;
+  int64_t cols = s.last ? s.last[group] : s.common_last;
+  require_metadata(rows >= 0 && cols >= 0 && rows <= INT_MAX - 256 && cols <= INT_MAX - 256);
+  uint64_t count = uint64_t(rows) * cols;
+  uint64_t offset = 0;
+  if (s.offsets) {
+    int64_t start = s.offsets[group], end = s.offsets[group + 1];
+    require_metadata(start >= 0 && end >= start && uint64_t(end) <= s.capacity &&
+                     count <= uint64_t(end - start));
+    offset = uint64_t(start);
+  } else if (!list) {
+    if (s.first || s.last) {
+      offset = running;
+      running += count;
+    } else {
+      require_metadata(count == 0 || uint64_t(group) <= s.capacity / count);
+      offset = uint64_t(group) * count;
+    }
+  }
+  require_metadata(offset <= s.capacity && count <= s.capacity - offset);
+  // The host checked the byte range of the complete allocation.
+  uint64_t ptr = reinterpret_cast<uint64_t>(s.base) + offset * bytes;
+  require_metadata(count == 0 || (ptr != 0 && ptr % 16 == 0));
+  return {ptr, int(rows), int(cols)};
+}
+
+__host__ __device__ bool disjoint_ranges(uint64_t a, uint64_t bytes_a,
+                                        uint64_t b, uint64_t bytes_b) {
+  return bytes_a == 0 || bytes_b == 0 ||
+         (a <= b ? bytes_a <= b - a : bytes_b <= a - b);
+}
+
+constexpr int kMetadataThreads = 32;
+__global__ void prepare_native_grouped_metadata(NativeSetup p) {
+  __shared__ NativeExpert chunk[kMetadataThreads];
+  auto needs_prefix = [](const NativeStorage& s) { return !s.offsets && (s.first || s.last); };
+  int step = needs_prefix(p.a) || needs_prefix(p.b) || needs_prefix(p.c) || needs_prefix(p.d)
+                 ? 1 : kMetadataThreads;
+  int lane = threadIdx.x;
+  uint64_t offsets[4]{};
+  uint64_t total = 0, per_group = 0;
+  for (int64_t start = 0; start < p.groups; start += step) {
+    int count = int(p.groups - start < step ? p.groups - start : step);
+    if (lane < count) {
+      int i = int(start) + lane;
+      auto a = matrix_slice(p.a, nullptr, i, 2, offsets[0]);
+      auto b = matrix_slice(p.b, p.b_list, i, 2, offsets[1]);
+      auto d = matrix_slice(p.d, p.d_list, i, p.output_bytes, offsets[2]);
+      int m = p.ta ? a.cols : a.rows, k = p.ta ? a.rows : a.cols;
+      int n = p.tb ? b.rows : b.cols;
+      float alpha = p.alpha[p.scalar_count == 1 ? 0 : i];
+      float beta = p.beta[p.scalar_count == 1 ? 0 : i];
+      require_metadata(k == (p.tb ? b.cols : b.rows) && d.rows == m && d.cols == n);
+      require_metadata(!m || !n || !k || (a.cols % 8 == 0 && b.cols % 8 == 0));
+      uint64_t cptr = 0;
+      if (p.has_c) {
+        auto c = matrix_slice(p.c, p.c_list, i, p.output_bytes, offsets[3]);
+        require_metadata(c.rows == m && c.cols == n);
+        uint64_t bytes = uint64_t(m) * n * p.output_bytes;
+        require_metadata(c.ptr == d.ptr || disjoint_ranges(c.ptr, bytes, d.ptr, bytes));
+        require_metadata(!bytes || !p.d.base || p.c.base != p.d.base || c.ptr == d.ptr);
+        cptr = c.ptr;
+      } else {
+        require_metadata(beta == 0 || !m || !n);
+      }
+      int columns = p.ne4 && ne4_shape(m, n, k) && alpha == 1 && beta == 0 ? 4 : 1;
+      uint64_t tiles = uint64_t((m + p.tile_m - 1) / p.tile_m) *
+                       ((n + p.tile_n - 1) / p.tile_n) / columns;
+      chunk[lane] = {a.ptr, b.ptr, cptr, d.ptr, tiles, m, n, k, columns, alpha, beta};
+    }
+    __syncthreads();
+    if (lane == 0) {
+      for (int j = 0; j < count; ++j) {
+        auto& e = chunk[j];
+        uint64_t tiles = e.end;
+        if (start == 0 && j == 0) per_group = tiles;
+        if (tiles != per_group) per_group = 0;
+        require_metadata(tiles <= UINT64_MAX - total);
+        e.end = total += tiles;
+      }
+    }
+    __syncthreads();
+    if (lane < count) p.experts[start + lane] = chunk[lane];
+    __syncthreads();
+  }
+  // A list of independent outputs has no single allocation range to validate
+  // on the host. Check it against all inputs and the other output slices.
+  if (p.d_list) {
+    for (int64_t i = lane; i < p.groups; i += kMetadataThreads) {
+      auto e = p.experts[i];
+      uint64_t bytes = uint64_t(e.m) * e.n * p.output_bytes;
+      for (int j = 0; j < p.groups; ++j) {
+        auto other = p.experts[j];
+        uint64_t other_bytes = uint64_t(other.m) * other.n * p.output_bytes;
+        require_metadata(disjoint_ranges(e.d, bytes, other.a, uint64_t(other.m) * other.k * 2) &&
+                         disjoint_ranges(e.d, bytes, other.b, uint64_t(other.n) * other.k * 2));
+        if (i != j) {
+          require_metadata(disjoint_ranges(e.d, bytes, other.d, other_bytes));
+          require_metadata(other.beta == 0 || disjoint_ranges(e.d, bytes, other.c, other_bytes));
+        }
+      }
+    }
+  }
+  if (lane == 0) *p.control = {total, per_group};
+}
+
+// These are the geometries used by the native BF16 backend. Reuse the
+// ordinary tile heuristic and snap an unsupported tuning override once.
+#define NVTE_NATIVE_TILES(F) \
+  F(256,256,64,3) F(256,256,64,4) F(256,256,128,2) \
+  F(256,128,64,3) F(256,128,64,4) F(128,256,64,2) \
+  F(128,256,64,3) F(128,256,64,4) F(128,128,64,2)
+
+template <bool TA, bool TB, bool FP32, int M, int N, int K, int S>
+struct NativeTraits : GemmTraits<TA, TB, 89, cutlass::bfloat16_t, M, N, K, S, FP32> {
+  using Base = GemmTraits<TA, TB, 89, cutlass::bfloat16_t, M, N, K, S, FP32>;
+  using GemmKernel = cutlass::gemm::kernel::NvteNativeGrouped<
+      typename Base::CollectiveMainloop, typename Base::CollectiveEpilogue, false>;
+};
+
+template <bool TA, bool TB, bool FP32>
+void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream) {
+  if (cfg.stages == 0) cfg.stages = cfg.tile_m == 128 && cfg.tile_n == 128 ? 2 : 3;
+  const CompiledKernel& kernel = [&]() -> const CompiledKernel& {
+#define NVTE_NATIVE_MATCH(M,N,K,S) \
+    if (cfg.tile_m == M && cfg.tile_n == N && cfg.tile_k == K && cfg.stages == S) \
+      return get_or_compile<NativeTraits<TA, TB, FP32, M, N, K, S>>(89, TA, TB, cfg);
+    NVTE_NATIVE_TILES(NVTE_NATIVE_MATCH)
+#undef NVTE_NATIVE_MATCH
+    cfg = TileConfig{256, 128, 64, 3, true};
+    cfg.grouped_tensor = true;
+    return get_or_compile<NativeTraits<TA, TB, FP32, 256, 128, 64, 3>>(89, TA, TB, cfg);
+  }();
+  setup.tile_m = cfg.tile_m;
+  setup.tile_n = cfg.tile_n;
+  setup.ne4 = cfg.n_expand;
+  NativeParams params{};
+  auto packed = [&](const NativeStorage& s, int bytes) {
+    if (s.first || s.last || s.offsets || !s.base || s.common_first <= 0 || s.common_last <= 0)
+      return false;
+    uint64_t count = uint64_t(s.common_first) * s.common_last;
+    return count <= s.capacity / setup.groups && reinterpret_cast<uintptr_t>(s.base) % 16 == 0 &&
+           (count * bytes) % 16 == 0;
+  };
+  // A plain packed descriptor proves every expert address on the host.
+  // CSR and discrete inputs retain device-side shape and bounds validation.
+  const int m = TA ? setup.a.common_last : setup.a.common_first;
+  const int k = TA ? setup.a.common_first : setup.a.common_last;
+  const int n = TB ? setup.b.common_first : setup.b.common_last;
+  const int mt = (m + cfg.tile_m - 1) / cfg.tile_m;
+  const int columns = cfg.n_expand ? 4 : 1;
+  const int nt = ((n + cfg.tile_n - 1) / cfg.tile_n) / columns;
+  const uint64_t group_tiles = uint64_t(mt) * nt;
+  if (group_tiles > 0 && group_tiles <= INT_MAX / setup.groups && packed(setup.a, 2) && packed(setup.b, 2) &&
+      packed(setup.c, setup.output_bytes) && packed(setup.d, setup.output_bytes) &&
+      k == (TB ? setup.b.common_last : setup.b.common_first) &&
+      setup.c.common_first == m && setup.c.common_last == n &&
+      setup.d.common_first == m && setup.d.common_last == n &&
+      setup.a.common_last % 8 == 0 && setup.b.common_last % 8 == 0 &&
+      (!cfg.n_expand || ne4_shape(m, n, k))) {
+    params.uniform = {reinterpret_cast<uint64_t>(setup.a.base),
+                      reinterpret_cast<uint64_t>(setup.b.base),
+                      reinterpret_cast<uint64_t>(setup.c.base),
+                      reinterpret_cast<uint64_t>(setup.d.base), group_tiles * setup.groups, m, n, k, columns};
+    params.alpha = setup.alpha;
+    params.beta = setup.beta;
+    params.scalar_stride = setup.scalar_count != 1;
+    params.tiles_per_group = cutlass::FastDivmod(int(group_tiles));
+    params.tiles_per_row = cutlass::FastDivmod(nt);
+  } else {
+    prepare_native_grouped_metadata<<<1, kMetadataThreads, 0, stream>>>(setup);
+    NVTE_CHECK_CUDA(cudaGetLastError());
+    params.experts = setup.experts;
+    params.control = setup.control;
+  }
+  int blocks_per_sm = 1;
+  if (cfg.tile_m <= 128) {
+    NVTE_CALL_CHECK_CUDA_DRIVER(cuOccupancyMaxActiveBlocksPerMultiprocessor, &blocks_per_sm,
+                                kernel.function, kernel.thread_count, kernel.smem_size);
+  }
+  void* args[] = {&params};
+  NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchKernel, kernel.function, setup.sms * std::max(1, blocks_per_sm), 1, 1,
+                              kernel.thread_count, 1, 1, kernel.smem_size,
+                              static_cast<CUstream>(stream), args, nullptr);
+}
+#undef NVTE_NATIVE_TILES
+}  // namespace
 }  // namespace grouped_gemm_rtc
+
+bool native_grouped_gemm_supported_device() {
+  return cuda::sm_arch(grouped_gemm_rtc::current_device_ordinal()) == 89;
+}
+
+size_t native_grouped_gemm_workspace_size(size_t groups) {
+  using namespace grouped_gemm_rtc;
+  NVTE_CHECK(groups <= size_t(INT_MAX) && groups <=
+                 (std::numeric_limits<size_t>::max() - 512) /
+                     (sizeof(NativeExpert) + 3 * sizeof(NativeStorage)),
+             "native grouped GEMM workspace size overflow");
+  return grouped_gemm_rtc::round_up(sizeof(NativeControl), size_t(128)) +
+         grouped_gemm_rtc::round_up(groups * sizeof(NativeExpert), size_t(128)) +
+         3 * grouped_gemm_rtc::round_up(groups * sizeof(NativeStorage), size_t(128));
+}
+
+bool try_native_grouped_gemm(const NVTEGroupedTensor A, int transa,
+                            const NVTEGroupedTensor B, int transb,
+                            const NVTEGroupedTensor C, NVTEGroupedTensor D,
+                            const NVTETensor alpha, const NVTETensor beta,
+                            NVTETensor workspace_setup, NVTETensor workspace_cublas,
+                            NVTEGroupedMatmulConfig config, cudaStream_t stream,
+                            const NVTETensor* A_list, size_t num_a,
+                            const NVTETensor* C_list, NVTETensor* D_list, size_t num_d) {
+  using namespace grouped_gemm_rtc;
+  if (!native_grouped_gemm_supported_device()) return false;
+  const auto* b = convertNVTEGroupedTensorCheck(B);
+  if (b->dtype() != DType::kBFloat16 || b->scale_inv.dptr || b->columnwise_scale_inv.dptr)
+    return false;
+  NVTE_CHECK(transa == 0 || transa == 1, "native grouped GEMM invalid transa");
+  NVTE_CHECK(transb == 0 || transb == 1, "native grouped GEMM invalid transb");
+  NVTE_CHECK(!(transa && transb), "native grouped GEMM TT layout is unsupported");
+  const auto* a = A ? convertNVTEGroupedTensorCheck(A) : nullptr;
+  const auto* c = C ? convertNVTEGroupedTensorCheck(C) : nullptr;
+  const auto* d = D ? convertNVTEGroupedTensorCheck(D) : nullptr;
+  const size_t groups = b->num_tensors;
+  NVTE_CHECK(groups > 0 && groups <= size_t(INT_MAX), "native grouped GEMM invalid group count");
+  NVTE_CHECK((a && !A_list) || (!a && A_list && num_a == groups),
+             "native grouped GEMM invalid A descriptor");
+  NVTE_CHECK((d && !D_list) || (!d && D_list && num_d == groups),
+             "native grouped GEMM invalid D descriptor");
+  const auto output_dtype = d ? d->dtype() : convertNVTETensorCheck(D_list[0])->dtype();
+  if (output_dtype != DType::kBFloat16 && output_dtype != DType::kFloat32) return false;
+  const int device = current_device_ordinal();
+  auto device_pointer = [&](const void* pointer) {
+    if (!pointer) return;
+    cudaPointerAttributes attrs{};
+    NVTE_CHECK_CUDA(cudaPointerGetAttributes(&attrs, pointer));
+    NVTE_CHECK(attrs.type == cudaMemoryTypeDevice && attrs.device == device,
+               "native grouped GEMM requires pointers on the current device");
+  };
+  auto metadata = [&](const SimpleTensor& tensor, size_t count) -> const int64_t* {
+    if (!tensor.dptr) {
+      NVTE_CHECK(tensor.numel() == 0, "native grouped GEMM null metadata with nonzero length");
+      return nullptr;
+    }
+    NVTE_CHECK(tensor.dtype == DType::kInt64 && tensor.shape.size() == 1 &&
+                   tensor.shape[0] == count,
+               "native grouped GEMM metadata must be rank-1 int64 with exact group length");
+    NVTE_CHECK(reinterpret_cast<uintptr_t>(tensor.dptr) % alignof(int64_t) == 0,
+               "native grouped GEMM metadata requires 8-byte alignment");
+    device_pointer(tensor.dptr);
+    return static_cast<const int64_t*>(tensor.dptr);
+  };
+  auto storage = [&](const GroupedTensor* tensor, DType dtype) -> NativeStorage {
+    if (!tensor) return {};
+    NVTE_CHECK(tensor->num_tensors == groups && tensor->logical_shape.ndim == 2 &&
+                   tensor->data.dtype == dtype && tensor->data.shape.size() == 1 &&
+                   !tensor->scale_inv.dptr && !tensor->columnwise_scale_inv.dptr,
+               "native grouped GEMM requires rank-1 unquantized grouped storage");
+    NativeStorage result{};
+    result.base = tensor->data.dptr;
+    result.capacity = tensor->data.numel();
+    device_pointer(result.base);
+    result.first = metadata(tensor->first_dims, groups);
+    result.last = metadata(tensor->last_dims, groups);
+    result.offsets = metadata(tensor->tensor_offsets, groups + 1);
+    if (!result.first) {
+      NVTE_CHECK(result.last || tensor->logical_shape.data[0] % groups == 0,
+                 "native grouped GEMM uniform rows are not divisible by group count");
+      auto value = result.last ? tensor->logical_shape.data[0]
+                               : tensor->logical_shape.data[0] / groups;
+      NVTE_CHECK(value <= size_t(INT_MAX - 256), "native grouped GEMM row dimension overflow");
+      result.common_first = value;
+    }
+    if (!result.last) {
+      NVTE_CHECK(tensor->logical_shape.data[1] <= size_t(INT_MAX - 256),
+                 "native grouped GEMM column dimension overflow");
+      result.common_last = tensor->logical_shape.data[1];
+    }
+    NVTE_CHECK(result.capacity == 0 || result.base,
+               "native grouped GEMM nonempty storage has a null pointer");
+    return result;
+  };
+  NativeSetup setup{};
+  setup.a = storage(b, DType::kBFloat16);
+  setup.b = storage(a, DType::kBFloat16);
+  setup.c = storage(c, output_dtype);
+  setup.d = storage(d, output_dtype);
+  setup.has_c = c != nullptr || C_list != nullptr;
+  setup.groups = int(groups);
+  setup.ta = transb; setup.tb = transa;
+  setup.output_bytes = output_dtype == DType::kFloat32 ? 4 : 2;
+  const auto* at = convertNVTETensorCheck(alpha);
+  const auto* bt = convertNVTETensorCheck(beta);
+  NVTE_CHECK(at->dtype() == DType::kFloat32 && bt->dtype() == DType::kFloat32 &&
+                 (at->numel() == 1 || at->numel() == groups) && at->numel() == bt->numel(),
+             "native grouped GEMM alpha/beta must be float32 scalars or per-group arrays");
+  device_pointer(at->data.dptr); device_pointer(bt->data.dptr);
+  NVTE_CHECK(at->data.dptr && bt->data.dptr, "native grouped GEMM null alpha/beta");
+  NVTE_CHECK(reinterpret_cast<uintptr_t>(at->data.dptr) % alignof(float) == 0 &&
+                 reinterpret_cast<uintptr_t>(bt->data.dptr) % alignof(float) == 0,
+             "native grouped GEMM alpha/beta requires 4-byte alignment");
+  setup.alpha = static_cast<const float*>(at->data.dptr);
+  setup.beta = static_cast<const float*>(bt->data.dptr);
+  setup.scalar_count = int(at->numel());
+  auto* ws = convertNVTETensorCheck(workspace_setup);
+  const size_t bytes = native_grouped_gemm_workspace_size(groups);
+  NVTE_CHECK(ws->dtype() == DType::kByte && ws->data.shape.size() == 1 &&
+                 ws->data.dptr && ws->numel() >= bytes &&
+                 reinterpret_cast<uintptr_t>(ws->data.dptr) % 128 == 0,
+             "native grouped GEMM requires sufficient 128-byte aligned setup workspace");
+  device_pointer(ws->data.dptr);
+  auto range = [&](NativeStorage const& s, int element_bytes) {
+    uint64_t start = reinterpret_cast<uint64_t>(s.base);
+    NVTE_CHECK(s.capacity <= (UINT64_MAX - start) / element_bytes,
+               "native grouped GEMM storage pointer range overflow");
+    return std::make_pair(start, s.capacity * element_bytes);
+  };
+  auto disjoint = [](auto x, auto y) {
+    return disjoint_ranges(x.first, x.second, y.first, y.second);
+  };
+  auto wrange = std::make_pair(reinterpret_cast<uint64_t>(ws->data.dptr), uint64_t(bytes));
+  for (auto r : {range(setup.a, 2), range(setup.b, 2),
+                 range(setup.c, setup.output_bytes), range(setup.d, setup.output_bytes)})
+    NVTE_CHECK(disjoint(wrange, r), "native grouped GEMM workspace overlaps storage");
+  auto drange = range(setup.d, setup.output_bytes);
+  NVTE_CHECK(disjoint(drange, range(setup.a, 2)) && disjoint(drange, range(setup.b, 2)),
+             "native grouped GEMM D overlaps input storage");
+  auto crange = range(setup.c, setup.output_bytes);
+  NVTE_CHECK(crange == drange || disjoint(crange, drange),
+             "native grouped GEMM partially overlapping C/D storage");
+  auto check_metadata_disjoint = [&](auto buffer) {
+    auto check = [&](const SimpleTensor& t, int element_bytes) {
+      auto r = std::make_pair(reinterpret_cast<uint64_t>(t.dptr), uint64_t(t.numel()) * element_bytes);
+      NVTE_CHECK(disjoint(buffer, r), "native grouped GEMM output or workspace overlaps metadata");
+    };
+    for (const auto* t : {a, b, c, d}) {
+      if (t) {
+        check(t->first_dims, 8);
+        check(t->last_dims, 8);
+        check(t->tensor_offsets, 8);
+      }
+    }
+    check(at->data, 4);
+    check(bt->data, 4);
+  };
+  check_metadata_disjoint(wrange);
+  check_metadata_disjoint(drange);
+  cudaStreamCaptureStatus capture;
+  NVTE_CHECK_CUDA(cudaStreamIsCapturing(stream, &capture));
+  NVTE_CHECK(capture == cudaStreamCaptureStatusNone,
+             "native grouped GEMM does not support CUDA graph capture");
+  GroupedMatmulConfig policy{};
+  if (config) policy = *reinterpret_cast<const GroupedMatmulConfig*>(config);
+  setup.sms = policy.sm_count > 0 ? policy.sm_count : cuda::sm_count();
+  if (setup.sms <= 0) setup.sms = 39;
+  // Align the native geometry with the ordinary host-array launcher: both now
+  // derive the same host-visible averages and run the same tile policy. The
+  // averages are O(1) reads for grouped operands (logical_shape / common dims)
+  // and per-tensor shape reads for a real discrete list; per-expert device
+  // dims never leave the GPU.
+  auto avg_first = [](const GroupedTensor* t) -> int64_t {
+    if (t->all_same_first_dim()) return int64_t(t->get_common_first_dim());
+    const int64_t count = int64_t(t->num_tensors);
+    if (t->all_same_last_dim()) return int64_t(t->logical_shape.data[0]) / count;
+    return 1;
+  };
+  auto avg_last = [](const GroupedTensor* t) -> int64_t {
+    if (t->all_same_last_dim()) return int64_t(t->logical_shape.data[1]);
+    return int64_t(t->logical_shape.data[1]) / int64_t(t->num_tensors);
+  };
+  auto clamp_avg = [](int64_t value) {
+    if (value <= 0) return 1;
+    return value > INT_MAX - 256 ? INT_MAX - 256 : int(value);
+  };
+  const bool ta = transb, tb = transa;
+  int64_t host_m = ta ? avg_last(b) : avg_first(b);
+  int64_t host_k = ta ? avg_first(b) : avg_last(b);
+  int64_t host_n = 1;
+  if (a) {
+    host_n = tb ? avg_first(a) : avg_last(a);
+    host_k = tb ? avg_last(a) : avg_first(a);
+  } else if (A_list) {
+    int64_t sum_n = 0, sum_k = 0;
+    for (size_t i = 0; i < groups; ++i) {
+      const auto* t = convertNVTETensorCheck(A_list[i]);
+      NVTE_CHECK(t->data.shape.size() == 2,
+                 "native grouped GEMM discrete A requires rank 2");
+      sum_n += tb ? int64_t(t->data.shape[0]) : int64_t(t->data.shape[1]);
+      sum_k += tb ? int64_t(t->data.shape[1]) : int64_t(t->data.shape[0]);
+    }
+    host_n = sum_n / int64_t(groups);
+    host_k = sum_k / int64_t(groups);
+  }
+  TileConfig chosen = select_grouped_tile(clamp_avg(host_m), clamp_avg(host_n),
+                                          clamp_avg(host_k), int(groups), transa,
+                                          transb, 89, setup.sms, true);
+  if (!transb && ne4_shape(clamp_avg(host_m), clamp_avg(host_n), clamp_avg(host_k)) &&
+      use_ne4(uint64_t(groups) * (host_m / 256) * (host_n / 1024), setup.sms, chosen)) {
+    chosen = kDefaultTile;
+    chosen.with_C = true;
+    chosen.n_expand = true;
+  }
+  chosen.grouped_tensor = true;
+  char* memory = static_cast<char*>(ws->data.dptr);
+  setup.control = reinterpret_cast<NativeControl*>(memory);
+  memory += round_up(sizeof(NativeControl), size_t(128));
+  setup.experts = reinterpret_cast<NativeExpert*>(memory);
+  memory += round_up(groups * sizeof(NativeExpert), size_t(128));
+  auto stage_discrete = [&](const NVTETensor* tensors, DType dtype) -> const NativeStorage* {
+    if (!tensors) return nullptr;
+    std::vector<NativeStorage> descriptors;
+    descriptors.reserve(groups);
+    for (size_t i = 0; i < groups; ++i) {
+      const auto* t = convertNVTETensorCheck(tensors[i]);
+      NVTE_CHECK(t->dtype() == dtype && t->data.shape.size() == 2 &&
+                     t->data.shape[0] <= size_t(INT_MAX - 256) &&
+                     t->data.shape[1] <= size_t(INT_MAX - 256),
+                 "native grouped GEMM discrete tensors require uniform dtype and rank 2");
+      device_pointer(t->data.dptr);
+      NativeStorage s{t->data.dptr, t->numel(), nullptr, nullptr, nullptr,
+                      int64_t(t->data.shape[0]), int64_t(t->data.shape[1])};
+      auto r = range(s, dtype == DType::kBFloat16 ? 2 : setup.output_bytes);
+      NVTE_CHECK(disjoint(wrange, r), "native grouped GEMM workspace overlaps discrete storage");
+      if (dtype == DType::kBFloat16 && tensors == A_list)
+        NVTE_CHECK(disjoint(drange, r), "native grouped GEMM D overlaps discrete input");
+      if (tensors == D_list) check_metadata_disjoint(r);
+      descriptors.push_back(s);
+    }
+    auto* result = reinterpret_cast<NativeStorage*>(memory);
+    NVTE_CHECK_CUDA(cudaMemcpyAsync(memory, descriptors.data(), groups * sizeof(NativeStorage),
+                                    cudaMemcpyHostToDevice, stream));
+    memory += round_up(groups * sizeof(NativeStorage), size_t(128));
+    return result;
+  };
+  setup.b_list = stage_discrete(A_list, DType::kBFloat16);
+  setup.c_list = stage_discrete(C_list, output_dtype);
+  setup.d_list = stage_discrete(D_list, output_dtype);
+  auto layout = [&](auto fp32) {
+    if (transb) launch_native<true, false, decltype(fp32)::value>(setup, chosen, stream);
+    else if (transa) launch_native<false, true, decltype(fp32)::value>(setup, chosen, stream);
+    else launch_native<false, false, decltype(fp32)::value>(setup, chosen, stream);
+  };
+  if (output_dtype == DType::kFloat32) layout(std::true_type{});
+  else layout(std::false_type{});
+  return true;
+}
 }  // namespace transformer_engine
 
 bool cutlass_grouped_gemm_rtc(const NVTETensor* A, const NVTETensor* B,

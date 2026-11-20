@@ -15,13 +15,20 @@ instead of silently falling back to cuBLAS, which would let these tests pass
 vacuously.
 """
 
+import importlib
+import json
 import os
+import subprocess
+import sys
 
 import pytest
 import torch
 import transformer_engine
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
+from transformer_engine.pytorch.tensor.storage.grouped_tensor_storage import GroupedTensorStorage
+
+gemm_ext = importlib.import_module("transformer_engine.pytorch.cpp_extensions.gemm")
 
 NUM_GEMMS = 16
 RTOL = 0.05
@@ -73,6 +80,269 @@ def _rtc_env(monkeypatch):
         monkeypatch.setenv("NVTE_CUTLASS3_INCLUDE_DIR", candidate)
     yield
     torch.cuda.synchronize()
+
+
+def test_grouped_workspace_stream_cache(monkeypatch):
+    """Pointer ranges, not timing, prove isolation even when launches serialize."""
+    device = torch.cuda.current_device()
+    streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+    setup = gemm_ext._get_grouped_gemm_setup_workspace
+    setup.cache_clear()
+    size_requests = []
+
+    def setup_size(groups):
+        size_requests.append(groups)
+        return groups * 256
+
+    # Test the cache independently of compile-time cuBLAS grouped-setup support.
+    monkeypatch.setattr(gemm_ext, "get_grouped_gemm_setup_workspace_size", setup_size)
+    snapshots, ordinary = [], []
+    try:
+        for stream in streams:
+            with torch.cuda.stream(stream):
+                ws = gemm_ext.get_cublas_workspace(device, False, True)
+                assert ws is gemm_ext.get_cublas_workspace(device, False, True)
+                assert len(ws) == gemm_ext.tex.get_num_cublas_streams()
+                assert all(buf.numel() > 0 for buf in ws)
+                buffers = list(ws)
+                for groups in (3, 5):
+                    buf = setup(device, groups, stream.cuda_stream)
+                    assert buf is setup(device, groups, stream.cuda_stream)
+                    buffers.append(buf)
+                for layout in ("TN", "NN", "NT"):
+                    buf = gemm_ext._get_grouped_cublas_workspace(device, layout, stream.cuda_stream)
+                    assert buf.numel() > 0
+                    assert buf is gemm_ext._get_grouped_cublas_workspace(
+                        device, layout, stream.cuda_stream
+                    )
+                    buffers.append(buf)
+                snapshots.append(buffers)
+                ordinary.append([gemm_ext.get_cublas_workspace(device, ub, False)
+                                 for ub in (False, True)])
+        assert all(a is b for a, b in zip(*ordinary))  # Non-grouped/UB remain device-cached.
+        assert size_requests == [3, 5, 3, 5]
+        nonempty = [buf for buffers in snapshots for buf in buffers if buf.numel()]
+        for i, left in enumerate(nonempty):
+            for right in nonempty[i + 1:]:
+                assert (left.data_ptr() + left.numel() <= right.data_ptr()
+                        or right.data_ptr() + right.numel() <= left.data_ptr())
+    finally:
+        # Never leave mocked setup capacities in the production cache.
+        setup.cache_clear()
+
+
+@pytest.mark.parametrize("path", ["ordinary", "grouped_tensor"])
+def test_grouped_gemm_two_streams(path):
+    """Interleave groups and workspaces on two caller streams."""
+    if path == "grouped_tensor" and torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("The grouped-tensor multi-tensor adapter requires PPU sm89")
+    torch.manual_seed(5702)
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    cases = []
+
+    def pack(tensors):
+        rows, cols = tensors[0].shape
+        return GroupedTensorStorage(
+            (len(tensors) * rows, cols), torch.bfloat16, num_tensors=len(tensors),
+            data=torch.cat([t.flatten() for t in tensors]),
+        )
+
+    for sid in range(2):
+        stream_cases = []
+        for groups in (4, 3):
+            m, n, k = 256 + sid * 128, 256 + sid * 256, 256
+            a = [torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.125
+                 for _ in range(groups)]
+            b = [torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.125
+                 for _ in range(groups)]
+            refs = [y.float() @ x.float().t() for x, y in zip(a, b)]
+            d = [torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+                 for _ in range(groups)]
+            if path == "grouped_tensor":
+                a, b, d = pack(a), pack(b), pack(d)
+                outputs = list(d.rowwise_data.view(groups, m, n).unbind())
+            else:
+                outputs = d
+            stream_cases.append((a, b, d, outputs, refs))
+        cases.append(stream_cases)
+
+    def launch(case):
+        a, b, d, _, _ = case
+        if path == "grouped_tensor":
+            gemm_ext.general_grouped_gemm_for_grouped_tensor(a, b, d)
+        else:
+            general_grouped_gemm(a, b, d, [None] * len(a), torch.bfloat16, m_splits=[])
+
+    ready = torch.cuda.Event()
+    ready.record()  # Inputs and references were produced on the current stream.
+    for stream, stream_cases in zip(streams, cases):
+        with torch.cuda.stream(stream):
+            stream.wait_event(ready)
+            for case in stream_cases:
+                launch(case)  # Warm every JIT specialization before the stress loop.
+        stream.synchronize()
+    for _ in range(4):
+        for index in range(2):
+            for stream, stream_cases in zip(streams, cases):
+                with torch.cuda.stream(stream):
+                    for out in stream_cases[index][3]:
+                        out.fill_(float("nan"))
+                    launch(stream_cases[index])
+    done = [torch.cuda.Event() for _ in streams]
+    for stream, event in zip(streams, done):
+        event.record(stream)
+        torch.cuda.current_stream().wait_event(event)
+    # Keep all inputs, outputs, metadata and events alive until both streams finish.
+    for stream_cases in cases:
+        for _, _, _, outputs, refs in stream_cases:
+            for actual, expected in zip(outputs, refs):
+                torch.testing.assert_close(actual.float(), expected, rtol=0.005, atol=0.01)
+
+
+def _direct_grouped_gemm(a, b, d, *, workspace=None, workspace_size=None,
+                         bias=None, pre_gelu=None, single_output=False, m_splits=(),
+                         accumulate=False, grad=False):
+    """Exercise the C++ boundary without Python wrapper validation or allocation."""
+    if workspace is None:
+        workspace = gemm_ext.get_cublas_workspace(torch.cuda.current_device(), False, True)
+    if workspace_size is None:
+        workspace_size = workspace[0].numel()
+    empty = torch.empty(0, dtype=torch.bfloat16)
+    dtype = gemm_ext.TE_DType[torch.bfloat16]
+    return gemm_ext.tex.te_general_grouped_gemm(
+        a, True, b, False, d, dtype, list(m_splits),
+        [empty] * len(a) if bias is None else bias, dtype, single_output,
+        [empty] * len(a) if pre_gelu is None else pre_gelu, grad,
+        workspace, workspace_size, accumulate, False, 0,
+    )
+
+
+@pytest.mark.parametrize("target,problem", [
+    *[(target, problem) for target in ("a", "b", "d", "workspace")
+      for problem in ("noncontiguous", "cpu", "mixed_device")],
+    *[(target, problem) for target in ("a", "b", "d", "bias", "pre_gelu")
+      for problem in ("short", "long")],
+    ("a", "shape"), ("d", "shape"), ("d", "capacity"), ("d", "dtype"),
+    ("workspace", "empty"), ("workspace", "short"), ("workspace", "rank"),
+    ("workspace", "dtype"), ("workspace", "capacity"), ("workspace", "negative_size"),
+])
+def test_direct_grouped_gemm_rejects_invalid_batch(target, problem):
+    if problem == "mixed_device" and torch.cuda.device_count() < 2:
+        pytest.skip("Mixed-device validation requires two GPUs")
+    # K=0 in group 0 would zero D/bias/pre-GELU before finding group 1 invalid.
+    a = [torch.empty(256, 0, device="cuda", dtype=torch.bfloat16),
+         torch.randn(256, 256, device="cuda", dtype=torch.bfloat16) * 0.125]
+    b = [torch.empty(256, 0, device="cuda", dtype=torch.bfloat16),
+         torch.randn(256, 256, device="cuda", dtype=torch.bfloat16) * 0.125]
+    d = [torch.full((256, 256), 7.0, device="cuda", dtype=torch.bfloat16) for _ in a]
+    empty = torch.empty(0, dtype=torch.bfloat16)  # Unused CPU sentinels remain legal.
+    bias = [torch.full((256,), 7.0, device="cuda", dtype=torch.bfloat16), empty]
+    pre_gelu = [d[0].clone(), empty]
+    workspace = gemm_ext.get_cublas_workspace(torch.cuda.current_device(), False, True)
+    args = dict(a=list(a), b=list(b), d=list(d), bias=list(bias), pre_gelu=list(pre_gelu),
+                workspace=list(workspace), workspace_size=workspace[0].numel(), grad=True)
+    values = args[target]
+    tensor = values[-1]
+    if problem == "noncontiguous":
+        values[-1] = tensor[::2] if target == "workspace" else tensor.t()
+    elif problem in ("cpu", "mixed_device"):
+        device = "cpu" if problem == "cpu" else torch.device(
+            "cuda", (torch.cuda.current_device() + 1) % torch.cuda.device_count()
+        )
+        values[-1] = tensor.to(device)
+    elif problem == "short":
+        values.pop()
+    elif problem == "long":
+        values.append(tensor)
+    elif problem == "empty":
+        values.clear()
+    elif problem == "rank":
+        values[-1] = tensor.view(1, -1)
+    elif problem == "dtype":
+        values[-1] = tensor.float()
+    elif problem == "shape":
+        values[-1] = tensor.view(128, 512)
+    elif problem == "capacity":
+        if target == "workspace":
+            args["workspace_size"] += 1
+        else:
+            values[-1] = tensor[:-1]
+    elif problem == "negative_size":
+        args["workspace_size"] = -1
+    watched = d + bias + pre_gelu + args["d"]
+    before = [tensor.clone() for tensor in watched]
+    with pytest.raises(TypeError if problem == "negative_size" else RuntimeError):
+        _direct_grouped_gemm(**args)
+    for actual, expected in zip(watched, before):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # A failed descriptor refresh must not poison a later valid call on this thread.
+    _direct_grouped_gemm(a, b, d, bias=bias, pre_gelu=pre_gelu, grad=True)
+    assert torch.count_nonzero(d[0]) == 0
+    assert torch.count_nonzero(bias[0]) == 0
+    assert torch.count_nonzero(pre_gelu[0]) == 0
+    torch.testing.assert_close(d[1].float(), b[1].float() @ a[1].float().t(),
+                               rtol=0.005, atol=0.01)
+
+
+@pytest.mark.parametrize("single_input", [False, True])
+@pytest.mark.parametrize("problem", ["capacity", "empty_d", "extra_d", "split_length",
+                                     "negative_split", "split_coverage"])
+@pytest.mark.parametrize("splits", [(0, 256), (256, 256)])
+def test_direct_grouped_gemm_single_output_bounds(single_input, problem, splits):
+    a = [torch.randn(256, 256, device="cuda", dtype=torch.bfloat16) * 0.125
+         for _ in range(2)]
+    rows = sum(splits)
+    inp = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16) * 0.125
+    b = inp if single_input else list(inp.split(splits))
+    storage = torch.full((rows * 256 + 32,), 7.0, device="cuda", dtype=torch.bfloat16)
+    # Spare capacity is allowed; it must not be written by either group.
+    d = [storage]
+    args = dict(a=a, b=b, d=d, single_output=True, m_splits=splits)
+    if problem == "capacity":
+        args["d"] = [storage[:rows * 256 - 1]]
+    elif problem == "empty_d":
+        args["d"] = []
+    elif problem == "extra_d":
+        args["d"] = d * 2
+    else:
+        # Split validation belongs to the single-input entry; list-B does not use splits.
+        args["b"] = inp
+        args["m_splits"] = {"split_length": [rows], "negative_split": [-1, rows + 1],
+                            "split_coverage": [splits[0], splits[1] - 1]}[problem]
+    with pytest.raises(RuntimeError):
+        _direct_grouped_gemm(**args)
+    assert torch.all(storage == 7)
+    _direct_grouped_gemm(a, b, d, single_output=True, m_splits=splits)
+    expected = torch.cat([x.float() @ w.float().t() for x, w in zip(inp.split(splits), a)])
+    torch.testing.assert_close(storage[:rows * 256].view(rows, 256).float(), expected,
+                               rtol=0.005, atol=0.01)
+    assert torch.all(storage[rows * 256:] == 7)
+
+
+@pytest.mark.parametrize("single_output", [False, True])
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_direct_grouped_gemm_flatten_and_empty(single_output, accumulate, monkeypatch):
+    # RTC is rank-2 only; the binding must retain cuBLAS's outer-dimension flattening.
+    monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "0")
+    monkeypatch.setenv("NVTE_FORCE_RTC_NO_FALLBACK", "0")
+    a = [torch.full((2, 128, 256), 0.125, device="cuda", dtype=torch.bfloat16)
+         for _ in range(3)]
+    b = [torch.full((2, 128, 256), 0.0625, device="cuda", dtype=torch.bfloat16)
+         for _ in range(3)]
+    a[0] = a[0][..., :0].contiguous()  # K=0 with a nonempty output.
+    b[0] = b[0][..., :0].contiguous()
+    b[1] = b[1][:0]  # Zero-token split.
+    d = [torch.full((rows, 128, 256), 7.0, device="cuda", dtype=torch.bfloat16)
+         for rows in (2, 0, 2)]
+    if single_output:
+        d = [torch.cat([t.flatten() for t in d])]
+    _direct_grouped_gemm(a, b, d, single_output=single_output, accumulate=accumulate)
+    actual = d[0].view(2, 256, 256) if single_output else torch.stack([d[0].view(256, 256),
+                                                                    d[2].view(256, 256)])
+    assert torch.all(actual[0] == (7 if accumulate else 0))
+    assert torch.all(actual[1] == (9 if accumulate else 2))
+    # An empty batch must not index A/B/D or the optional epilogue lists.
+    _direct_grouped_gemm([], [], [])
 
 
 def _reference(inp, weights, grad_out, splits):
@@ -150,6 +420,42 @@ def test_grouped_linear_rtc_nonuniform_m(splits, in_features, out_features):
         assert p.grad is not None, f"wgrad missing for group {i}"
         dw.append(p.grad.detach())
     _assert_group_list_close(dw, ref_dw, f"dw [{label}]")
+
+
+@pytest.mark.parametrize("implementation", ["module", "module_main_grad", "op"])
+def test_grouped_linear_rtc_packed_weight(implementation, monkeypatch):
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Packed BF16 RTC requires PPU sm89")
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+    torch.manual_seed(57)
+    splits, k, n = [257, 128, 64], 256, 128
+    dtype = torch.bfloat16
+    args = dict(bias=False, single_grouped_weight=True, device="cuda")
+    fused = implementation == "module_main_grad"
+    if implementation.startswith("module"):
+        layer = te.GroupedLinear(len(splits), k, n, params_dtype=dtype,
+                                 fuse_wgrad_accumulation=fused, **args)
+        if fused:
+            layer.weight.main_grad = torch.ones(len(splits), n, k, device="cuda", dtype=torch.float32)
+    else:
+        layer = te.ops.GroupedLinear(len(splits), k, n, dtype=dtype, **args)
+    x = torch.randn(sum(splits), k, device="cuda", dtype=dtype, requires_grad=True)
+    dy = torch.randn(sum(splits), n, device="cuda", dtype=dtype)
+    sizes = torch.tensor(splits, device="cuda", dtype=torch.int64)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        out = layer(x, sizes)
+        out.backward(dy)
+        torch.cuda.synchronize()
+    kernels = [e.name for e in prof.events() if e.name.startswith("nvte_grouped_gemm3_")
+               and e.device_type == torch.autograd.DeviceType.CUDA]
+    assert len(kernels) == 3 and all("_grouped_tensor" in name for name in kernels)
+    weights = layer.weight.split_into_quantized_tensors()
+    ref_out, ref_dx, ref_dw = _reference(x, weights, dy, splits)
+    _assert_group_list_close([out, x.grad], [ref_out, ref_dx], implementation)
+    if fused:
+        _assert_group_list_close(layer.weight.main_grad.unbind(), [dw + 1 for dw in ref_dw], "main_grad")
+    else:
+        _assert_group_list_close(layer.weight.grad.view(len(splits), n, k).unbind(), ref_dw, "wgrad")
 
 
 def _wgrad_call(a, b, out, splits, accumulate):
@@ -322,3 +628,115 @@ def test_grouped_wgrad_rtc_single_fp32_launch(accumulate, dtype):
     assert len(kernels) == 1, kernels
     name = "fp32" if dtype == torch.float32 else "bf16"
     assert f"bf16_bf16_{name}_acc_fp32" in kernels[0], kernels
+
+
+def _packed_storage(shapes, dtype, *, mirror):
+    """Build a packed GroupedTensorStorage for per-expert (rows, cols) shapes.
+
+    mirror=True uses make_grouped_tensor, which materializes the host offsets
+    mirror and supports ragged first dims; mirror=False uses the bare constructor
+    (uniform only, offsets=None) to exercise the offset-free uniform fast path.
+    """
+    groups = len(shapes)
+    rows = [r for r, _ in shapes]
+    cols = [c for _, c in shapes]
+    total = sum(r * c for r, c in shapes)
+    if mirror:
+        first = (None if len(set(rows)) == 1
+                 else torch.tensor(rows, device="cuda", dtype=torch.int64))
+        logical0 = rows[0] * groups if first is None else sum(rows)
+        storage = GroupedTensorStorage.make_grouped_tensor(
+            groups, first, None, logical0, cols[0], dtype=dtype, device="cuda")
+    else:
+        assert len(set(rows)) == 1 and len(set(cols)) == 1, "bare constructor is uniform-only"
+        storage = GroupedTensorStorage((rows[0] * groups, cols[0]), dtype, num_tensors=groups,
+                                       data=torch.empty(total, dtype=dtype, device="cuda"))
+    storage.rowwise_data.copy_(torch.randn(total, device="cuda", dtype=dtype) * 0.125)
+    return storage
+
+
+def _expert_views(storage, shapes):
+    data = storage.rowwise_data
+    views, offset = [], 0
+    for rows, cols in shapes:
+        views.append(data.narrow(0, offset, rows * cols).view(rows, cols))
+        offset += rows * cols
+    return views
+
+
+@pytest.mark.parametrize("api", ["ordinary", "grouped_tensor"])
+@pytest.mark.parametrize("layout,m,n,k,expand", [
+    ("NN", 2048, 2048, 512, True),
+    ("TN", 2048, 2048, 1024, True),
+    ("TN", 259, 1536, 256, False),
+    ("NN", 256, 1024, 2304, False),
+])
+def test_rtc_nexpand(api, layout, m, n, k, expand):
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("N_expand requires PPU sm89")
+    torch.manual_seed(57)
+    groups = 16
+    ashape = (n, k) if layout == "TN" else (k, n)
+    a, b, d = [_packed_storage([shape] * groups, torch.bfloat16, mirror=False)
+               for shape in (ashape, (m, k), (m, n))]
+    av, bv, dv = [_expert_views(t, [shape] * groups)
+                  for t, shape in ((a, ashape), (b, (m, k)), (d, (m, n)))]
+    if api == "ordinary":
+        # Descending addresses rule out accidental adjacency in the allocator.
+        av = [w.clone() for w in av]
+        av.sort(key=lambda w: w.data_ptr(), reverse=True)
+
+        def run():
+            general_grouped_gemm(av, bv, dv, [None] * groups, torch.bfloat16,
+                                 layout=layout, m_splits=[m] * groups)
+    else:
+        def run():
+            gemm_ext.general_grouped_gemm_for_grouped_tensor(a, b, d, layout=layout)
+    run()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        run()
+        torch.cuda.synchronize()
+    kernels = [e.name for e in prof.events() if e.name.startswith("nvte_grouped_gemm3_")
+               and e.device_type == torch.autograd.DeviceType.CUDA]
+    assert len(kernels) == 1
+    assert ("_ne4" in kernels[0]) == expand
+    assert ("_grouped_tensor" in kernels[0]) == (api == "grouped_tensor")
+    for weight, inp, out in zip(av, bv, dv):
+        ref = inp.float() @ (weight.float().t() if layout == "TN" else weight.float())
+        torch.testing.assert_close(out.float(), ref, rtol=0.005, atol=0.01)
+
+    if api == "grouped_tensor" and layout == "NN" and expand:
+        # Reuse the uniform launch with device scalars and the old D as C.
+        previous = [out.clone() for out in dv]
+        alpha = torch.tensor(0.5, device="cuda")
+        beta = torch.tensor(-0.25, device="cuda")
+        gemm_ext.general_grouped_gemm_for_grouped_tensor(a, b, d, layout=layout,
+                                                         alpha=alpha, beta=beta)
+        for x, y, out, old in zip(av, bv, dv, previous):
+            ref = 0.5 * (y.float() @ x.float()) - 0.25 * old.float()
+            torch.testing.assert_close(out.float(), ref, rtol=0.005, atol=0.01)
+
+
+@pytest.mark.parametrize("mirror", [False, True])
+def test_grouped_tensor_metadata_and_accumulation(mirror):
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Native GroupedTensor requires PPU sm89")
+    # Cover a second metadata chunk, empty experts, short M and fp32 C/D.
+    rows = [0, 8, 257] * 11
+    groups, k, n = len(rows), 128, 256
+    shapes = [(m, k) for m in rows]
+    a = _packed_storage([(n, k)] * groups, torch.bfloat16, mirror=False)
+    b = _packed_storage(shapes, torch.bfloat16, mirror=True)
+    d = _packed_storage([(m, n) for m in rows], torch.float32, mirror=True)
+    if not mirror:
+        b.tensor_offsets = d.tensor_offsets = None
+        b.offsets = d.offsets = None
+    av = _expert_views(a, [(n, k)] * groups)
+    bv = _expert_views(b, shapes)
+    dv = _expert_views(d, [(m, n) for m in rows])
+    alpha = torch.tensor(0.5, device="cuda")
+    beta = torch.tensor(-0.25, device="cuda")
+    refs = [0.5 * (y.float() @ x.float().t()) - 0.25 * z for x, y, z in zip(av, bv, dv)]
+    gemm_ext.general_grouped_gemm_for_grouped_tensor(a, b, d, alpha=alpha, beta=beta)
+    for out, ref in zip(dv, refs):
+        torch.testing.assert_close(out, ref, rtol=0.005, atol=0.01)

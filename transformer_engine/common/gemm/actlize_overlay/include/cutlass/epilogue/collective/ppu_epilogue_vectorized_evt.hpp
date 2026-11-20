@@ -1074,6 +1074,260 @@ public:
   }
 #endif
 
+  // Host proves 16B D origins and row strides. This completes that proof for
+  // the MMA-C copy layout: every fragment this layout emits starts at a
+  // VectorBytes-aligned D offset and holds a whole number of vectors, so a
+  // fragment wholly inside the output may always be stored vectorized.
+  template <class CopyC, class Registers, class Global>
+  CUTE_HOST_DEVICE static constexpr int proven_vector_bytes(
+      CopyC const& copy_c, Registers const& registers, Global const& global) {
+    using namespace cute;
+    (void) copy_c;
+    using CopyOp = typename CPY_Op<typename CopyAtomR2S::Traits>::type;
+    constexpr int CopyBits = sizeof(typename CopyOp::SRegisters) * 8;
+    constexpr int CommonElems = CUTE_STATIC_V(max_common_vector(registers, global));
+    constexpr int AlignBits = CUTE_STATIC_V(
+        gcd(max_alignment(registers), max_alignment(global), Int<CopyBits>{}));
+    constexpr int VectorBits = gcd(CommonElems * sizeof_bits<ElementD>::value, AlignBits);
+    constexpr int VectorBytes = VectorBits / 8;
+    static_assert(VectorBytes >= sizeof(ElementD));
+    static_assert(VectorBytes <= 16 && 16 % VectorBytes == 0);
+    constexpr int Frag = decltype(size(registers))::value;
+    static_assert(Frag % (VectorBytes / sizeof(ElementD)) == 0);
+    constexpr bool fragment_origins_aligned = []() {
+      using Copy = CopyC;
+      constexpr auto tv = Copy::get_layoutD_TV();
+      constexpr int CopyM = size<0>(typename Copy::Tiler_MN{});
+      constexpr int CopyN = size<1>(typename Copy::Tiler_MN{});
+      constexpr int Threads = size<0>(tv);
+      constexpr int Vectors = size<1>(tv) / (VectorBytes / sizeof(ElementD));
+      if (CopyN * sizeof(ElementD) % 16 != 0) return false;
+      // Affine TV modes are additive; cache coordinates to bound constexpr evaluation.
+      int value_offsets[Vectors]{};
+      for (int v = 0; v < Vectors; ++v)
+        value_offsets[v] = tv(0, v * (VectorBytes / sizeof(ElementD)));
+      for (int t = 0; t < Threads; ++t) {
+        int thread_offset = tv(t, 0);
+        for (int v = 0; v < Vectors; ++v)
+          if (((thread_offset + value_offsets[v]) / CopyM * sizeof(ElementD)) %
+              VectorBytes != 0) return false;
+      }
+      return true;
+    }();
+    static_assert(fragment_origins_aligned, "host 对齐证明不覆盖此 MMA-C copy 布局。");
+    return VectorBytes;
+  }
+
+  // Requires host-proved full M/N tiles and 16B D origins/row strides.
+  template <class TileShapeType, class Coord, class Acc, class Mma>
+  CUTLASS_DEVICE static void store_full_tile(
+      ElementD* dst, int M, int N, TileShapeType tile_shape, Coord coord,
+      Acc const& acc, Mma mma, int thread_idx) {
+    using namespace cute;
+    auto matrix = make_tensor(make_gmem_ptr(dst), make_shape(M, N, _1{}),
+                              make_stride(int64_t(N), _1{}, _0{}));
+    auto tile = local_tile(matrix, tile_shape, make_coord(_, _, _), Step<_1, _1, Underscore>{});
+    auto copy_c = make_tiled_copy_C(CopyAtomR2S{}, mma);
+    auto thread = copy_c.get_thread_slice(thread_idx);
+    auto regs = thread.retile_S(acc);
+    auto output = thread.partition_D(tile(_, _, get<0>(coord), get<1>(coord), 0));
+    constexpr int Frag = decltype(size(regs(_, 0, 0)))::value;
+    CUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < size<1>(regs); ++m) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < size<2>(regs); ++n) {
+        auto src = regs(_, m, n);
+        auto d = output(_, m, n);
+        cutlass::Array<ElementAccumulator, Frag> values;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < Frag; ++i) values[i] = src(i);
+        auto converted = cutlass::NumericArrayConverter<ElementD, ElementAccumulator, Frag>{}(values);
+        auto result = make_tensor(converted.data(), src.layout());
+        (void) proven_vector_bytes(copy_c, result, d);
+        copy(copy_c, result, d);
+      }
+    }
+  }
+
+  // `aligned` is the host's proof that the D origin and its row stride are a
+  // multiple of 16 bytes. Every copy layout used here is the same MMA-C tiling
+  // store_full_tile proves statically, so the per-fragment vector width is
+  // legal wherever the whole fragment is inside the valid extent. Re-deriving
+  // that alignment on device from the global addresses cost one 64-bit layout
+  // evaluation per element and dominated this path on partial tiles.
+  template <class TileShapeType, class Coord, class Acc, class Mma>
+  CUTLASS_DEVICE static void compute_native(
+      ElementD const* src, ElementD* dst, int M, int N,
+      TileShapeType tile_shape, Coord coord, Acc const& acc, Mma mma,
+      int thread_idx, float alpha, float beta, bool aligned) {
+    using namespace cute;
+    if (M <= 0 || N <= 0) return;
+
+    bool const with_c = beta != 0.0f;
+    auto stride = make_stride(int64_t(N), _1{}, _0{});
+    Tensor matrix_d = make_tensor(
+        make_gmem_ptr(dst), make_shape(M, N, _1{}), stride);
+    Tensor matrix_c = make_tensor(
+        make_gmem_ptr(with_c ? src : static_cast<ElementD const*>(dst)),
+        make_shape(M, N, _1{}), stride);
+    static_assert(sizeof(decltype(matrix_d.layout()(make_coord(0, 0, 0)))) >= sizeof(int64_t));
+    Tensor output = local_tile(
+        matrix_d, tile_shape, make_coord(_, _, _), Step<_1, _1, Underscore>{});
+    Tensor source = local_tile(
+        matrix_c, tile_shape, make_coord(_, _, _), Step<_1, _1, Underscore>{});
+    Tensor gD = output(_, _, get<0>(coord), get<1>(coord), 0);
+    Tensor gC = source(_, _, get<0>(coord), get<1>(coord), 0);
+
+    auto copy_c = make_tiled_copy_C(CopyAtomR2S{}, mma);
+    auto thread = copy_c.get_thread_slice(thread_idx);
+    Tensor tAcc = thread.retile_S(acc);
+    Tensor tDst = thread.partition_D(gD);
+    auto copy_g2r = make_tiled_copy_D(CopyAtomG2R{}, copy_c);
+    auto thread_g2r = copy_g2r.get_thread_slice(thread_idx);
+    Tensor tSrc = thread_g2r.partition_S(gC);
+    CUTE_STATIC_ASSERT_V(
+        coalesce(copy_g2r.get_layoutS_TV(), Shape<_1, _1>{}) ==
+        coalesce(copy_c.get_layoutD_TV(), Shape<_1, _1>{}));
+    CUTE_STATIC_ASSERT_V(size(tSrc) == size(tDst));
+    CUTE_STATIC_ASSERT_V(size<1>(tSrc) == size<1>(tDst));
+    CUTE_STATIC_ASSERT_V(size<2>(tSrc) == size<2>(tDst));
+    CUTE_STATIC_ASSERT_V(size(tAcc) == size(tDst));
+    CUTE_STATIC_ASSERT_V(size<1>(tAcc) == size<1>(tDst));
+    CUTE_STATIC_ASSERT_V(size<2>(tAcc) == size<2>(tDst));
+
+    Tensor coordinates = make_identity_tensor(make_shape(size<0>(gD), size<1>(gD)));
+    Tensor tCoord = thread.partition_D(coordinates);
+    // Host bounds every extent below INT_MAX, so 32-bit offsets hold and avoid
+    // 64-bit adds in the per-element predicate.
+    int const m_base = int(get<0>(coord)) * int(size<0>(gD));
+    int const n_base = int(get<1>(coord)) * int(size<1>(gD));
+    auto valid = [&](auto const& element_coord) {
+      int const m = m_base + int(get<0>(element_coord));
+      int const n = n_base + int(get<1>(element_coord));
+      return m >= 0 && m < M && n >= 0 && n < N;
+    };
+
+    constexpr int Frag = decltype(size(tAcc(_, 0, 0)))::value;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int mma_m = 0; mma_m < size<1>(tAcc); ++mma_m) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int mma_n = 0; mma_n < size<2>(tAcc); ++mma_n) {
+        Tensor a = tAcc(_, mma_m, mma_n);
+        Tensor d = tDst(_, mma_m, mma_n);
+        Tensor c = tCoord(_, mma_m, mma_n);
+        bool any_valid = false;
+        bool all_valid = true;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < Frag; ++i) {
+          bool const element_valid = valid(c(i));
+          any_valid = any_valid || element_valid;
+          all_valid = all_valid && element_valid;
+        }
+        if (!any_valid) continue;
+
+        Tensor rC = make_tensor<ElementD>(shape(a));
+        bool vector_copy = all_valid && aligned;
+        if (with_c) {
+          Tensor s = tSrc(_, mma_m, mma_n);
+          if (vector_copy) {
+            copy(CopyAtomG2R{}, s, rC);
+          } else {
+            clear(rC);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < Frag; ++i) {
+              if (valid(c(i))) rC(i) = s(i);
+            }
+          }
+        }
+
+        cutlass::Array<float, Frag> combined;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < Frag; ++i) {
+          combined[i] = alpha * float(a(i));
+          if (with_c) combined[i] += beta * float(rC(i));
+        }
+        cutlass::NumericArrayConverter<ElementD, float, Frag> convert;
+        auto converted = convert(combined);
+        Tensor result = make_tensor(converted.data(), rC.layout());
+        if (vector_copy) {
+          copy(CopyAtomR2G{}, result, d);
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < Frag; ++i) {
+            if (valid(c(i))) d(i) = result(i);
+          }
+        }
+      }
+    }
+  }
+
+  // Row-partial variant of compute_contiguous for the noC unit-scalar contract
+  // (alpha == 1, beta == 0): M may cut through the tile while N is wholly
+  // inside the matrix. Fragments below the cut take the plain vector store
+  // store_full_tile proves; the fragments crossing it are masked element by
+  // element; fragments past it are skipped. Ragged-M tiles previously ran the
+  // fully generic compute_native, whose per-element predicates and runtime
+  // with_c/alpha handling cost ~4x per tile.
+  template <class TileShapeType, class Coord, class Acc, class Mma>
+  CUTLASS_DEVICE static void compute_native_rows(
+      ElementD* dst, int M, int N, TileShapeType tile_shape, Coord coord,
+      Acc const& acc, Mma mma, int thread_idx) {
+    using namespace cute;
+    if (M <= 0) return;
+    auto stride = make_stride(int64_t(N), _1{}, _0{});
+    Tensor matrix = make_tensor(make_gmem_ptr(dst), make_shape(M, N, _1{}), stride);
+    static_assert(sizeof(decltype(matrix.layout()(make_coord(0, 0, 0)))) >= sizeof(int64_t));
+    Tensor output = local_tile(matrix, tile_shape, make_coord(_, _, _), Step<_1, _1, Underscore>{});
+    Tensor gD = output(_, _, get<0>(coord), get<1>(coord), 0);
+    auto copy_c = make_tiled_copy_C(CopyAtomR2S{}, mma);
+    auto thread = copy_c.get_thread_slice(thread_idx);
+    Tensor tAcc = thread.retile_S(acc);
+    Tensor tDst = thread.partition_D(gD);
+    Tensor coordinates = make_identity_tensor(make_shape(size<0>(gD), size<1>(gD)));
+    Tensor tCoord = thread.partition_D(coordinates);
+    CUTE_STATIC_ASSERT_V(size(tAcc) == size(tDst));
+    // Host bounds every extent below INT_MAX, so 32-bit offsets hold.
+    int const m_base = int(get<0>(coord)) * int(size<0>(gD));
+    constexpr int Frag = decltype(size(tAcc(_, 0, 0)))::value;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int mma_m = 0; mma_m < size<1>(tAcc); ++mma_m) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int mma_n = 0; mma_n < size<2>(tAcc); ++mma_n) {
+        Tensor c = tCoord(_, mma_m, mma_n);
+        int row_lo = m_base + int(get<0>(c(0)));
+        int row_hi = row_lo;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 1; i < Frag; ++i) {
+          int const row = m_base + int(get<0>(c(i)));
+          row_lo = row < row_lo ? row : row_lo;
+          row_hi = row > row_hi ? row : row_hi;
+        }
+        if (row_lo >= M) continue;
+
+        Tensor a = tAcc(_, mma_m, mma_n);
+        Tensor d = tDst(_, mma_m, mma_n);
+        using Array = cutlass::Array<ElementAccumulator, Frag>;
+        Array combined;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < Frag; ++i) combined[i] = a(i);
+        cutlass::NumericArrayConverter<ElementD, ElementAccumulator, Frag> convert;
+        auto converted = convert(combined);
+        Tensor result = make_tensor(converted.data(), a.layout());
+        if (row_hi < M) {
+          (void) proven_vector_bytes(copy_c, result, d);
+          copy(copy_c, result, d);
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < Frag; ++i) {
+            if (m_base + int(get<0>(c(i))) < M) d(i) = result(i);
+          }
+        }
+      }
+    }
+  }
+
 private:
   Params params;
   FusionCallbacks fusion_callbacks;

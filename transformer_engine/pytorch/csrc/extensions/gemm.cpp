@@ -6,6 +6,8 @@
 
 #include <pybind11/pybind11.h>
 
+#include <climits>
+#include <cstdint>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -165,6 +167,21 @@ inline bool is_plain_torch_tensor(py::handle tensor) {
            IsNVFP4Tensor(obj));
 }
 
+void check_discrete_grouped_tensor(py::handle value, const char* name) {
+  if (!is_plain_torch_tensor(value)) return;
+  const auto tensor = py::cast<at::Tensor>(value);
+  NVTE_CHECK(!tensor.is_quantized() && tensor.is_cuda() && tensor.is_contiguous() && tensor.dim() == 2 &&
+                 tensor.get_device() == at::cuda::current_device(),
+             "Grouped GEMM ", name, " must be a contiguous CUDA matrix on the current device.");
+}
+
+void check_grouped_bias_scale(const at::Tensor& scale) {
+  NVTE_CHECK(scale.is_cuda() && scale.is_contiguous() && scale.dim() == 1 &&
+                 scale.scalar_type() == at::kFloat &&
+                 scale.get_device() == at::cuda::current_device(),
+             "Grouped bias scale must be a contiguous CUDA float32 vector on the current device.");
+}
+
 }  // namespace
 
 namespace transformer_engine::pytorch {
@@ -239,6 +256,16 @@ GroupedGemmConfig prepare_grouped_gemm_config(at::Tensor alpha, at::Tensor beta,
                                               at::Tensor workspace_setup,
                                               at::Tensor workspace_cublas, size_t num_tensors,
                                               int math_sm_count, bool use_split_accumulator) {
+  auto check_buffer = [](const at::Tensor& tensor, at::ScalarType dtype, const char* name) {
+    NVTE_CHECK(tensor.is_cuda() && tensor.is_contiguous() && tensor.scalar_type() == dtype &&
+                   tensor.get_device() == at::cuda::current_device(),
+               "Grouped GEMM ", name,
+               " must be contiguous CUDA storage of the required dtype on the current device.");
+  };
+  check_buffer(alpha, at::kFloat, "alpha");
+  check_buffer(beta, at::kFloat, "beta");
+  check_buffer(workspace_setup, at::kByte, "workspace_setup");
+  check_buffer(workspace_cublas, at::kByte, "workspace_cublas");
   const bool per_group = (alpha.numel() == static_cast<int64_t>(num_tensors));
   const bool scalar = (alpha.numel() == 1);
   NVTE_CHECK(per_group || scalar, "Grouped GEMM expects alpha to have 1 or num_tensors (",
@@ -612,19 +639,38 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     NVTE_ERROR("not implemented, D should be allocated for single output case.");
   }
 
-  // Ensure that cublasLt handle is created on the correct device,
-  // overriding torch.cuda.set_device calls from user side.
-  // Assumes all tensors passed are on the same device.
-  at::cuda::CUDAGuard device_guard(workspace[0].device());
-
-  void* output_data_ptr = nullptr;
-  if (single_output) {
-    output_data_ptr = (*D)[0].data_ptr();
+  NVTE_CHECK(!workspace.empty() &&
+                 workspace.size() >= static_cast<size_t>(nvte_get_num_compute_streams()),
+             "Grouped GEMM requires a workspace for every compute stream.");
+  const auto device = workspace[0].device();
+  for (const auto& ws : workspace) {
+    NVTE_CHECK(ws.is_cuda() && ws.device() == device && ws.dim() == 1 &&
+                   ws.is_contiguous() && ws.scalar_type() == at::kByte,
+               "Grouped GEMM workspace must be contiguous CUDA uint8 vectors on one device.");
+    NVTE_CHECK(workspaceSize <= static_cast<size_t>(ws.numel()),
+               "Grouped GEMM workspaceSize exceeds workspace capacity.");
   }
+  NVTE_CHECK(bias.size() == A.size() && pre_gelu_out.size() == A.size(),
+             "Grouped GEMM requires one bias and pre_gelu_out entry per group.");
+  NVTE_CHECK(!D.has_value() || D->size() == (single_output ? 1 : A.size()),
+             "Grouped GEMM has an invalid number of D tensors.");
 
+  // Pin cuBLAS to the workspace device, after validating the entire workspace list.
+  at::cuda::CUDAGuard device_guard(device);
   const auto none = py::none();
   const auto dtype = GetATenDType(D_type);
   const DType te_D_dtype = GetTransformerEngineDType(dtype);
+  auto check_tensor = [&](const at::Tensor& tensor, const char* name) {
+    NVTE_CHECK(tensor.is_cuda() && tensor.device() == device && tensor.is_contiguous(),
+               "Grouped GEMM ", name, " must be contiguous CUDA storage on the workspace device.");
+  };
+  if (D.has_value()) {
+    for (const auto& out : *D) {
+      check_tensor(out, "D");
+      NVTE_CHECK(out.scalar_type() == dtype, "Grouped GEMM D has an invalid output dtype.");
+    }
+  }
+  size_t output_offset = 0;
   // Descriptors and the NVTETensor arrays live in thread-local scratch, so a
   // steady-state launch refreshes data pointers instead of rebuilding every
   // expert's tensors, shapes and vector storage.
@@ -646,8 +692,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
   DType input_dtype = DType::kBFloat16;
   if (single_input) {
     input = B.cast<at::Tensor>();
-    NVTE_CHECK(single_output && !transb && input.is_cuda() && input.dim() == 2 &&
-                   input.is_contiguous() && input.device() == workspace[0].device() &&
+    check_tensor(input, "B");
+    NVTE_CHECK(single_output && !transb && input.dim() == 2 &&
                    (input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf),
                "Single input requires a contiguous BF16/FP16 CUDA matrix and single output.");
     NVTE_CHECK(m_splits.size() == A.size(), "Invalid number of input splits.");
@@ -660,8 +706,11 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     input_dtype = GetTransformerEngineDType(input.scalar_type());
   } else {
     input_parts = B.cast<std::vector<py::handle>>();
+    NVTE_CHECK(input_parts.size() == A.size(), "Grouped GEMM requires matching A and B lengths.");
   }
   std::vector<at::Tensor> D_vectors;
+  // Defer empty-group writes until every group has passed validation.
+  std::vector<at::Tensor> tensors_to_zero;
   size_t used = 0;
   for (size_t i = 0; i < A.size(); i++) {
     // A slice: a plain torch tensor keeps its descriptor between launches, so
@@ -670,6 +719,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     at::Tensor a_tensor;
     if (is_plain_torch_tensor(A[i])) {
       a_tensor = A[i].cast<at::Tensor>();
+      check_tensor(a_tensor, "A");
       void* dptr = a_tensor.data_ptr();
       const int dtype_id = static_cast<int>(a_tensor.scalar_type());
       if (!reuse_descriptors || scratch.a_quantized[used]) {
@@ -716,6 +766,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       input_offset += m_splits[i];
     } else if (is_plain_torch_tensor(input_parts[i])) {
       b_tensor = input_parts[i].cast<at::Tensor>();
+      check_tensor(b_tensor, "B");
       void* dptr = b_tensor.data_ptr();
       const int dtype_id = static_cast<int>(b_tensor.scalar_type());
       if (!reuse_descriptors || scratch.b_quantized[used]) {
@@ -744,31 +795,28 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     // Describe the output slice directly: no per-expert torch tensor, hence no
     // cudaPointerGetAttributes to recover the device from the raw pointer.
     void* out_slice_ptr = nullptr;
+    NVTE_CHECK(te_A->shape().ndim >= 1 && te_B->shape().ndim >= 1,
+               "Grouped GEMM A and B must have at least one dimension.");
     auto size_t_shape =
         pytorch::detail::getGemmOutputShape(te_A->shape(), transa, te_B->shape(), transb);
-    bool D_numel_is_zero = false;
+    size_t D_numel = 1;
     std::vector<int64_t> D_shape;
     for (size_t t : size_t_shape) {
+      NVTE_CHECK(t == 0 || D_numel <= static_cast<size_t>(INT64_MAX) / t,
+                 "Grouped GEMM output shape is too large.");
       D_shape.push_back(t);
-      if (t == 0) {
-        D_numel_is_zero = true;
-      }
+      D_numel *= t;
     }
     auto opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
     if (single_output) {
-      if (output_data_ptr == nullptr) {
-        out_tensor = at::empty(D_shape, opts);
-        D_vectors.emplace_back(out_tensor);
-      } else {
-        // We need to check !D_numel_is_zero because if the final input portion has zero elements,
-        // output_data_ptr would point beyond the allocated memory of D.
-        if (!D_numel_is_zero) {
-          out_slice_ptr = output_data_ptr;
-        }
+      NVTE_CHECK(D_numel <= static_cast<size_t>((*D)[0].numel()) - output_offset,
+                 "Grouped GEMM D has insufficient single-output capacity.");
+      // Count all dimensions, including the outer dimensions flattened by GEMM.
+      if (D_numel != 0) {
+        out_slice_ptr = static_cast<char*>((*D)[0].data_ptr()) +
+                        output_offset * (*D)[0].element_size();
       }
-      char* char_ptr = reinterpret_cast<char*>(output_data_ptr);
-      char_ptr += D_shape[0] * D_shape[1] * (*D)[0].element_size();
-      output_data_ptr = reinterpret_cast<void*>(char_ptr);
+      output_offset += D_numel;
     } else {
       if (D == std::nullopt) {
         auto opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
@@ -776,6 +824,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
         D_vectors.emplace_back(out_tensor);
       } else {
         out_tensor = (*D)[i];
+        NVTE_CHECK(shape_matches(make_nvte_shape(size_t_shape), out_tensor.sizes()),
+                   "Grouped GEMM D has an invalid output shape.");
       }
     }
 
@@ -783,25 +833,24 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       if (!accumulate) {
         if (out_slice_ptr != nullptr) {
           // The slice lies inside (*D)[0], so pin the device instead of querying the pointer.
-          at::for_blob(out_slice_ptr, D_shape)
-              .options(opts)
-              .target_device((*D)[0].device())
-              .make_tensor()
-              .zero_();
-        } else if (out_tensor.numel() != 0) {
-          out_tensor.zero_();
+          tensors_to_zero.emplace_back(at::for_blob(out_slice_ptr, D_shape)
+                                           .options(opts)
+                                           .target_device((*D)[0].device())
+                                           .make_tensor());
+        } else if (out_tensor.defined() && out_tensor.numel() != 0) {
+          tensors_to_zero.emplace_back(out_tensor);
         }
       }
       if (bias[i].numel() != 0 && grad) {
-        bias[i].zero_();
+        tensors_to_zero.emplace_back(bias[i]);
       }
-      if (pre_gelu_out[i].numel() != 0) pre_gelu_out[i].zero_();
+      if (pre_gelu_out[i].numel() != 0) tensors_to_zero.emplace_back(pre_gelu_out[i]);
       continue;
     }
 
-    if (out_slice_ptr != nullptr && reuse_descriptors) {
+    if (single_output && !out_tensor.defined() && reuse_descriptors) {
       scratch.d[used].set_rowwise_data(out_slice_ptr, te_D_dtype, make_nvte_shape(size_t_shape));
-    } else if (out_slice_ptr != nullptr) {
+    } else if (single_output && !out_tensor.defined()) {
       scratch.d[used] = makeTransformerEngineTensor(out_slice_ptr, size_t_shape, te_D_dtype);
     } else {
       scratch.d[used] = makeTransformerEngineTensor(out_tensor);
@@ -836,6 +885,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     used++;
   }
   scratch.finish(used);
+  for (auto& tensor : tensors_to_zero) tensor.zero_();
 
   if (scratch.a_v.empty()) {
     return bias;
@@ -911,10 +961,6 @@ py::object te_general_grouped_gemm_for_grouped_tensor(
   using namespace transformer_engine::pytorch::detail;
 
   init_extension();
-
-  // Ensure that cublasLt handle is created on the correct device,
-  // overriding torch.cuda.set_device calls from user side.
-  // Assumes all tensors passed are on the same device.
   at::cuda::CUDAGuard device_guard(workspace_cublas.device());
 
   auto grouped_A = GroupedTensorFromPyTorchGroupedTensor(A);
@@ -949,6 +995,7 @@ py::object te_general_grouped_gemm_for_grouped_tensor(
   if (!bias.is_none()) {
     auto grouped_bias = GroupedTensorFromPyTorchGroupedTensor(bias);
     if (bias_scale.has_value()) {
+      check_grouped_bias_scale(*bias_scale);
       auto te_bias_scale = makeTransformerEngineTensor(*bias_scale);
       NVTE_SCOPED_GIL_RELEASE({
         nvte_grouped_scaled_bias_add(grouped_D.data(), grouped_bias.data(), te_bias_scale.data(),
@@ -1001,6 +1048,7 @@ py::object te_general_grouped_gemm_for_discrete_in(py::handle A, bool transa, py
   te_A_vector.reserve(num_tensors);
   const auto none = py::none();
   for (const auto& tensor : A_list) {
+    check_discrete_grouped_tensor(tensor, "A");
     te_A_wrappers.emplace_back(makeTransformerEngineTensor(tensor, none));
     te_A_vector.emplace_back(te_A_wrappers.back().data());
   }
@@ -1026,6 +1074,7 @@ py::object te_general_grouped_gemm_for_discrete_in(py::handle A, bool transa, py
   if (!bias.is_none()) {
     auto grouped_bias = GroupedTensorFromPyTorchGroupedTensor(bias);
     if (bias_scale.has_value()) {
+      check_grouped_bias_scale(*bias_scale);
       auto te_bias_scale = makeTransformerEngineTensor(*bias_scale);
       NVTE_SCOPED_GIL_RELEASE({
         nvte_grouped_scaled_bias_add(grouped_D.data(), grouped_bias.data(), te_bias_scale.data(),
@@ -1080,6 +1129,7 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
   te_D_vector.reserve(num_tensors);
   const auto none = py::none();
   for (const auto& tensor : D_list) {
+    check_discrete_grouped_tensor(tensor, "D");
     te_D_wrappers.emplace_back(makeTransformerEngineTensor(tensor, none));
     te_D_vector.emplace_back(te_D_wrappers.back().data());
   }
