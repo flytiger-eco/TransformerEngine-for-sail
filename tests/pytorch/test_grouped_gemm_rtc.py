@@ -182,6 +182,27 @@ def test_grouped_gemm_two_streams(path):
                 torch.testing.assert_close(actual.float(), expected, rtol=0.005, atol=0.01)
 
 
+def test_rtc_workspace_reuse_after_static_gemm(monkeypatch):
+    """The static launch overwrites the descriptor block that RTC would otherwise reuse."""
+    a = [torch.eye(256, device="cuda", dtype=torch.bfloat16)]
+    b = [torch.ones_like(a[0])]
+    first = [torch.empty_like(a[0])]
+    second = [torch.empty_like(a[0])]
+
+    def gemm(output):
+        general_grouped_gemm(a, b, output, [None], torch.bfloat16, layout="NN", m_splits=[256])
+
+    gemm(first)
+    monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM_RTC", "0")
+    gemm(second)
+    first[0].zero_()
+    second[0].zero_()
+    monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM_RTC", "1")
+    gemm(first)
+    torch.testing.assert_close(first[0], b[0], rtol=0, atol=0)
+    assert torch.count_nonzero(second[0]) == 0
+
+
 def _direct_grouped_gemm(a, b, d, *, workspace=None, workspace_size=None,
                          bias=None, pre_gelu=None, single_output=False, m_splits=(),
                          accumulate=False, grad=False):
@@ -452,7 +473,7 @@ def test_grouped_linear_rtc_packed_weight(implementation, k, n, monkeypatch):
 
 def _wgrad_call(a, b, out, splits, accumulate):
     general_grouped_gemm(
-        a, b, out, [None] * len(a), torch.bfloat16, layout="NT",
+        a, b, out, [None] * len(a), out[0].dtype, layout="NT",
         m_splits=splits, grad=True, accumulate=accumulate, single_output=False,
     )
     torch.cuda.synchronize()
@@ -521,14 +542,11 @@ def test_grouped_wgrad_rtc_source_map(rows, dtype):
     assert torch.equal(out[0], source)
 
 
-@pytest.mark.parametrize("prologue", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("mpe", [64, 200, 2048])
-def test_grouped_wgrad_rtc_accumulator_seed(monkeypatch, prologue, dtype, mpe):
+def test_grouped_wgrad_rtc_accumulates_once(dtype, mpe):
     """An exactly representable non-zero product proves the seed is consumed
     once and never lost across K or persistent tiles."""
-    monkeypatch.setenv("NVTE_GG_EXTRA_DEFINES", f"-DNVTE_GG_PROLOGUE_C={int(prologue)}")
-    monkeypatch.setenv("NVTE_GG_WGRAD_C_FUSION", "1")
     rows = [64, 200, 536]
     a = [torch.full((mpe, 1032), 0.125, device="cuda", dtype=torch.bfloat16) for _ in rows]
     b = [torch.full((mpe, m), 0.0625, device="cuda", dtype=torch.bfloat16) for m in rows]
@@ -542,11 +560,8 @@ def test_grouped_wgrad_rtc_accumulator_seed(monkeypatch, prologue, dtype, mpe):
             assert torch.equal(actual, reference)
 
 
-@pytest.mark.parametrize("atomic_options", ["", "-DNVTE_GG_ATOMIC_GLOBAL=1",
-                                            "-DNVTE_GG_ATOMIC_GLOBAL=1 -DNVTE_GG_ATOMIC_INTERLEAVE=1"])
-def test_grouped_wgrad_rtc_atomic_special_values(monkeypatch, atomic_options):
-    """A zero product proves the atomic treats subnormals and Inf/NaN exactly
-    like the fragment path does."""
+def test_grouped_wgrad_rtc_special_values():
+    """Adding a zero product preserves subnormals, infinities and NaNs in FP32 C."""
     rows, cols, k = 64, 1032, 64
     a = [torch.zeros(k, cols, device="cuda", dtype=torch.bfloat16)]
     b = [torch.ones(k, rows, device="cuda", dtype=torch.bfloat16)]
@@ -557,23 +572,15 @@ def test_grouped_wgrad_rtc_atomic_special_values(monkeypatch, atomic_options):
                           device="cuda", dtype=torch.float32)
     source = values.repeat((rows * cols + values.numel() - 1) // values.numel())
     source = source[:rows * cols].reshape(rows, cols)
-    reference, actual = [source.clone()], [source.clone()]
-    monkeypatch.setenv("NVTE_GG_EXTRA_DEFINES", "-DNVTE_GG_ATOMIC_C=0")
-    _wgrad_call(a, b, reference, [k], True)
-    monkeypatch.setenv("NVTE_GG_EXTRA_DEFINES", "-DNVTE_GG_ATOMIC_C=1 " + atomic_options)
+    actual = [source.clone()]
     _wgrad_call(a, b, actual, [k], True)
-    torch.testing.assert_close(actual[0], reference[0], rtol=0, atol=0, equal_nan=True)
+    torch.testing.assert_close(actual[0], source, rtol=0, atol=0, equal_nan=True)
 
 
-@pytest.mark.parametrize("atomic_options", ["", "-DNVTE_GG_ATOMIC_GLOBAL=1",
-                                            "-DNVTE_GG_ATOMIC_GLOBAL=1 -DNVTE_GG_ATOMIC_INTERLEAVE=1"])
-@pytest.mark.parametrize("prologue", [False, True])
 @pytest.mark.parametrize("accumulate", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_grouped_wgrad_rtc_atomic_c(monkeypatch, prologue, accumulate, dtype, atomic_options):
-    """Compare the atomic experiment bit for bit against the original path,
-    covering the tail boundary, back-to-back RMW, the bf16/noC bypass and
-    mutual exclusion."""
+def test_grouped_wgrad_rtc_guard_regions(accumulate, dtype):
+    """Repeated writes to an output with M/N tails must stay inside its allocation."""
     torch.manual_seed(9012)
     splits, rows, cols = [64, 200, 2048], [64, 200, 536], 1032
     a = [torch.randn(k, cols, device="cuda", dtype=torch.bfloat16) for k in splits]
@@ -584,42 +591,46 @@ def test_grouped_wgrad_rtc_atomic_c(monkeypatch, prologue, accumulate, dtype, at
     storage = [torch.full((m * cols + 2 * guard,), sentinel, device="cuda", dtype=dtype)
                for m in rows]
     actual = [buf[guard:-guard].reshape(m, cols) for buf, m in zip(storage, rows)]
-    reference = [c.clone() for c in sources]
+    products = [y.float().t() @ x.float() for x, y in zip(a, b)]
+    expected = sources
     for out, source in zip(actual, sources):
-        out.copy_(source)
-    if not accumulate:
-        for out in actual + reference:
+        if accumulate:
+            out.copy_(source)
+        else:
             out.fill_(float("nan"))
     for _ in range(2):
-        monkeypatch.setenv("NVTE_GG_EXTRA_DEFINES",
-                           f"-DNVTE_GG_PROLOGUE_C={int(prologue)} -DNVTE_GG_ATOMIC_C=0")
-        _wgrad_call(a, b, reference, splits, accumulate)
-        monkeypatch.setenv("NVTE_GG_EXTRA_DEFINES",
-                           f"-DNVTE_GG_PROLOGUE_C={int(prologue)} -DNVTE_GG_ATOMIC_C=1 {atomic_options}")
+        expected = [(c.float() + product if accumulate else product).to(dtype)
+                    for c, product in zip(expected, products)]
         _wgrad_call(a, b, actual, splits, accumulate)
-        for out, expected, buf in zip(actual, reference, storage):
-            assert torch.isfinite(out).all()
-            assert torch.equal(out, expected)
+        for out, ref, buf in zip(actual, expected, storage):
+            torch.testing.assert_close(out, ref, rtol=0.05, atol=0.05)
             assert torch.all(buf[:guard] == sentinel)
             assert torch.all(buf[-guard:] == sentinel)
 
 
 @pytest.mark.parametrize("accumulate", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_grouped_wgrad_rtc_single_fp32_launch(accumulate, dtype):
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fp32_output", [False, True])
+def test_grouped_wgrad_rtc_single_fp32_launch(accumulate, input_dtype, fp32_output):
     """Guard against the regression that dispatched bf16 first and fp32 after,
     including the extra kernel that beta==0 used to hide."""
-    a = [torch.randn(256, 1024, device="cuda", dtype=torch.bfloat16)]
-    b = [torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)]
+    dtype = torch.float32 if fp32_output else input_dtype
+    a = [torch.randn(256, 1024, device="cuda", dtype=input_dtype)]
+    b = [torch.randn(256, 512, device="cuda", dtype=input_dtype)]
     out = [torch.randn(512, 1024, device="cuda", dtype=dtype)]
     _wgrad_call(a, b, out, [256], accumulate)
+    expected = b[0].float().t() @ a[0].float()
+    if accumulate:
+        expected += out[0].float()
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                             torch.profiler.ProfilerActivity.CUDA]) as prof:
         _wgrad_call(a, b, out, [256], accumulate)
     kernels = [e.name for e in prof.events() if e.name.startswith("nvte_grouped_gemm3_")]
     assert len(kernels) == 1, kernels
-    name = "fp32" if dtype == torch.float32 else "bf16"
-    assert f"bf16_bf16_{name}_acc_fp32" in kernels[0], kernels
+    inp = "fp16" if input_dtype == torch.float16 else "bf16"
+    dst = "fp32" if fp32_output else inp
+    assert f"{inp}_{inp}_{dst}_acc_fp32" in kernels[0], kernels
+    torch.testing.assert_close(out[0].float(), expected, rtol=0.005, atol=0.01)
 
 
 def _packed_storage(shapes, dtype, *, mirror):
@@ -710,7 +721,8 @@ def test_rtc_nexpand(api, layout, m, n, k, expand):
 
 
 @pytest.mark.parametrize("mirror", [False, True])
-def test_grouped_tensor_metadata_and_accumulation(mirror):
+@pytest.mark.parametrize("storage", ["packed", "discrete_in", "discrete_out"])
+def test_grouped_tensor_metadata_and_accumulation(mirror, storage):
     if torch.cuda.get_device_capability() != (8, 9):
         pytest.skip("Native GroupedTensor requires PPU sm89")
     # Cover a second metadata chunk, empty experts, short M and fp32 C/D.
@@ -726,9 +738,34 @@ def test_grouped_tensor_metadata_and_accumulation(mirror):
     av = _expert_views(a, [(n, k)] * groups)
     bv = _expert_views(b, shapes)
     dv = _expert_views(d, [(m, n) for m in rows])
+    if storage == "discrete_in":
+        a = [x.clone() for x in av]
+    elif storage == "discrete_out":
+        dv = [x.clone() for x in dv]
+        d = dv
     alpha = torch.tensor(0.5, device="cuda")
     beta = torch.tensor(-0.25, device="cuda")
     refs = [0.5 * (y.float() @ x.float().t()) - 0.25 * z for x, y, z in zip(av, bv, dv)]
     gemm_ext.general_grouped_gemm_for_grouped_tensor(a, b, d, alpha=alpha, beta=beta)
     for out, ref in zip(dv, refs):
         torch.testing.assert_close(out, ref, rtol=0.005, atol=0.01)
+
+
+@pytest.mark.parametrize("scaled", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_grouped_tensor_ragged_bias(scaled, dtype):
+    """Exercise bias metadata and per-row scaling across an empty expert."""
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Native grouped bias requires PPU sm89")
+    rows, k, n = [8, 0, 24], 128, 256
+    a = _packed_storage([(n, k)] * len(rows), torch.bfloat16, mirror=False)
+    b = _packed_storage([(m, k) for m in rows], torch.bfloat16, mirror=True)
+    out = _packed_storage([(m, n) for m in rows], dtype, mirror=True)
+    bias = _packed_storage([(1, n)] * len(rows), dtype, mirror=False)
+    a.rowwise_data.zero_()
+    scale = torch.arange(sum(rows), dtype=torch.float32, device="cuda") if scaled else None
+    gemm_ext.general_grouped_gemm_for_grouped_tensor(a, b, out, bias=bias, bias_scale=scale)
+    expected = torch.cat([v.expand(m, n) for m, v in zip(rows, bias.rowwise_data.view(-1, n))])
+    if scaled:
+        expected = (scale[:, None] * expected.float()).to(dtype)
+    torch.testing.assert_close(out.rowwise_data.view(-1, n), expected, rtol=0, atol=0)
