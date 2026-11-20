@@ -1,6 +1,6 @@
 name: ppu-890-rtc-grouped-gemm-gate
 
-# 对所有相关 PR 运行 27 个 case；perf/refactor 和手动运行阻断超过 5% 的退化。
+# 对所有相关 PR 运行 case 列表中的两种 API；perf/refactor 和手动运行阻断超过 5% 的退化。
 # 数值错误、RTC 回退、tile 不匹配和基础设施失败始终阻断。
 # 无关 PR 由 paths 跳过；不要将此 workflow 设为所有 PR 无条件必需的检查。
 on:
@@ -21,9 +21,12 @@ on:
       - 'transformer_engine/common/util/rtc.h'
       - 'transformer_engine/common/include/transformer_engine/gemm.h'
       - 'transformer_engine/common/CMakeLists.txt'
+      - 'transformer_engine/common/common.h'
       - 'transformer_engine/pytorch/cpp_extensions/gemm.py'
       - 'transformer_engine/pytorch/csrc/extensions/gemm.cpp'
+      - 'transformer_engine/pytorch/csrc/type_converters.cpp'
       - 'transformer_engine/pytorch/module/grouped_linear.py'
+      - 'transformer_engine/pytorch/ops/basic/grouped_linear.py'
       - '3rdparty/actlize'
       - '3rdparty/actlize/**'
       - '3rdparty/cudafy-for-sail'
@@ -411,7 +414,7 @@ jobs:
                     await github.rest.git.createRef({...context.repo, ref: `refs/heads/${branch}`, sha: commit.data.sha});
                   }
                   const imageUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/raw/${commit.data.sha}/${imagePath}`;
-                  image = `\n![RTC GroupGemm 延迟柱状图](${imageUrl})\n`;
+                  image = `\n![RTC GroupGemm 设备与端到端延迟图](${imageUrl})\n`;
                   published = true;
                 } catch (error) {
                   if (![409, 422].includes(error.status) || attempt === 4) throw error;

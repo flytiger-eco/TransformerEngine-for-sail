@@ -215,7 +215,7 @@ for sweep in 0 1 2 3; do
     fi
     for arm in "${arms[@]}"; do
         export RTC_CI_EXPECTED_PREFIX="$SCRATCH/$arm-venv"
-        python3 "$GATE" measure --python "$SCRATCH/$arm-venv/bin/python" \
+        python3 "$GATE" measure --arm "$arm" --sweep "$sweep" --python "$SCRATCH/$arm-venv/bin/python" \
             --replay "$REPLAY" --cases "$CASES" --output "$OUT/$arm/sweep-$sweep" \
             --warmup 5 --iters 20 --samples 5 \
             2>&1 | tee "$OUT/$arm/sweep-$sweep.log" || true

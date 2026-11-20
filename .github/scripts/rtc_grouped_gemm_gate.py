@@ -33,9 +33,12 @@ SCOPE_PATHS = (
     "transformer_engine/common/util/rtc.h",
     "transformer_engine/common/include/transformer_engine/gemm.h",
     "transformer_engine/common/CMakeLists.txt",
+    "transformer_engine/common/common.h",
     "transformer_engine/pytorch/cpp_extensions/gemm.py",
     "transformer_engine/pytorch/csrc/extensions/gemm.cpp",
+    "transformer_engine/pytorch/csrc/type_converters.cpp",
     "transformer_engine/pytorch/module/grouped_linear.py",
+    "transformer_engine/pytorch/ops/basic/grouped_linear.py",
     "3rdparty/actlize",
     "3rdparty/actlize/**",
     "3rdparty/cudafy-for-sail",
@@ -82,69 +85,67 @@ def load_cases(path):
     return cases
 
 
+def validate_result(result, api, tag, samples, *, head=False):
+    if result.get("tag") != tag or result.get("api") != api:
+        raise ValueError(f"case tag/API 与 {api} 不一致")
+    names = result.get("kernels")
+    if not names or not all(
+        isinstance(name, str) and name.startswith("nvte_grouped_gemm3_")
+        and ("_grouped_tensor" in name) == (api == "grouped_tensor") for name in names
+    ):
+        raise ValueError(f"{api} RTC kernel 缺失或选路错误")
+    if head and "n_expand:4" in tag.split(",") and any("_ne4" not in name for name in names):
+        raise ValueError(f"{api} 未命中该 case 要求的 N_expand=4")
+    if not 0 <= result["max_relative_error"] < 4e-3:
+        raise ValueError(f"{api} 数值对拍失败")
+    for values, median in (("samples_us", "median_us"), ("e2e_samples_us", "e2e_us")):
+        times = result[values]
+        if not isinstance(times, list) or len(times) != samples or not all(
+            type(t) in (int, float) and math.isfinite(t) and t > 0 for t in times
+        ) or result[median] != statistics.median(times):
+            raise ValueError(f"{api} {median} 测量无效")
+
+
 def measure(args):
     cases = load_cases(args.cases)
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
     results, errors = [], []
-    env = os.environ.copy()
-    env["OMP_NUM_THREADS"] = "1"
-    env["MKL_NUM_THREADS"] = "1"
-    # base/head 的缓存完全隔离；同一 arm 的 sweep 复用该 arm 自己的 cubin。
-    env["NVTE_GG_RTC_CACHE_DIR"] = str(out.parent / "rtc-cache")
+    env = dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
+               NVTE_GG_RTC_CACHE_DIR=str(out.parent / "rtc-cache"))
+    apis = ("ordinary",) if args.arm == "base" else ("ordinary", "grouped_tensor")
+    if args.sweep % 2:
+        apis = apis[::-1]
     for index, tag in enumerate(cases, 1):
         if args.only_case and index != args.only_case:
             continue
-        log = out / f"case-{index:02d}.log"
-        result_file = out / f"case-{index:02d}.json"
-        print(f"[RTC CI] case {index}/{len(cases)}: {tag}", flush=True)
-        command = [
-            args.python,
-            str(Path(args.replay).resolve()),
-            "--tag",
-            tag,
-            "--ci-output",
-            str(result_file),
-            "--warmup",
-            str(args.warmup),
-            "--iters",
-            str(args.iters),
-            "--profile-samples",
-            str(args.samples),
-        ]
-        try:
-            with log.open("w", encoding="utf-8") as stream:
-                completed = subprocess.run(
-                    command, env=env, stdout=stream, stderr=subprocess.STDOUT, timeout=args.timeout
-                )
-            if completed.returncode:
-                raise RuntimeError(f"worker 退出码 {completed.returncode}；详见 {log.name}")
-            # tag 含真实尺寸、backend、tile、stages，不能仅验证 override 配置。
-            live = re.findall(r"\[TE\] --format=[^\r\n]+", log.read_text(encoding="utf-8"))
-            if not live or any(line != tag for line in live):
-                raise RuntimeError(f"实际 launch tag 与 case 不同或缺失；详见 {log.name}")
-            result = json.loads(result_file.read_text(encoding="utf-8"))
-            if result["tag"] != tag:
-                raise RuntimeError("结果 tag 不匹配")
-            expected_prefix = os.environ.get("RTC_CI_EXPECTED_PREFIX")
-            if expected_prefix and not Path(result["te_path"]).is_relative_to(expected_prefix):
-                raise RuntimeError(f"导入了错误的 TE：{result['te_path']}")
-            result["id"] = index
-            results.append(result)
-        except (
-            OSError,
-            ValueError,
-            KeyError,
-            TypeError,
-            RuntimeError,
-            subprocess.TimeoutExpired,
-        ) as error:
-            errors.append({"id": index, "tag": tag, "error": str(error)})
-            print(f"[RTC CI] ERROR: {error}", flush=True)
-        # 每个 case 发布检查点，pod 超时也保留已完成的测试和原始日志。
+        row = {"id": index}
+        for api in apis:
+            log = out / f"case-{index:02d}.{api}.log"
+            result_file = log.with_suffix(".json")
+            print(f"[RTC CI] case {index}/{len(cases)} {api}: {tag}", flush=True)
+            try:
+                result_file.unlink(missing_ok=True)
+                with log.open("w", encoding="utf-8") as stream:
+                    subprocess.run([
+                        args.python, str(Path(args.replay).resolve()), "--tag", tag, "--api", api,
+                        "--ci-output", str(result_file), "--warmup", str(args.warmup),
+                        "--iters", str(args.iters), "--profile-samples", str(args.samples),
+                    ], env=env, stdout=stream, stderr=subprocess.STDOUT, timeout=args.timeout,
+                       check=True)
+                result = json.loads(result_file.read_text())
+                validate_result(result, api, tag, args.samples, head=args.arm == "head")
+                prefix = env.get("RTC_CI_EXPECTED_PREFIX")
+                if prefix and not Path(result["te_path"]).resolve().is_relative_to(Path(prefix).resolve()):
+                    raise ValueError(f"导入了错误的 TE：{result['te_path']}")
+                row[api] = result
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+                message = f"{exc} ({log.name})"
+                errors.append({"id": index, "tag": tag, "api": api, "error": message})
+                print(f"[RTC CI] ERROR: {message}", flush=True)
+        results.append(row)
         payload = {
-            "results": results,
-            "errors": errors,
+            "results": results, "errors": errors,
             "case_digest": hashlib.sha256("\n".join(cases).encode()).hexdigest(),
             "settings": {"iters": args.iters, "samples": args.samples, "warmup": args.warmup},
         }
@@ -153,51 +154,49 @@ def measure(args):
 
 
 def compare(cases, measurements, tolerance):
-    """每个 case 取配对 sweep 的速度比中位数，禁止汇总增益掩盖单项退化。"""
-    if not 0 <= tolerance < 1 or not measurements:
+    """Compare adjacent arms within each sweep before aggregating across sweeps."""
+    if not measurements or not cases or not 0 <= tolerance < 1:
         raise ValueError("需要配对测量，且性能容差必须在 [0, 1) 内")
-    rows = []
     digest = hashlib.sha256("\n".join(cases).encode()).hexdigest()
-    for base, head in measurements:
-        for arm in (base, head):
-            if arm.get("errors") or arm.get("case_digest") != digest:
-                raise ValueError(f"测量失败或 case 列表不一致：{arm.get('errors')}")
-            if [r.get("id") for r in arm["results"]] != list(range(1, len(cases) + 1)):
+    settings = measurements[0][0]["settings"]
+    if not all(type(settings[key]) is int and settings[key] > 0 for key in ("samples", "iters", "warmup")):
+        raise ValueError("测量设置无效")
+    for pair in measurements:
+        for arm in pair:
+            if arm["errors"] != [] or arm["case_digest"] != digest or arm["settings"] != settings:
+                raise ValueError(f"测量失败或设置不一致：{arm['errors']}")
+            if [r["id"] for r in arm["results"]] != list(range(1, len(cases) + 1)):
                 raise ValueError("结果缺失、重复或顺序错误")
-        if base.get("settings") != head.get("settings"):
-            raise ValueError("base/head 的测量设置不一致")
+    rows = []
     for index, tag in enumerate(cases):
-        base_times, head_times, ratios = [], [], []
+        sweeps = []
+        environment = None
         for base, head in measurements:
             b, h = base["results"][index], head["results"][index]
-            if b["tag"] != tag or h["tag"] != tag:
-                raise ValueError("case tag 不一致")
-            for key in ("device", "capability", "torch"):
-                if b.get(key) != h.get(key):
-                    raise ValueError(f"base/head 运行环境不一致：{key}")
-            bt, ht = b["median_us"], h["median_us"]
-            if not all(math.isfinite(t) and t > 0 for t in (bt, ht)):
-                raise ValueError("无效的时间测量")
-            base_times.append(bt)
-            head_times.append(ht)
-            ratios.append(ht / bt)
-        ratio = statistics.median(ratios)
-        rows.append(
-            {
-                "id": index + 1,
-                "tag": tag,
-                "base_us": statistics.median(base_times),
-                "head_us": statistics.median(head_times),
-                "latency_ratio": ratio,
-                "speedup": 1 / ratio,
-                "regression": ratio > 1 + tolerance,
-            }
-        )
+            trio = b["ordinary"], h["ordinary"], h["grouped_tensor"]
+            for arm, result in zip(("base", "head", "grouped_tensor"), trio):
+                api = "grouped_tensor" if arm == "grouped_tensor" else "ordinary"
+                validate_result(result, api, tag, settings["samples"], head=arm != "base")
+                current = tuple(result[key] for key in ("device", "device_uuid", "capability", "torch"))
+                if not all(current) or (environment is not None and environment != current):
+                    raise ValueError("base/head/API/sweep 运行环境不一致")
+                environment = current
+            sweeps.append(trio)
+
+        row = {"id": index + 1, "tag": tag}
+        for metric, suffix in (("median_us", ""), ("e2e_us", "_e2e")):
+            for arm, times in zip(("base", "head", "grouped"), zip(*sweeps)):
+                row[f"{arm}{suffix}_us"] = statistics.median(t[metric] for t in times)
+            row[f"ordinary{suffix}_ratio"] = statistics.median(h[metric] / b[metric] for b, h, g in sweeps)
+            row[f"grouped{suffix}_ratio"] = statistics.median(g[metric] / h[metric] for b, h, g in sweeps)
+        row["regression"] = max(row["ordinary_ratio"], row["ordinary_e2e_ratio"],
+                                row["grouped_e2e_ratio"]) > 1 + tolerance
+        rows.append(row)
     return rows
 
 
 def plot_report(gate, output):
-    """无显示环境绘制延迟及配对变化；不把独立中位数之比冒充配对比率。"""
+    """绘制三组设备延迟和端到端延迟。"""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -218,25 +217,14 @@ def plot_report(gate, output):
             axes[1].text(0.5, 0.5, "See the report and case/build logs.", ha="center", fontsize=14)
         else:
             ids = [row["id"] for row in rows]
-            axes[0].bar([i - 0.2 for i in ids], [r["base_us"] for r in rows], 0.4, label="base")
-            axes[0].bar([i + 0.2 for i in ids], [r["head_us"] for r in rows], 0.4, label="head")
-            axes[0].set_ylabel("RTC kernel latency (μs)")
-            axes[0].legend()
-            changes = [(row["latency_ratio"] - 1) * 100 for row in rows]
-            colors = [
-                "#d62728" if r["regression"] else "#2ca02c" if c < 0 else "#7f7f7f"
-                for r, c in zip(rows, changes)
-            ]
-            axes[1].bar(ids, changes, color=colors)
-            axes[1].axhline(0, color="black", linewidth=0.8)
-            axes[1].axhline(
-                gate["tolerance"] * 100,
-                color="#d62728",
-                linestyle="--",
-                label=f"+{gate['tolerance']:.0%} tolerance",
-            )
-            axes[1].set_ylabel("Paired head/base latency change (%)")
-            axes[1].legend()
+            for axis, suffix, label in zip(axes, ("", "_e2e"), ("Device", "End-to-end")):
+                for offset, arm, name in ((-0.26, "base", "Base ordinary"),
+                                          (0, "head", "PR ordinary"),
+                                          (0.26, "grouped", "PR GroupedTensor")):
+                    axis.bar([i + offset for i in ids], [r[f"{arm}{suffix}_us"] for r in rows],
+                             0.26, label=name)
+                axis.set_ylabel(f"{label} latency (μs)")
+                axis.legend()
             for axis in axes:
                 axis.set_xticks(ids, [f"{i:02d}" for i in ids])
                 axis.set_xlabel("case (lower latency is better)")
@@ -280,27 +268,32 @@ def report(args):
     (out / "gate.json").write_text(json.dumps(gate, indent=2) + "\n", encoding="utf-8")
     lines = [
         "### TE RTC GroupGemm 性能门禁（890P）",
-        f"结论：**{verdict}**；策略：`{args.policy}`；逐 case 延迟容差：{args.tolerance:.0%}。",
-        f"base `{args.base_sha}` → head `{args.head_sha}`；{args.sweeps} 轮配对 sweep。",
-        "计时只统计 RTC GEMM kernel；JIT、FP32 对拍、CPU dispatch 不计入。",
-        "数值、backend、实际 tag/tile/stages 或测量缺失始终使检查失败。",
+        "",
+        f"**{verdict}**。本次采用 `{args.policy}` 策略，每个 case 的延迟容差为 {args.tolerance:.0%}。",
+        f"比较基线 `{args.base_sha}` 与 PR `{args.head_sha}`，配对轮数为 {args.sweeps}。",
+        "",
+        "设备时间包含 RTC GEMM 和实际启动的元数据 kernel。端到端时间还包含 Python 提交和批次末尾同步。",
+        "三组使用相同输入和 tile。加速比来自逐轮配对的延迟比，大于 1× 表示加速。",
         "",
     ]
     if error:
-        lines += [f"测量未完成或校验失败：`{error}`", "详见 build 日志和逐 case 日志。"]
+        lines += ["测量或校验失败。", "", f"`{error}`", "", "详见构建日志和各 case 的日志。"]
     else:
-        geometric_speedup = math.exp(statistics.mean(math.log(r["speedup"]) for r in rows))
+        case_ids = ", ".join(f"{row['id']:02d}" for row in regressions)
         lines += [
-            f"几何平均加速比：{geometric_speedup:.3f}x；退化：{len(regressions)}/{len(rows)}。",
-            "",
-            "| case | base μs | head μs | 加速比 | 结果 |",
-            "|---|---:|---:|---:|---|",
+            f"{len(regressions)}/{len(rows)} 个 case 超过容差" + (f"（{case_ids}）。" if case_ids else "。"),
+            "普通接口比较设备和端到端延迟。GroupedTensor 比较其相对 PR 普通接口的端到端延迟。",
         ]
-        for row in rows:
-            lines.append(
-                f"| {row['id']:02d} | {row['base_us']:.2f} | {row['head_us']:.2f} | "
-                f"{row['speedup']:.3f}x | {'退化' if row['regression'] else '通过'} |"
-            )
+        for suffix, title in (("", "设备"), ("_e2e", "端到端")):
+            lines += ["", f"**{title}**", "",
+                      "| case | 基线普通 μs | PR 普通 μs | PR GroupedTensor μs | 普通加速比 | 接口额外加速比 |",
+                      "|---|---:|---:|---:|---:|---:|"]
+            for row in rows:
+                lines.append(
+                    f"| {row['id']:02d} | {row[f'base{suffix}_us']:.2f} | {row[f'head{suffix}_us']:.2f} | "
+                    f"{row[f'grouped{suffix}_us']:.2f} | {1/row[f'ordinary{suffix}_ratio']:.3f}× | "
+                    f"{1/row[f'grouped{suffix}_ratio']:.3f}× |"
+                )
         lines += [
             "",
             "<details><summary>完整 case 列表</summary>",
@@ -331,6 +324,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("measure")
+    run.add_argument("--sweep", type=int, default=0, help="奇数轮反转接口测量顺序")
+    run.add_argument("--arm", choices=("base", "head"), default="head")
     run.add_argument("--python", default=sys.executable)
     run.add_argument("--replay", default=str(DEFAULT_REPLAY))
     run.add_argument("--output", required=True)
