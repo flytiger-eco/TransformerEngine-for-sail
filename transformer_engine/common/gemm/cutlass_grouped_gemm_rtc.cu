@@ -1117,12 +1117,7 @@ std::map<std::pair<int, std::string>, CompiledKernel>& kernel_cache() {
   return c;
 }
 
-// Resolve CUTLASS 3.x + PPU include directory for NVRTC.
-// Follows the same pattern as cuda::include_directory(): env var overrides,
-// then build-time baked path (string_path_cutlass3_include), then heuristic
-// fallbacks. The baked path is set by CMake's make_string_header() and
-// matches CUTLASS3_INCLUDE_DIR at build time — for source builds this is
-// 3rdparty/cutlass3/include.
+// Resolve the CUTLASS + PPU headers for the loaded RTC library.
 std::string resolve_cutlass_include_dir() {
   namespace fs = std::filesystem;
   auto check = [](const fs::path& p) {
@@ -1130,7 +1125,7 @@ std::string resolve_cutlass_include_dir() {
            fs::exists(p / "ppu_include.hpp");
   };
 
-  // 1. Explicit env var overrides (highest priority).
+  // Explicit include directory overrides.
   std::vector<std::pair<std::string, fs::path>> search_paths = {
       {"NVTE_CUTLASS3_INCLUDE_DIR", ""},
       {"NVTE_CUTLASS_INCLUDE_DIR", ""},
@@ -1140,11 +1135,24 @@ std::string resolve_cutlass_include_dir() {
     if (check(p)) return p.string();
   }
 
-  // 2. Build-time baked path (like string_path_cuda_include for CUDA).
+  // Wheels put include/cutlass3 at the installation root and the shared
+  // library in transformer_engine/ or transformer_engine/wheel_lib/.
+  fs::path installed;
+  Dl_info dl_info;
+  if (dladdr(reinterpret_cast<void*>(&resolve_cutlass_include_dir), &dl_info) &&
+      dl_info.dli_fname) {
+    fs::path dir = fs::path(dl_info.dli_fname).parent_path();
+    if (dir.filename() == "wheel_lib") dir = dir.parent_path();
+    const bool packaged = dir.filename() == "transformer_engine";
+    installed = (packaged ? dir.parent_path() : dir) / "include" / "cutlass3";
+    if (packaged && check(installed)) return installed.string();
+  }
+
+  // Source builds use the effective include tree materialized by CMake.
   fs::path baked(string_path_cutlass3_include);
   if (check(baked)) return baked.string();
 
-  // 3. CUTLASS_PATH env var with /include suffix.
+  // CUTLASS_PATH may name a checkout or its include directory.
   fs::path cutlass_path = getenv<fs::path>("CUTLASS_PATH");
   if (!cutlass_path.empty()) {
     fs::path with_include = cutlass_path / "include";
@@ -1152,26 +1160,17 @@ std::string resolve_cutlass_include_dir() {
     if (check(cutlass_path)) return cutlass_path.string();
   }
 
-  // 4. NVTE_HOME / 3rdparty / cutlass3 / include.
+  // Older source trees keep CUTLASS under NVTE_HOME.
   fs::path nvte_home = getenv<fs::path>("NVTE_HOME");
   if (!nvte_home.empty()) {
     fs::path candidate = nvte_home / "3rdparty" / "cutlass3" / "include";
     if (check(candidate)) return candidate.string();
   }
 
-  // 5. Installed-package fallback: headers installed alongside the .so
-  //    via CMake install(DIRECTORY ... DESTINATION include/cutlass3).
-  {
-    Dl_info dl_info;
-    if (dladdr(reinterpret_cast<void*>(&resolve_cutlass_include_dir), &dl_info)
-        && dl_info.dli_fname) {
-      fs::path lib_dir = fs::path(dl_info.dli_fname).parent_path();
-      fs::path installed = lib_dir / "include" / "cutlass3";
-      if (check(installed)) return installed.string();
-    }
-  }
+  // Standalone CMake installs keep include/cutlass3 next to the library.
+  if (check(installed)) return installed.string();
 
-  // 6. __FILE__-relative fallback (source tree layout).
+  // __FILE__-relative fallback for that source layout.
   fs::path here(__FILE__);
   fs::path repo_root = here.parent_path()      // gemm
                             .parent_path()    // common
@@ -2480,8 +2479,8 @@ struct NativeSetup {
   NativeExpert* experts;
   NativeControl* control;
   const float *alpha, *beta;
-  int groups, scalar_count, ta, tb, output_bytes, sms, tile_m, tile_n;
-  bool has_c, ne4;
+  int groups, scalar_count, ta, tb, output_bytes, sms, tile_m_shift, tile_n_shift;
+  bool has_c, packed_in_place, ne4;
 };
 
 __device__ __forceinline__ void require_metadata(bool valid) {
@@ -2514,7 +2513,7 @@ __device__ __forceinline__ MatrixSlice matrix_slice(const NativeStorage& packed,
       offset = running;
       running += count;
     } else {
-      require_metadata(count == 0 || uint64_t(group) <= s.capacity / count);
+      require_metadata(__umul64hi(uint64_t(group), count) == 0);
       offset = uint64_t(group) * count;
     }
   }
@@ -2532,8 +2531,8 @@ __host__ __device__ bool disjoint_ranges(uint64_t a, uint64_t bytes_a,
 }
 
 constexpr int kMetadataThreads = 32;
+template <bool PackedInPlace>
 __global__ void prepare_native_grouped_metadata(NativeSetup p) {
-  __shared__ NativeExpert chunk[kMetadataThreads];
   auto needs_prefix = [](const NativeStorage& s) { return !s.offsets && (s.first || s.last); };
   int step = needs_prefix(p.a) || needs_prefix(p.b) || needs_prefix(p.c) || needs_prefix(p.d)
                  ? 1 : kMetadataThreads;
@@ -2542,11 +2541,12 @@ __global__ void prepare_native_grouped_metadata(NativeSetup p) {
   uint64_t total = 0, per_group = 0;
   for (int64_t start = 0; start < p.groups; start += step) {
     int count = int(p.groups - start < step ? p.groups - start : step);
+    NativeExpert e{};
     if (lane < count) {
       int i = int(start) + lane;
       auto a = matrix_slice(p.a, nullptr, i, 2, offsets[0]);
-      auto b = matrix_slice(p.b, p.b_list, i, 2, offsets[1]);
-      auto d = matrix_slice(p.d, p.d_list, i, p.output_bytes, offsets[2]);
+      auto b = matrix_slice(p.b, PackedInPlace ? nullptr : p.b_list, i, 2, offsets[1]);
+      auto d = matrix_slice(p.d, PackedInPlace ? nullptr : p.d_list, i, p.output_bytes, offsets[2]);
       int m = p.ta ? a.cols : a.rows, k = p.ta ? a.rows : a.cols;
       int n = p.tb ? b.rows : b.cols;
       float alpha = p.alpha[p.scalar_count == 1 ? 0 : i];
@@ -2554,7 +2554,9 @@ __global__ void prepare_native_grouped_metadata(NativeSetup p) {
       require_metadata(k == (p.tb ? b.cols : b.rows) && d.rows == m && d.cols == n);
       require_metadata(!m || !n || !k || (a.cols % 8 == 0 && b.cols % 8 == 0));
       uint64_t cptr = 0;
-      if (p.has_c) {
+      if constexpr (PackedInPlace) {
+        cptr = d.ptr;
+      } else if (p.has_c) {
         auto c = matrix_slice(p.c, p.c_list, i, p.output_bytes, offsets[3]);
         require_metadata(c.rows == m && c.cols == n);
         uint64_t bytes = uint64_t(m) * n * p.output_bytes;
@@ -2565,28 +2567,31 @@ __global__ void prepare_native_grouped_metadata(NativeSetup p) {
         require_metadata(beta == 0 || !m || !n);
       }
       int columns = p.ne4 && ne4_shape(m, n, k) && alpha == 1 && beta == 0 ? 4 : 1;
-      uint64_t tiles = uint64_t((m + p.tile_m - 1) / p.tile_m) *
-                       ((n + p.tile_n - 1) / p.tile_n) / columns;
-      chunk[lane] = {a.ptr, b.ptr, cptr, d.ptr, tiles, m, n, k, columns, alpha, beta};
+      int mt = (m + (1 << p.tile_m_shift) - 1) >> p.tile_m_shift;
+      int nt = (n + (1 << p.tile_n_shift) - 1) >> p.tile_n_shift;
+      uint64_t tiles = uint64_t(mt) * (columns == 4 ? nt / 4 : nt);
+      e = {a.ptr, b.ptr, cptr, d.ptr, tiles, m, n, k, columns, alpha, beta};
     }
-    __syncthreads();
-    if (lane == 0) {
-      for (int j = 0; j < count; ++j) {
-        auto& e = chunk[j];
-        uint64_t tiles = e.end;
-        if (start == 0 && j == 0) per_group = tiles;
-        if (tiles != per_group) per_group = 0;
-        require_metadata(tiles <= UINT64_MAX - total);
-        e.end = total += tiles;
-      }
+    constexpr unsigned mask = 0xffffffff;
+    if (start == 0) per_group = __shfl_sync(mask, e.end, 0);
+    if (!__all_sync(mask, lane >= count || e.end == per_group)) per_group = 0;
+    // A chunk contains at most 32 experts with 32-bit extents and tiles >= 128.
+    // Its inclusive sum fits in 64 bits; check the carry between chunks.
+#pragma unroll
+    for (int delta = 1; delta < kMetadataThreads; delta *= 2) {
+      uint64_t prior = __shfl_up_sync(mask, e.end, delta);
+      if (lane >= delta) e.end += prior;
     }
-    __syncthreads();
-    if (lane < count) p.experts[start + lane] = chunk[lane];
-    __syncthreads();
+    uint64_t chunk_tiles = __shfl_sync(mask, e.end, kMetadataThreads - 1);
+    require_metadata(chunk_tiles <= UINT64_MAX - total);
+    e.end += total;
+    if (lane < count) p.experts[start + lane] = e;
+    total += chunk_tiles;
   }
   // A list of independent outputs has no single allocation range to validate
   // on the host. Check it against all inputs and the other output slices.
-  if (p.d_list) {
+  if (!PackedInPlace && p.d_list) {
+    __syncthreads();
     for (int64_t i = lane; i < p.groups; i += kMetadataThreads) {
       auto e = p.experts[i];
       uint64_t bytes = uint64_t(e.m) * e.n * p.output_bytes;
@@ -2614,6 +2619,8 @@ __global__ void prepare_native_grouped_metadata(NativeSetup p) {
 
 template <bool TA, bool TB, bool FP32, int M, int N, int K, int S>
 struct NativeTraits : GemmTraits<TA, TB, 89, cutlass::bfloat16_t, M, N, K, S, FP32> {
+  static_assert((M & (M - 1)) == 0 && (N & (N - 1)) == 0,
+                "The metadata kernel uses power-of-two M/N tiles");
   using Base = GemmTraits<TA, TB, 89, cutlass::bfloat16_t, M, N, K, S, FP32>;
   using GemmKernel = cutlass::gemm::kernel::NvteNativeGrouped<
       typename Base::CollectiveMainloop, typename Base::CollectiveEpilogue, false>;
@@ -2632,8 +2639,8 @@ void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream) {
     cfg.grouped_tensor = true;
     return get_or_compile<NativeTraits<TA, TB, FP32, 256, 128, 64, 3>>(89, TA, TB, cfg);
   }();
-  setup.tile_m = cfg.tile_m;
-  setup.tile_n = cfg.tile_n;
+  setup.tile_m_shift = cutlass::find_log2(cfg.tile_m);
+  setup.tile_n_shift = cutlass::find_log2(cfg.tile_n);
   setup.ne4 = cfg.n_expand;
   NativeParams params{};
   auto packed = [&](const NativeStorage& s, int bytes) {
@@ -2669,7 +2676,11 @@ void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream) {
     params.tiles_per_group = cutlass::FastDivmod(int(group_tiles));
     params.tiles_per_row = cutlass::FastDivmod(nt);
   } else {
-    prepare_native_grouped_metadata<<<1, kMetadataThreads, 0, stream>>>(setup);
+    if (setup.packed_in_place) {
+      prepare_native_grouped_metadata<true><<<1, kMetadataThreads, 0, stream>>>(setup);
+    } else {
+      prepare_native_grouped_metadata<false><<<1, kMetadataThreads, 0, stream>>>(setup);
+    }
     NVTE_CHECK_CUDA(cudaGetLastError());
     params.experts = setup.experts;
     params.control = setup.control;
@@ -2787,6 +2798,8 @@ bool try_native_grouped_gemm(const NVTEGroupedTensor A, int transa,
   setup.c = storage(c, output_dtype);
   setup.d = storage(d, output_dtype);
   setup.has_c = c != nullptr || C_list != nullptr;
+  // The Python packed interface passes the same descriptor for C and D.
+  setup.packed_in_place = !A_list && !C_list && !D_list && c && c == d;
   setup.groups = int(groups);
   setup.ta = transb; setup.tb = transa;
   setup.output_bytes = output_dtype == DType::kFloat32 ? 4 : 2;

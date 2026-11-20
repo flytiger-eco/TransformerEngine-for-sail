@@ -1010,6 +1010,8 @@ class GroupedLinear(BasicOperation):
             self.single_grouped_weight
             and torch.cuda.get_device_capability(device) == (8, 9)
             and dtype == torch.bfloat16
+            and self.in_features % 8 == 0
+            and self.out_features % 8 == 0
             and not is_quantized_tensor(input_)
             and not self.has_bias
             and not self._scale_bias

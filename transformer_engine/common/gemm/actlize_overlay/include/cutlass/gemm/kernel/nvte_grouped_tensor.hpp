@@ -170,8 +170,14 @@ struct NvteNativeGrouped {
         }
       }
       const auto& e = p.experts[group];
-      int ntiles = ((e.n + BN - 1) / BN) / e.columns;
-      run_tile(e, int((id - start) / ntiles), int((id - start) % ntiles) * e.columns, smem);
+      const int columns = EnableNExpand ? e.columns : 1;
+      const int ntiles = ((e.n + BN - 1) / BN) / columns;
+      const uint64_t local = id - start;
+      // Keep large experts addressable, and use a 32-bit divide for ordinary tile counts.
+      const int mi = local <= UINT32_MAX ? int(uint32_t(local) / uint32_t(ntiles))
+                                         : int(local / ntiles);
+      const int ni = int(local - uint64_t(mi) * ntiles);
+      run_tile(e, mi, ni * columns, smem);
     }
   }
 };

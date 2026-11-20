@@ -16,14 +16,9 @@ vacuously.
 """
 
 import importlib
-import json
-import os
-import subprocess
-import sys
 
 import pytest
 import torch
-import transformer_engine
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
 from transformer_engine.pytorch.tensor.storage.grouped_tensor_storage import GroupedTensorStorage
@@ -66,18 +61,6 @@ def _rtc_env(monkeypatch):
     monkeypatch.setenv("NVTE_FORCE_RTC_NO_FALLBACK", "1")
     monkeypatch.setenv("NVTE_GG_ALLOW_FP32_ACCUM", "1")
     monkeypatch.setenv("NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", "1")
-    # A wheel install puts the headers in <site-packages>/include/cutlass3
-    # while the shared object lives in <site-packages>/transformer_engine/,
-    # so the runtime resolver's dladdr fallback cannot reach them.
-    site = os.path.dirname(os.path.dirname(transformer_engine.__file__))
-    candidate = os.path.join(site, "include", "cutlass3")
-    # Prefer the effective headers materialized by configure when running from a
-    # source tree, so a stale installed copy cannot mask a fix.
-    effective = os.path.join(site, "build", "cmake", "actlize_effective", "include")
-    if os.path.isfile(os.path.join(effective, "ppu_include.hpp")):
-        candidate = effective
-    if os.path.isfile(os.path.join(candidate, "cutlass", "cutlass.h")):
-        monkeypatch.setenv("NVTE_CUTLASS3_INCLUDE_DIR", candidate)
     yield
     torch.cuda.synchronize()
 
@@ -422,13 +405,19 @@ def test_grouped_linear_rtc_nonuniform_m(splits, in_features, out_features):
     _assert_group_list_close(dw, ref_dw, f"dw [{label}]")
 
 
-@pytest.mark.parametrize("implementation", ["module", "module_main_grad", "op"])
-def test_grouped_linear_rtc_packed_weight(implementation, monkeypatch):
+@pytest.mark.parametrize("implementation,k,n", [
+    ("module", 256, 128), ("module_main_grad", 256, 128), ("op", 256, 128),
+    ("module", 255, 128), ("op", 256, 127),
+])
+def test_grouped_linear_rtc_packed_weight(implementation, k, n, monkeypatch):
     if torch.cuda.get_device_capability() != (8, 9):
         pytest.skip("Packed BF16 RTC requires PPU sm89")
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
     torch.manual_seed(57)
-    splits, k, n = [257, 128, 64], 256, 128
+    splits = [257, 128, 64]
+    aligned = k % 8 == 0 and n % 8 == 0
+    if not aligned:
+        monkeypatch.setenv("NVTE_FORCE_RTC_NO_FALLBACK", "0")
     dtype = torch.bfloat16
     args = dict(bias=False, single_grouped_weight=True, device="cuda")
     fused = implementation == "module_main_grad"
@@ -448,7 +437,10 @@ def test_grouped_linear_rtc_packed_weight(implementation, monkeypatch):
         torch.cuda.synchronize()
     kernels = [e.name for e in prof.events() if e.name.startswith("nvte_grouped_gemm3_")
                and e.device_type == torch.autograd.DeviceType.CUDA]
-    assert len(kernels) == 3 and all("_grouped_tensor" in name for name in kernels)
+    if aligned:
+        assert len(kernels) == 3 and all("_grouped_tensor" in name for name in kernels)
+    else:
+        assert not any("_grouped_tensor" in name for name in kernels)
     weights = layer.weight.split_into_quantized_tensors()
     ref_out, ref_dx, ref_dw = _reference(x, weights, dy, splits)
     _assert_group_list_close([out, x.grad], [ref_out, ref_dx], implementation)

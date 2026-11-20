@@ -135,7 +135,7 @@ class _GroupedLinear(torch.autograd.Function):
         activation_dtype: torch.dtype,
         input_quantizers: List[Optional[Quantizer]],
         output_quantizers: List[Optional[Quantizer]],
-        packed_weights: bool = False,
+        aligned_packed_weights: bool = False,
     ) -> bool:
         """Whether to use grouped GEMM through GroupedTensor metadata.
 
@@ -144,7 +144,8 @@ class _GroupedLinear(torch.autograd.Function):
         and be incompatible with CUDA Graphs.
 
         Supported Compute Capability (CC) and precisions:
-        * PPU (CC 8.9): unquantized BF16 with packed weights, outside graph capture.
+        * PPU (CC 8.9): packed BF16 weights with 16-byte aligned feature strides,
+          outside graph capture.
         * Hopper (CC 9.0): BF16/FP16, FP8 per-tensor current scaling, and FP8
           block scaling (1D/2D, including power-of-2 scales).
         * Blackwell (CC 10.x and 11.0): BF16/FP16/MXFP8/NVFP4 with RHT and FP8
@@ -168,7 +169,7 @@ class _GroupedLinear(torch.autograd.Function):
         device_capability = get_device_compute_capability()
         if device_capability == (8, 9):
             return (
-                packed_weights and not fp8 and activation_dtype == torch.bfloat16
+                aligned_packed_weights and not fp8 and activation_dtype == torch.bfloat16
                 and all(q is None for q in input_quantizers)
                 and not torch.cuda.is_current_stream_capturing()
             )
@@ -630,7 +631,9 @@ class _GroupedLinear(torch.autograd.Function):
             activation_dtype=activation_dtype,
             input_quantizers=input_quantizers,
             output_quantizers=output_quantizers,
-            packed_weights=grouped_weight is not None,
+            aligned_packed_weights=(
+                grouped_weight is not None and in_features % 8 == 0 and weights[0].size(-2) % 8 == 0
+            ),
         ):
             return _GroupedLinear._forward_grouped_tensor(
                 ctx,
