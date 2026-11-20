@@ -126,6 +126,39 @@ __device__ __forceinline__ void cached_naive_topk(CompType *scores, int size, in
   }
 }
 
+__device__ __forceinline__ void small_post_softmax(CompType *scores, int size, int lane_id) {
+  constexpr CompType empty = -std::numeric_limits<CompType>::infinity();
+  const bool valid = lane_id < size;
+  const CompType value = valid ? scores[lane_id] : empty;
+  if (__any_sync(0xffffffff, valid && !isfinite(value))) {
+    return apply_softmax_on_float(scores, size, lane_id);
+  }
+  if (size == 1) {
+    if (lane_id == 0) scores[0] = 1.0f;
+    __syncwarp();
+    return;
+  }
+  CompType maximum = value;
+  CompType sum = valid ? 1.0f : 0.0f;
+#pragma unroll
+  for (int offset = 4; offset > 0; offset >>= 1) {
+    CompType peer_max = warp_shuffle_xor(maximum, offset);
+    CompType peer_sum = warp_shuffle_xor(sum, offset);
+    if (peer_max != empty) {
+      if (maximum == empty) {
+        maximum = peer_max;
+        sum = peer_sum;
+      } else {
+        CompType next_max = fmaxf(maximum, peer_max);
+        sum = sum * expf(maximum - next_max) + peer_sum * expf(peer_max - next_max);
+        maximum = next_max;
+      }
+    }
+  }
+  if (valid) scores[lane_id] = expf(value - maximum) * (1.0f / sum);
+  __syncwarp();
+}
+
 __device__ __forceinline__ void small_group_scores(const CompType *scores, CompType *group_scores,
                                                    int num_groups, int group_size, int keep,
                                                    int lane_id) {
@@ -354,7 +387,11 @@ __global__ void fused_topk_forward_simple_kernel(
     }
 
     if (!use_pre_softmax && score_function == 1) {
-      apply_softmax_on_float(topk_scores, topk, lane_id);
+      if constexpr (UseSmallTopk) {
+        small_post_softmax(topk_scores, topk, lane_id);
+      } else {
+        apply_softmax_on_float(topk_scores, topk, lane_id);
+      }
       __syncwarp();
       for (int i = lane_id; i < topk; i += kThreadsPerWarp) {
         intermediate_output[pos_offset + topk_indices[i]] = topk_scores[i];
@@ -824,7 +861,13 @@ void fused_topk_with_score_function_forward_kernel_launcher(
         }
         return dispatch_forward_router_tiles<DataType>(num_experts, launch_grouped);
       }
-      if (topk > 1 && num_experts > kThreadsPerWarp && num_experts <= 8 * kThreadsPerWarp) {
+      const bool small_post = topk <= 8 && group_topk == 0 && !use_pre_softmax && score_function == 1;
+      if (small_post && num_experts <= kThreadsPerWarp) {
+        return launch_simple(fused_topk_forward_simple_kernel<DataType, BiasType, RoutingMapFormat,
+                             TopkFuncType::Naive, int32_t, 1, false, true>);
+      }
+      if ((topk > 1 || small_post) && num_experts > kThreadsPerWarp &&
+          num_experts <= 8 * kThreadsPerWarp) {
         dispatch_forward_router_tiles<DataType>(num_experts, [&](auto tiles, auto full) {
           if (topk <= 8) {
             return launch_simple(fused_topk_forward_simple_kernel<

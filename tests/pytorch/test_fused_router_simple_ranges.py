@@ -101,3 +101,22 @@ def test_small_group_scores_select_by_top_values_in_rank_order(dtype):
         logits, 2, False, 8, 2, 1.0, "softmax", None, fmt, None
     )
     assert mask.nonzero()[:, 1].tolist() == [0, 2]
+
+
+@pytest.mark.parametrize("topk", range(1, 9))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_small_post_softmax_matches_full_warp(topk, dtype):
+    generator = torch.Generator().manual_seed(863)
+    logits = torch.randn(11, 33, generator=generator).to(device="cuda", dtype=dtype)
+    logits[0] = -torch.inf
+    logits[1, 3] = torch.inf
+    logits[2, ::2] = torch.nan
+    logits[3] = -0.0
+    logits[4] *= torch.finfo(dtype).tiny
+    args = (logits, topk, False, None, None, -0.75, "softmax", None)
+    byte = int(tex.NVTERoutingMapFormat.BYTEMAP)
+    packed = int(tex.NVTERoutingMapFormat.BITMAP_U8)
+    probs, _, saved = tex.fused_topk_with_score_function_fwd(*args, byte, None)
+    ref_probs, _, ref_saved = tex.fused_topk_with_score_function_fwd(*args, packed, None)
+    assert torch.equal(probs.view(torch.uint8), ref_probs.view(torch.uint8))
+    assert torch.equal(saved.view(torch.uint8), ref_saved.view(torch.uint8))
