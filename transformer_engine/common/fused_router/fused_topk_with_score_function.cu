@@ -676,6 +676,14 @@ __global__ void fused_topk_with_score_function_forward_kernel(
   }
 }
 
+inline void simplify_singleton_top1_groups(int num_experts, int topk, bool use_radix,
+                                           int &num_groups, int &group_topk) {
+  if (!use_radix && topk == 1 && group_topk == 1 && num_groups == num_experts) {
+    num_groups = 0;
+    group_topk = 0;
+  }
+}
+
 template <typename DataType, typename BiasType, NVTERoutingMapFormat RoutingMapFormat>
 void fused_topk_with_score_function_forward_kernel_launcher(
     const DataType *logits, int num_tokens, int num_experts, int topk, bool use_pre_softmax,
@@ -704,6 +712,11 @@ void fused_topk_with_score_function_forward_kernel_launcher(
                "per-group topk must be <= group size, got per_group_topk=", topk / group_topk,
                " group_size=", num_experts / num_groups);
   }
+  // Dispatch: use radix only when it is profitable and supported. Otherwise use the
+  // naive path, which handles very large expert counts without the radix histogram limit.
+  const bool use_radix = topk >= get_radix_topk_threshold() && num_experts <= kMaxExpertsRadixTopk;
+  simplify_singleton_top1_groups(num_experts, topk, use_radix, num_groups, group_topk);
+
   size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
   size_t total_blocks = (num_tokens + num_token_per_block - 1) / num_token_per_block;
   size_t scores_shmem = num_experts * num_token_per_block * sizeof(CompType);
@@ -737,9 +750,6 @@ void fused_topk_with_score_function_forward_kernel_launcher(
     NVTE_CHECK_CUDA(cudaGetLastError());
   };
 
-  // Dispatch: use radix only when it is profitable and supported. Otherwise use the
-  // naive path, which handles very large expert counts without the radix histogram limit.
-  const bool use_radix = topk >= get_radix_topk_threshold() && num_experts <= kMaxExpertsRadixTopk;
   constexpr bool cache_scores = RoutingMapFormat == NVTE_ROUTING_MAP_FORMAT_BYTEMAP &&
                                 (!std::is_same_v<DataType, CompType> || std::is_same_v<BiasType, CompType>);
   if (!use_radix) {
@@ -848,6 +858,9 @@ void fused_topk_with_score_function_forward_with_indices_kernel_launcher(
                ", got ", num_experts);
   }
 
+  const bool use_radix = topk >= get_radix_topk_threshold() && num_experts <= kMaxExpertsRadixTopk;
+  simplify_singleton_top1_groups(num_experts, topk, use_radix, num_groups, group_topk);
+
   size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
   size_t total_blocks = (num_tokens + num_token_per_block - 1) / num_token_per_block;
   size_t scores_shmem = num_experts * num_token_per_block * sizeof(CompType);
@@ -878,7 +891,6 @@ void fused_topk_with_score_function_forward_with_indices_kernel_launcher(
     NVTE_CHECK_CUDA(cudaGetLastError());
   };
 
-  const bool use_radix = topk >= get_radix_topk_threshold() && num_experts <= kMaxExpertsRadixTopk;
   if (!use_radix) {
     // Simple path: no async loader, no persistent grid.
     check_shared_memory_capacity_num_experts(other_shmem, num_experts);

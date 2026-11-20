@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 import transformer_engine_torch as tex
@@ -53,3 +55,29 @@ def test_simple_ties_and_first_lane_nan(topk):
     assert torch.equal(saved.view(torch.int32), index_saved.view(torch.int32))
     assert torch.equal(mask, torch.zeros_like(mask).scatter_(1, indices, True))
     assert indices.cpu().tolist() == [expected]
+
+
+@pytest.mark.skipif(int(os.getenv("NVTE_RADIX_TOPK_THRESHOLD", "16")) <= 1, reason="tests naive tie order")
+@pytest.mark.parametrize("experts", [8, 33])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_singleton_groups_top1(experts, dtype):
+    logits = torch.full((6, experts), -torch.inf, dtype=dtype, device="cuda")
+    logits[0, -1] = 3
+    logits[1, 1:3] = 2
+    logits[2, 1], logits[2, 2] = -0.0, 0.0
+    logits[3] = torch.nan
+    logits[5] = torch.nan
+    logits[5, 1] = 1
+    expected = torch.tensor([experts - 1, 2, 2, 0, 0, 1], device="cuda").unsqueeze(1)
+    args = (logits, 1, False, experts, 1, 1.25, "softmax", None)
+    byte = int(tex.NVTERoutingMapFormat.BYTEMAP)
+    probs, mask, saved = tex.fused_topk_with_score_function_fwd(*args, byte, None)
+    wanted = torch.zeros_like(mask).scatter_(1, expected, True)
+    assert torch.equal(mask, wanted)
+    finite = [0, 1, 2, 5]
+    assert torch.equal(probs[finite], wanted[finite].to(dtype) * 1.25)
+    assert torch.equal(saved[finite], torch.where(wanted[finite], 1.0, -torch.inf))
+    for index_dtype in (torch.int16, torch.int32, torch.int64):
+        indices = torch.empty_like(expected, dtype=index_dtype)
+        tex.fused_topk_with_score_function_fwd(*args, byte, indices)
+        assert torch.equal(indices.long(), expected)
