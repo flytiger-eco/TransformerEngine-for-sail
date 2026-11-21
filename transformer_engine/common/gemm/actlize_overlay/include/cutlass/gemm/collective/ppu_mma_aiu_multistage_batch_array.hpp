@@ -272,9 +272,9 @@ struct CollectiveMma<
     (void) k_tile_iter;
     (void) residue_mnk;
     int k_tile = 0;
-    // Reserve a free shared-memory slot for the first K block to start the next
-    // A/B loads before the CTA waits for the next tile's register prefetch.
-#if NVTE_GG_COMMON_K && NVTE_GG_N_EXPAND != 4 && NVTE_GG_ARCH == 89
+    // With row-major A, reserve a slot to issue the next loads before the CTA
+    // waits. Column-major A benefits from prefilling all three stages.
+#if NVTE_GG_COMMON_K && NVTE_GG_N_EXPAND != 4 && NVTE_GG_ARCH == 89 && !NVTE_GG_TRANS_A
     constexpr bool early_issue = DispatchPolicy::Stages == 3 && size<2>(TileShape{}) == 64;
 #else
     constexpr bool early_issue = false;
