@@ -271,7 +271,7 @@ void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream,
     return native_launch_geometry<TA, TB, FP32, 256, 128, 64, 3>();
   };
   const auto [threads, smem] = geometry();
-  const auto kernel = get_or_compile(
+  const auto& kernel = get_or_compile(
       cuda::current_device(),
       {89, TA, TB, DType::kBFloat16, FP32 ? DType::kFloat32 : DType::kBFloat16, true}, cfg, smem);
   setup.tile_m_shift = cutlass::find_log2(cfg.tile_m);
@@ -335,12 +335,12 @@ void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream,
   int blocks_per_sm = 1;
   if (cfg.tile_m <= 128) {
     NVTE_CALL_CHECK_CUDA_DRIVER(cuOccupancyMaxActiveBlocksPerMultiprocessor, &blocks_per_sm,
-                                kernel->function, threads, kernel->smem_size);
+                                kernel.function, threads, kernel.smem_size);
   }
   void* args[] = {&params};
-  NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchKernel, kernel->function,
+  NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchKernel, kernel.function,
                               setup.sms * std::max(1, blocks_per_sm), 1, 1, threads, 1, 1,
-                              kernel->smem_size, static_cast<CUstream>(stream), args, nullptr);
+                              kernel.smem_size, static_cast<CUstream>(stream), args, nullptr);
 }
 }  // namespace
 }  // namespace grouped_gemm_rtc

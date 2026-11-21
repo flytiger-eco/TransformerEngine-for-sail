@@ -110,11 +110,9 @@ class HostStaging {
       data_ = heap_.data();
     }
 
-    static const bool cache_enabled = getenv<bool>("NVTE_GG_CACHE_PARAMS", true);
-    const bool cacheable = cache_enabled && scratch_unused;
     {
       std::lock_guard<std::mutex> lock(device_.cache_mutex);
-      if (cacheable && device_.last_workspace == dest && device_.last_stream == stream &&
+      if (scratch_unused && device_.last_workspace == dest && device_.last_stream == stream &&
           device_.last_params.size() == param_bytes_ &&
           std::memcmp(device_.last_params.data(), data_, param_bytes_) == 0)
         return;
@@ -131,7 +129,7 @@ class HostStaging {
       }
       slot_->copy_pending = true;
     }
-    if (cacheable) {
+    if (scratch_unused) {
       std::lock_guard<std::mutex> lock(device_.cache_mutex);
       device_.last_params.assign(data_, data_ + param_bytes_);
       device_.last_stream = stream;
@@ -298,17 +296,10 @@ struct ListGemm {
                            m.data(), n.data(), k.data(), dims, device, stream);
     }
     void* args[] = {params};
-    {
-      te_profiling::TeHgtxGuard guard(tag);
-      NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchKernel, compiled.function, grid.x, grid.y, grid.z,
-                                  threads, 1, 1, compiled.smem_size, static_cast<CUstream>(stream),
-                                  args, nullptr);
-    }
-    if (verbose_tile_debug()) {
-      NVTE_WARN("RTC grouped GEMM groups=", groups, " tile=", tile.tile_m, "x", tile.tile_n, "x",
-                tile.tile_k, " stages=", tile.stages, " grid=(", grid.x, ",", grid.y,
-                ") threads=", threads, " smem=", compiled.smem_size);
-    }
+    te_profiling::TeHgtxGuard guard(tag);
+    NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchKernel, compiled.function, grid.x, grid.y, grid.z,
+                                threads, 1, 1, compiled.smem_size, static_cast<CUstream>(stream),
+                                args, nullptr);
   }
 
   template <class Traits>
@@ -336,7 +327,7 @@ struct ListGemm {
     ep.dD = reinterpret_cast<decltype(ep.dD)>(d.ldd);
     NVTE_CHECK(Kernel::can_implement(args), "CUTLASS cannot implement RTC grouped GEMM for ",
                groups, " groups.");
-    const auto compiled = get_or_compile(device, kernel, tile, Kernel::SharedStorageSize);
+    const auto& compiled = get_or_compile(device, kernel, tile, Kernel::SharedStorageSize);
     WorkspaceGuard guard(device, &workspace.nvte_tensor, 1, /*reuse_list_descriptors=*/true);
     void* scratch = upload(Kernel::get_workspace_size(args));
     // A pageable staging buffer can move when scratch is appended.
@@ -346,7 +337,7 @@ struct ListGemm {
     auto params = Kernel::to_underlying_arguments(args, scratch);
     const bool along_n =
         params.scheduler.raster_order_ == decltype(params.scheduler)::RasterOrder::AlongN;
-    launch(&params, Kernel::get_grid_shape(params), along_n, Kernel::MaxThreadsPerBlock, *compiled);
+    launch(&params, Kernel::get_grid_shape(params), along_n, Kernel::MaxThreadsPerBlock, compiled);
   }
 };
 
@@ -387,8 +378,7 @@ bool dispatch(const NVTETensor* A, const NVTETensor* B, NVTETensor* D, int group
   if (sms <= 0) sms = 39;
   cudaStreamCaptureStatus capture;
   NVTE_CHECK_CUDA(cudaStreamIsCapturing(stream, &capture));
-  NVTE_CHECK(capture == cudaStreamCaptureStatusNone,
-             "CUTLASS RTC grouped GEMM does not support CUDA graph capture.");
+  if (capture != cudaStreamCaptureStatusNone) return false;
   const auto input = convertNVTETensorCheck(A[0])->data.dtype;
   const auto output = convertNVTETensorCheck(D[0])->data.dtype;
   ListGemm gemm{

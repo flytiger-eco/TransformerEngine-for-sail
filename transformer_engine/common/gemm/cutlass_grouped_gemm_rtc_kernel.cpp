@@ -16,12 +16,14 @@
 #include <iomanip>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string_view>
 #include <tuple>
 #include <vector>
 
+#include "../util/system.h"
 #include "ppu_adaptive_tile.hpp"
 
 namespace transformer_engine::grouped_gemm_rtc {
@@ -250,9 +252,6 @@ std::string compile_cubin(const std::string& symbol, const std::vector<std::stri
   // hgrtc truncates long kernel identifiers passed via -D. Put the name in the source.
   const auto source = concat_strings("#define NVTE_GG_KERNEL_NAME ", symbol, "\n",
                                      string_code_gemm_rtc_cutlass_grouped_gemm_cu);
-  const auto dump_dir = getenv<std::string>("NVTE_CUTLASS_RTC_DUMP_CUBIN_DIR");
-  if (!dump_dir.empty()) std::ofstream(dump_dir + "/" + symbol + ".cu") << source;
-
   nvrtcProgram program{};
   NVTE_CHECK_NVRTC(nvrtcCreateProgram(&program, source.c_str(), "cutlass_grouped_gemm_rtc.cu", 0,
                                       nullptr, nullptr));
@@ -271,9 +270,6 @@ std::string compile_cubin(const std::string& symbol, const std::vector<std::stri
   NVTE_CHECK_NVRTC(nvrtcGetCUBINSize(program, &size));
   std::string cubin(size, '\0');
   NVTE_CHECK_NVRTC(nvrtcGetCUBIN(program, cubin.data()));
-  if (!dump_dir.empty()) {
-    std::ofstream(dump_dir + "/" + symbol + ".cubin", std::ios::binary).write(cubin.data(), size);
-  }
   return cubin;
 }
 }  // namespace
@@ -291,56 +287,39 @@ CompiledKernel::CompiledKernel(int device, const std::string& symbol, std::strin
   }
 }
 
-std::shared_ptr<const CompiledKernel> get_or_compile(int device, const KernelConfig& kernel,
-                                                     const TileConfig& tile, int host_smem) {
-  const bool line_info = getenv<bool>("NVTE_GG_RTC_LINEINFO", false);
-  const bool disable_cache = getenv<bool>("NVTE_GG_DISABLE_RTC_CACHE", false);
+const CompiledKernel& get_or_compile(int device, const KernelConfig& kernel, const TileConfig& tile,
+                                     int host_smem) {
   const auto key =
       std::make_tuple(device, kernel.sm_arch, kernel.trans_a, kernel.trans_b, kernel.input_dtype,
                       kernel.output_dtype, kernel.grouped_tensor, tile.tile_m, tile.tile_n,
-                      tile.tile_k, tile.stages, tile.n_expand, line_info);
-  static std::map<std::decay_t<decltype(key)>, std::shared_ptr<const CompiledKernel>> cache;
+                      tile.tile_k, tile.stages, tile.n_expand);
+  static std::map<std::decay_t<decltype(key)>, CompiledKernel> cache;
   static std::mutex cache_mutex;
-  auto lookup = [&]() -> std::shared_ptr<const CompiledKernel> {
-    if (disable_cache) return {};
+  auto lookup = [&]() -> const CompiledKernel* {
     std::lock_guard<std::mutex> lock(cache_mutex);
     auto it = cache.find(key);
-    return it == cache.end() ? nullptr : it->second;
+    return it == cache.end() ? nullptr : &it->second;
   };
-  if (auto cached = lookup()) return cached;
+  if (const auto* cached = lookup()) return *cached;
 
   // Serialize NVRTC and disk writes. Warm launches only take the map lock.
   static std::mutex compile_mutex;
   std::lock_guard<std::mutex> compiling(compile_mutex);
-  if (auto cached = lookup()) return cached;
+  if (const auto* cached = lookup()) return *cached;
 
   const auto symbol = kernel_symbol(kernel, tile);
-  std::string cubin;
-  std::filesystem::path cache_miss;
-  if (const auto dir = getenv<std::string>("NVTE_GG_RTC_LOAD_CUBIN_DIR"); !dir.empty()) {
-    cubin = read_cubin(std::filesystem::path(dir) / (symbol + ".cubin"));
-  }
-  if (cubin.empty()) {
-    const auto options = compiler_options(kernel, tile, line_info);
-    if (!disable_cache) {
-      auto disk_key = symbol + "|" + get_rtc_source_digest();
-      for (const auto& option : options) disk_key += "|" + option;
-      auto path = get_rtc_cache_path(disk_key);
-      if (!path.empty()) cubin = read_cubin(path);
-      if (cubin.empty()) cache_miss = std::move(path);
-    }
-    if (cubin.empty()) {
-      if (verbose_tile_debug()) NVTE_WARN("Compiling RTC grouped GEMM kernel ", symbol);
-      cubin = compile_cubin(symbol, options);
-    }
-  }
-  auto compiled = std::make_shared<CompiledKernel>(device, symbol, cubin, host_smem);
-  if (!cache_miss.empty()) save_cached_cubin(cache_miss, cubin);
-  if (!disable_cache) {
-    std::lock_guard<std::mutex> lock(cache_mutex);
-    cache.emplace(key, compiled);
-  }
-  return compiled;
+  static const bool line_info = getenv<bool>("NVTE_GG_RTC_LINEINFO", false);
+  const auto options = compiler_options(kernel, tile, line_info);
+  auto disk_key = symbol + "|" + get_rtc_source_digest();
+  for (const auto& option : options) disk_key += "|" + option;
+  const auto path = get_rtc_cache_path(disk_key);
+  auto cubin = path.empty() ? std::string{} : read_cubin(path);
+  const bool cache_miss = cubin.empty();
+  if (cache_miss) cubin = compile_cubin(symbol, options);
+  CompiledKernel compiled(device, symbol, cubin, host_smem);
+  if (cache_miss && !path.empty()) save_cached_cubin(path, cubin);
+  std::lock_guard<std::mutex> lock(cache_mutex);
+  return cache.emplace(key, std::move(compiled)).first->second;
 }
 
 }  // namespace transformer_engine::grouped_gemm_rtc

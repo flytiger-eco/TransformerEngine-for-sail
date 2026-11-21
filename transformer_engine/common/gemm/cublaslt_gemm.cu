@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -1002,20 +1003,21 @@ void multi_stream_cublas_gemm(const NVTETensor *A, const NVTETensor *B, NVTETens
 
   for (int i = 0; i < num_gemms; i++) {
     // Check whether GELU or dGELU epilogue is requested
-    Tensor *pre_gelu_tensor = convertNVTETensor(pre_gelu_out[i]);
+    const auto aux = pre_gelu_out ? pre_gelu_out[i] : nullptr;
+    Tensor *pre_gelu_tensor = convertNVTETensor(aux);
     bool with_gelu_dgelu_epilogue =
         (pre_gelu_tensor != nullptr && pre_gelu_tensor->data.dptr != nullptr);
 
     // Construct config
     MatmulConfig config;
     if (grad) {
-      config.dbias_tensor = bias[i];
+      config.dbias_tensor = bias ? bias[i] : nullptr;
       config.with_dgelu_epilogue = with_gelu_dgelu_epilogue;
     } else {
-      config.bias_tensor = bias[i];
+      config.bias_tensor = bias ? bias[i] : nullptr;
       config.with_gelu_epilogue = with_gelu_dgelu_epilogue;
     }
-    config.epilogue_aux_tensor = pre_gelu_out[i];
+    config.epilogue_aux_tensor = aux;
     config.use_split_accumulator = use_split_accumulator;
     config.sm_count = math_sm_count;
 
@@ -1080,11 +1082,14 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   const int arch = transformer_engine::cuda::sm_arch(current_device);
   const bool is_ppu = arch == 80 || arch == 89;
   const bool is_hopper = arch == 90;
-  const bool use_cutlass = transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM", false);
+  const int use_cutlass = transformer_engine::getenv<int>("NVTE_USE_CUTLASS_GROUPED_GEMM", -1);
   const bool use_cutlass_rtc =
       transformer_engine::getenv<bool>("NVTE_USE_CUTLASS_GROUPED_GEMM_RTC", true);
-  const bool sm80_disable_alignment_check =
-      is_ppu && transformer_engine::getenv<bool>("NVTE_DISABLE_ALIGNMENT_CHECK", true);
+#ifdef __HGGCCC__
+  const bool auto_rtc = arch == 89 && num_gemms > 1 && use_cutlass_rtc;
+#else
+  const bool auto_rtc = false;
+#endif
   const bool warn_fallback =
       transformer_engine::getenv<bool>("NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", false);
 
@@ -1128,7 +1133,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
                              workspace, accumulate, use_split_accumulator, math_sm_count, stream);
   };
 
-  if (!use_cutlass || !(is_ppu || is_hopper)) {
+  if (use_cutlass == 0 || (use_cutlass < 0 && !auto_rtc) || !(is_ppu || is_hopper)) {
     run_cublas();
     return;
   }
@@ -1136,7 +1141,8 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   auto is_empty_arr = [&](const NVTETensor *p) -> bool {
     if (p == nullptr) return true;
     for (int i = 0; i < num_gemms; ++i) {
-      if (transformer_engine::convertNVTETensor(p[i])->has_data()) return false;
+      const auto* tensor = transformer_engine::convertNVTETensor(p[i]);
+      if (tensor && tensor->has_data()) return false;
     }
     return true;
   };
@@ -1145,7 +1151,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
   const auto input_dtype = convertNVTETensorCheck(A[0])->data.dtype;
   const auto output_dtype = convertNVTETensorCheck(D[0])->data.dtype;
   const bool fp32_output = output_dtype == DType::kFloat32;
-  auto cutlass_compatible = [&] {
+  auto should_use_cutlass = [&] {
     if ((input_dtype != DType::kBFloat16 && input_dtype != DType::kFloat16) ||
         (!fp32_output && output_dtype != input_dtype) || !is_empty_arr(bias) ||
         !is_empty_arr(pre_gelu_out))
@@ -1153,33 +1159,46 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
 
     // All CUTLASS groups share one specialization and vectorized row accesses.
     // The TMA backend also needs a common K divisible by 128.
+    auto aligned_matrix = [](const SimpleTensor& t) {
+      return t.shape.size() == 2 && t.shape[0] <= std::numeric_limits<int>::max() &&
+             t.shape[1] <= std::numeric_limits<int>::max() && t.shape[1] % 8 == 0 &&
+             (t.dptr || t.shape[0] == 0 || t.shape[1] == 0) &&
+             reinterpret_cast<uintptr_t>(t.dptr) % 16 == 0;
+    };
     size_t first_k = 0;
+    double tiles = 0, squared_tiles = 0;
     for (int i = 0; i < num_gemms; ++i) {
       const auto &a = convertNVTETensorCheck(A[i])->data;
       const auto &b = convertNVTETensorCheck(B[i])->data;
       const auto &d = convertNVTETensorCheck(D[i])->data;
       if (a.dtype != input_dtype || b.dtype != input_dtype || d.dtype != output_dtype ||
-          a.shape.size() != 2 || b.shape.size() != 2 || d.shape.size() != 2 || a.shape.back() % 8 ||
-          b.shape.back() % 8 || d.shape.back() % 8)
+          !aligned_matrix(a) || !aligned_matrix(b) || !aligned_matrix(d))
         return false;
-      if (!sm80_disable_alignment_check) {
+      if (use_cutlass < 0) {
+        const double output_tiles = double((d.shape[0] + 255) / 256) * ((d.shape[1] + 255) / 256);
+        tiles += output_tiles;
+        squared_tiles += output_tiles * output_tiles;
+      }
+      if (is_hopper) {
         const auto k = b.shape[transb ? 0 : 1];
         if (k % 128 || (i && k != first_k)) return false;
         first_k = k;
       }
     }
-    return true;
+    // One persistent launch amortizes small experts. On PPU SM89, multi-stream
+    // cuBLAS wins once large experts dominate. Weight each expert by its number
+    // of 256x256 output tiles so a long tail of small experts cannot hide it.
+    // A handful of experts amortizes less launch overhead than a full batch.
+    const int max_tiles_per_expert = 8 * std::min(num_gemms, 8);
+    return use_cutlass >= 0 || (tiles > 0 && squared_tiles <= max_tiles_per_expert * tiles);
   };
 
-  if (!cutlass_compatible()) {
+  if (!should_use_cutlass()) {
     if (warn_fallback) NVTE_WARN("Fallback to cuBLAS grouped GEMM.");
     run_cublas();
     return;
   }
-  // FP32 wgrad accumulation remains opt-in. Static CUTLASS has no FP32 destination.
-  const bool rtc_handles_accum =
-      !fp32_output || !accumulate || getenv<bool>("NVTE_GG_ALLOW_FP32_ACCUM", false);
-  if (use_cutlass_rtc && is_ppu && rtc_handles_accum) {
+  if (use_cutlass_rtc && is_ppu) {
     if (cutlass_grouped_gemm_rtc(A, B, D, num_gemms, transa, transb, workspace, accumulate,
                                  current_device, math_sm_count, stream))
       return;

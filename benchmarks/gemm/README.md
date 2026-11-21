@@ -29,9 +29,8 @@ cmake --build build/cmake -j16 --target transformer_engine
 cp build/cmake/libtransformer_engine.so .
 ```
 
-- The RTC arm needs `NVTE_USE_CUTLASS_GROUPED_GEMM=1`. Without it the launch
-  **silently falls back** to the cuBLAS per-group path and the tag's op field
-  becomes `GroupedGemmCublas` -- the first signal telling the arms apart.
+- PPU SM89 selects the backend automatically. To reproduce a particular arm,
+  replay pins CUTLASS or cuBLAS for the recorded layout and checks the emitted tag.
 
 ## 2. Environment Switches (export before the process starts)
 

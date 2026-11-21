@@ -59,10 +59,10 @@ env:
     pytest -v -s $TE_PATH/tests/pytorch/debug/test_sanity.py --feature_dirs=$NVTE_TEST_NVINSPECT_FEATURE_DIRS || FAILED_CASES="$FAILED_CASES debug/test_sanity.py"
     pytest -v -s $TE_PATH/tests/pytorch/debug/test_config.py --feature_dirs=$NVTE_TEST_NVINSPECT_FEATURE_DIRS || FAILED_CASES="$FAILED_CASES debug/test_config.py"
 
-    NVTE_GROUPED_LINEAR_SINGLE_PARAM=1 python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_sanity.py || FAILED_CASES="$FAILED_CASES test_sanity.py"
+    python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_sanity.py || FAILED_CASES="$FAILED_CASES test_sanity.py"
     python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_recipe.py || FAILED_CASES="$FAILED_CASES test_recipe.py"
     python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_jit.py || FAILED_CASES="$FAILED_CASES test_jit.py"
-    NVTE_GROUPED_LINEAR_SINGLE_PARAM=1 python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_grouped_tensor.py || FAILED_CASES="$FAILED_CASES test_grouped_tensor.py"
+    python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/test_grouped_tensor.py || FAILED_CASES="$FAILED_CASES test_grouped_tensor.py"
     python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/attention/test_attention.py || FAILED_CASES="$FAILED_CASES test_attention.py"
     NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 python3 -m pytest --tb=auto $TE_PATH/tests/pytorch/attention/test_attention.py || FAILED_CASES="$FAILED_CASES NVTE_ALLOW_NONDETERMINISTIC_ALGO=0/test_attention.py"
 

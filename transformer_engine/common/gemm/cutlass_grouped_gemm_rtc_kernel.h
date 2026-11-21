@@ -6,10 +6,7 @@
 
 #pragma once
 
-#include <memory>
-
 #include "../util/rtc.h"
-#include "../util/system.h"
 
 namespace transformer_engine::grouped_gemm_rtc {
 
@@ -22,7 +19,7 @@ struct KernelConfig {
   bool grouped_tensor;
 };
 
-// Keep the module alive through launch, including when caching is disabled.
+// The process-wide cache owns each module for the lifetime of its CUDA function.
 struct CompiledKernel {
   rtc::Kernel module;
   CUfunction function;
@@ -31,12 +28,7 @@ struct CompiledKernel {
   CompiledKernel(int device, const std::string& symbol, std::string cubin, int host_smem);
 };
 
-std::shared_ptr<const CompiledKernel> get_or_compile(int device, const KernelConfig& kernel,
-                                                     const TileConfig& tile, int host_smem);
-
-inline bool verbose_tile_debug() {
-  static const bool verbose = getenv<bool>("NVTE_CUTLASS_GROUPED_GEMM_RTC_VERBOSE", false);
-  return verbose;
-}
+const CompiledKernel& get_or_compile(int device, const KernelConfig& kernel, const TileConfig& tile,
+                                     int host_smem);
 
 }  // namespace transformer_engine::grouped_gemm_rtc

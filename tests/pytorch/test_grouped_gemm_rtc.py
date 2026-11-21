@@ -61,10 +61,80 @@ def _rtc_env(monkeypatch):
     monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "1")
     monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM_RTC", "1")
     monkeypatch.setenv("NVTE_FORCE_RTC_NO_FALLBACK", "1")
-    monkeypatch.setenv("NVTE_GG_ALLOW_FP32_ACCUM", "1")
     monkeypatch.setenv("NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", "1")
     yield
     torch.cuda.synchronize()
+
+
+@pytest.fixture
+def auto_backend(_rtc_env, monkeypatch):
+    for name in (
+        "NVTE_USE_CUTLASS_GROUPED_GEMM",
+        "NVTE_USE_CUTLASS_GROUPED_GEMM_RTC",
+        "NVTE_FORCE_RTC_NO_FALLBACK",
+        "NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize(
+    "rows,columns,offset_operand,output_dtype,expect_rtc",
+    [
+        ([64, 96], 128, None, torch.float32, True),
+        ([64], 128, None, torch.bfloat16, False),
+        ([1536, 1536], 1024, None, torch.bfloat16, False),
+        ([2304, 2304], 2048, None, torch.bfloat16, False),
+        ([64, 64, 64, 4096], 2048, None, torch.bfloat16, False),
+        *[([64, 96], 128, operand, torch.bfloat16, False) for operand in ("a", "b", "d")],
+    ],
+)
+def test_grouped_gemm_auto_backend(auto_backend, rows, columns, offset_operand, output_dtype,
+                                   expect_rtc):
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Automatic RTC dispatch targets PPU SM89")
+    k = 64
+
+    def matrix(name, shape, value, dtype=torch.bfloat16):
+        offset = int(name == offset_operand)
+        storage = torch.full((shape[0] * shape[1] + offset,), value, device="cuda", dtype=dtype)
+        return storage[offset:].view(shape)
+
+    a = [matrix("a", (columns, k), 1) for _ in rows]
+    b = [matrix("b", (m, k), i + 1) for i, m in enumerate(rows)]
+    out = [matrix("d", (m, columns), -1, output_dtype) for m in rows]
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        general_grouped_gemm(a, b, out, [None] * len(rows), output_dtype, layout="TN",
+                             m_splits=rows, accumulate=True)
+        torch.cuda.synchronize()
+    kernels = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    assert kernels
+    assert any(name.startswith("nvte_grouped_gemm3_") for name in kernels) == expect_rtc
+    for i, result in enumerate(out):
+        assert torch.all(result == (i + 1) * k - 1)
+
+
+def test_grouped_gemm_auto_graph_capture(auto_backend, monkeypatch):
+    a = [torch.ones((128, 64), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    rows = [64, 96]
+    b = [a[0].new_ones((m, 64)) for m in rows]
+    out = [a[0].new_empty((m, 128)) for m in rows]
+
+    def gemm():
+        general_grouped_gemm(a, b, out, [None, None], torch.bfloat16, layout="TN", m_splits=rows)
+
+    # Initialize the cuBLAS handles and side streams before capture.
+    with monkeypatch.context() as env:
+        env.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "0")
+        gemm()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gemm()
+    for value in (2, -1):
+        for matrix in b:
+            matrix.fill_(value)
+        graph.replay()
+        for result in out:
+            assert torch.all(result == value * 64)
 
 
 def test_grouped_workspace_stream_cache(monkeypatch):
@@ -460,7 +530,6 @@ def test_grouped_linear_rtc_nonuniform_m(splits, in_features, out_features):
 def test_grouped_linear_rtc_packed_weight(implementation, k, n, monkeypatch):
     if torch.cuda.get_device_capability() != (8, 9):
         pytest.skip("Packed BF16 RTC requires PPU sm89")
-    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
     torch.manual_seed(57)
     splits = [257, 128, 64]
     aligned = k % 8 == 0 and n % 8 == 0

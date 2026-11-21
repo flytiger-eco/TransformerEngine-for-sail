@@ -10,7 +10,6 @@
 #include <climits>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -110,15 +109,11 @@ constexpr TunedTileEntry kTunedTiles[] = {
 inline TileConfig select_grouped_tile(int m, int n, int k, int groups, bool transa, bool transb,
                                       int sm_arch, int sms) {
   if (forced_tile()) return *forced_tile();
-  static const bool use_tuned = !getenv<bool>("NVTE_GG_NO_TUNED_TILE_OVERRIDES", false);
-  static const bool nn_bk128 = !getenv<bool>("NVTE_GG_NO_NN_BK128", false);
-  if (use_tuned) {
-    for (const auto& entry : kTunedTiles) {
-      if (entry.sm_arch == sm_arch && entry.trans_a == transa && entry.trans_b == transb &&
-          m >= entry.m_lo && m <= entry.m_hi && n >= entry.n_lo && n <= entry.n_hi &&
-          k >= entry.k_lo && k <= entry.k_hi)
-        return entry.tile;
-    }
+  for (const auto& entry : kTunedTiles) {
+    if (entry.sm_arch == sm_arch && entry.trans_a == transa && entry.trans_b == transb &&
+        m >= entry.m_lo && m <= entry.m_hi && n >= entry.n_lo && n <= entry.n_hi &&
+        k >= entry.k_lo && k <= entry.k_hi)
+      return entry.tile;
   }
   if (m > 0 && m <= 160) return {128, n <= 512 ? 256 : 128, 64, 2};
 
@@ -126,11 +121,7 @@ inline TileConfig select_grouped_tile(int m, int n, int k, int groups, bool tran
   if (m > 0 && n > 0 && k > 0) {
     // Score persistent waves across all experts. For row-major B, narrowing BN
     // reduces contiguous load width. Equal costs prefer the wider tile.
-    static const double ratio = [] {
-      const char* env = std::getenv("DG_TILE_COST_RATIO");
-      const double value = env ? std::atof(env) : 0;
-      return value > 0 ? value : 96.0;
-    }();
+    constexpr double kComputeToMemoryRatio = 96.0;
     constexpr std::pair<int, int> candidates[] = {
         {256, 256}, {256, 128}, {128, 128}, {256, 64}, {128, 64}};
     double best_cost = std::numeric_limits<double>::infinity();
@@ -140,14 +131,14 @@ inline TileConfig select_grouped_tile(int m, int n, int k, int groups, bool tran
       const int64_t waves = (blocks + sms - 1) / sms;
       const double live_m = std::min(bm, m);
       const double b_extent = transa ? bn : 256;
-      const double cost = waves * std::max(live_m * bn / ratio, live_m + b_extent);
+      const double cost = waves * std::max(live_m * bn / kComputeToMemoryRatio, live_m + b_extent);
       if (cost < best_cost) {
         best_cost = cost;
         best = {bm, bn, 64, bm == 256 && bn == 256 ? 3 : 0};
       }
     }
   }
-  if (!transa && !transb && nn_bk128 && best.tile_m == 256 && best.tile_n == 256) {
+  if (!transa && !transb && best.tile_m == 256 && best.tile_n == 256) {
     return {256, 256, 128, 2};
   }
   return best;

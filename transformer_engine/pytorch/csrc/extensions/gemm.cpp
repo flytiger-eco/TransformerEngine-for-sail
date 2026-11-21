@@ -8,9 +8,7 @@
 
 #include <climits>
 #include <cstdint>
-#include <cstdlib>
 #include <optional>
-#include <string>
 
 #include "../extensions.h"
 #include "common/common.h"
@@ -52,16 +50,6 @@ struct GroupedGemmHostScratch {
     quantized.resize(count);
   }
 };
-
-// Off switch for the descriptor cache, used to A/B the host cost of building
-// every NVTETensor from scratch.
-inline bool reuse_grouped_descriptors() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("NVTE_GG_REUSE_DESCRIPTORS");
-    return value == nullptr || std::string(value) != "0";
-  }();
-  return enabled;
-}
 
 // True for ordinary torch tensors, including nn.Parameter. Quantized tensor
 // subclasses are excluded: their descriptors carry per-call scale pointers.
@@ -555,10 +543,9 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
   size_t output_offset = 0;
   static thread_local GroupedGemmHostScratch scratch;
   scratch.resize(A.size());
-  const bool reuse = reuse_grouped_descriptors();
-  auto set_dense = [&](TensorWrapper& desc, void* ptr, DType type, const NVTEShape& shape,
+  auto set_dense = [](TensorWrapper& desc, void* ptr, DType type, const NVTEShape& shape,
                        bool was_quantized = false) {
-    if (reuse && !was_quantized) {
+    if (!was_quantized) {
       desc.set_rowwise_data(ptr, type, shape);
     } else {
       desc = TensorWrapper(ptr, shape, type);

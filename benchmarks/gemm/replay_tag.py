@@ -340,14 +340,8 @@ def main():
 
     # Env vars must exist before the C++ side reads them (first launch config).
     os.environ["PPU_LIB_SHOW_PARAMS"] = "1"  # echo the live tag for diffing
-    # Set both routing switches explicitly per operation. Relying on the RTC
-    # tag alone lets an inherited environment replay a cuBLAS capture through
-    # CUTLASS (or a PPU/static capture through RTC), so the echoed tag would
-    # not describe the requested backend.
+    # Pin the recorded backend even when automatic dispatch would choose another.
     if op == "GroupedGemmRtc":
-        # RTC is opt-in on both levels: without these the launch silently falls
-        # back to the static CUTLASS arm or cuBLAS and the echoed tag shows a
-        # different op.
         os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"] = "1"
         os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM_RTC"] = "1"
     elif op == "GroupedGemmPpu":
