@@ -17,7 +17,7 @@ struct KernelConfig {
   bool trans_a, trans_b;  // CUTLASS layouts, after the TE operand swap.
   DType input_dtype, output_dtype;
   bool grouped_tensor;
-  int common_n = 0, common_k = 0;  // Nonzero for a list with specialized weight dimensions.
+  int common_n = 0, common_k = 0;  // Nonzero when every expert shares these weight dimensions.
 };
 
 // The process-wide cache owns each module for the lifetime of its CUDA function.

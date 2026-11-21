@@ -158,4 +158,19 @@ inline void select_n_expand(TileConfig& cfg, uint64_t tiles, int sms) {
   }
 }
 
+// Specialize shared N/K when full-width output tiles can fill the device.
+// Short aligned reductions profit from the four-column pipeline. For row-major
+// B, deeper reductions amortize a separate loop per output tile.
+inline bool select_common_shape(TileConfig& tile, bool trans_b, int64_t sum_m, int n, int k,
+                                int sms) {
+  constexpr int bm = kDefaultTile.tile_m, bn = kDefaultTile.tile_n, bk = kDefaultTile.tile_k;
+  if ((tile.n_expand && (trans_b || k < 16 * bk)) || n <= 0 || n % bn != 0 ||
+      k < kDefaultTile.stages * bk || k > 32 * bk || k % bk != 0 ||
+      tile.tile_m != bm || tile.tile_n != bn || sum_m / bm < 1 + (sms - 1) / (n / bn) ||
+      (forced_tile() && !tile.matches(bm, bn, bk, kDefaultTile.stages)))
+    return false;
+  tile = kDefaultTile;
+  return true;
+}
+
 }  // namespace transformer_engine::grouped_gemm_rtc

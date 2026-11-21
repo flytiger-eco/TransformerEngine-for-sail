@@ -259,7 +259,7 @@ constexpr std::pair<int, int> native_launch_geometry() {
 }
 
 template <bool TA, bool TB, bool FP32>
-void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream,
+void launch_native(NativeSetup setup, TileConfig cfg, int64_t sum_m, cudaStream_t stream,
                    const DiscreteOperands& lists, NVTETensor workspace) {
   if (cfg.stages == 0) cfg.stages = cfg.tile_m == 128 && cfg.tile_n == 128 ? 2 : 3;
   auto geometry = [&]() -> std::pair<int, int> {
@@ -270,10 +270,18 @@ void launch_native(NativeSetup setup, TileConfig cfg, cudaStream_t stream,
     cfg = {256, 128, 64, 3};
     return native_launch_geometry<TA, TB, FP32, 256, 128, 64, 3>();
   };
+  KernelConfig config{89, TA, TB, DType::kBFloat16, FP32 ? DType::kFloat32 : DType::kBFloat16,
+                      true};
+  if (!FP32 && setup.b.base && !setup.b.first && !setup.b.last) {
+    const int n = TB ? setup.b.common_first : setup.b.common_last;
+    const int k = TB ? setup.b.common_last : setup.b.common_first;
+    if (select_common_shape(cfg, TB, sum_m, n, k, setup.sms)) {
+      config.common_n = n;
+      config.common_k = k;
+    }
+  }
   const auto [threads, smem] = geometry();
-  const auto& kernel = get_or_compile(
-      cuda::current_device(),
-      {89, TA, TB, DType::kBFloat16, FP32 ? DType::kFloat32 : DType::kBFloat16, true}, cfg, smem);
+  const auto& kernel = get_or_compile(cuda::current_device(), config, cfg, smem);
   setup.tile_m_shift = cutlass::find_log2(cfg.tile_m);
   setup.tile_n_shift = cutlass::find_log2(cfg.tile_n);
   setup.ne4 = cfg.n_expand;
@@ -508,16 +516,17 @@ bool try_native_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGr
   if (!transb && ne4_shape(m, n, k)) {
     select_n_expand(chosen, uint64_t(groups) * (m / 256) * (n / 1024), setup.sms);
   }
+  const int64_t estimated_rows = int64_t(m) * int64_t(groups);
   auto layout = [&](auto fp32) {
     if (transb)
-      launch_native<true, false, decltype(fp32)::value>(setup, chosen, stream, lists,
-                                                        workspace_setup);
+      launch_native<true, false, decltype(fp32)::value>(setup, chosen, estimated_rows, stream,
+                                                        lists, workspace_setup);
     else if (transa)
-      launch_native<false, true, decltype(fp32)::value>(setup, chosen, stream, lists,
-                                                        workspace_setup);
+      launch_native<false, true, decltype(fp32)::value>(setup, chosen, estimated_rows, stream,
+                                                        lists, workspace_setup);
     else
-      launch_native<false, false, decltype(fp32)::value>(setup, chosen, stream, lists,
-                                                         workspace_setup);
+      launch_native<false, false, decltype(fp32)::value>(setup, chosen, estimated_rows, stream,
+                                                         lists, workspace_setup);
   };
   if (output_dtype == DType::kFloat32)
     layout(std::true_type{});

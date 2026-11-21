@@ -25,7 +25,7 @@ struct NativeParams {
 
 // Each work item belongs to exactly one expert. A four-column item only
 // drains its A/B pipeline after the fourth output tile has been written.
-template <class Mainloop, class Epilogue, bool EnableNExpand>
+template <class Mainloop, class Epilogue, bool EnableNExpand, int CommonN = 0, int CommonK = 0>
 struct NvteNativeGrouped {
   using Params = NativeParams;
   using TileShape = typename Mainloop::TileShape;
@@ -81,7 +81,12 @@ struct NvteNativeGrouped {
     __syncthreads();
   }
 
-  CUTLASS_DEVICE static void run_tile(const NativeExpert& e, int mi, int ni, char* smem) {
+  CUTLASS_DEVICE static void run_tile(const NativeExpert& expert, int mi, int ni, char* smem) {
+    NativeExpert e = expert;
+    if constexpr (CommonK != 0) {
+      e.n = CommonN;
+      e.k = CommonK;
+    }
     using namespace cute;
     if constexpr (EnableNExpand) {
       if (e.columns == 4) {
@@ -157,7 +162,24 @@ struct NvteNativeGrouped {
       }
       return;
     }
-    uint64_t work = p.control->work, per_group = p.control->per_group;
+    const uint64_t work = p.control->work;
+    if constexpr (CommonK != 0) {
+      // Process each expert's tile range before loading the next descriptor.
+      // Empty experts have identical consecutive end offsets.
+      static_assert(!EnableNExpand && CommonN % BN == 0);
+      constexpr int ntiles = CommonN / BN;
+      uint64_t id = blockIdx.x, start = 0;
+      for (unsigned group = 0; id < work; ++group) {
+        const auto e = p.experts[group];
+        for (; id < e.end; id += gridDim.x) {
+          const uint64_t local = id - start;
+          run_tile(e, int(local / ntiles), int(local % ntiles), smem);
+        }
+        start = e.end;
+      }
+      return;
+    }
+    const uint64_t per_group = p.control->per_group;
     uint64_t group = 0, start = 0;
     for (uint64_t id = blockIdx.x; id < work; id += gridDim.x) {
       if (per_group) {

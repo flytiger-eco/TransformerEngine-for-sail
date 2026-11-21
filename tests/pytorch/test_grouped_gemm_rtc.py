@@ -796,6 +796,36 @@ def _expert_views(storage, shapes):
     return views
 
 
+def test_grouped_tensor_common_shape_device_scalars(auto_backend):
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Native GroupedTensor requires PPU sm89")
+    rows = [0, 777, 513, 1023] * 4
+    n, k = 2048, 512
+    weights, inputs, outputs = [(n, k)] * len(rows), [(m, k) for m in rows], [(m, n) for m in rows]
+    a, b, d = [_packed_storage(shapes, torch.bfloat16, mirror=True)
+               for shapes in (weights, inputs, outputs)]
+    dv = _expert_views(d, outputs)
+    products = [x.float() @ w.float().T for x, w in
+                zip(_expert_views(b, inputs), _expert_views(a, weights))]
+    alpha, beta = torch.ones((), device="cuda"), torch.zeros((), device="cuda")
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        gemm_ext.general_grouped_gemm_for_grouped_tensor(a, b, d, alpha=alpha, beta=beta)
+        torch.cuda.synchronize()
+    kernels = [e.name for e in prof.events() if e.name.startswith("nvte_grouped_gemm3_")
+               and e.device_type == torch.autograd.DeviceType.CUDA]
+    assert len(kernels) == 1 and kernels[0].endswith(f"_grouped_tensor_n{n}k{k}")
+    for out, ref in zip(dv, products):
+        torch.testing.assert_close(out.float(), ref, rtol=0.005, atol=0.01)
+
+    previous = [out.clone() for out in dv]
+    alpha.fill_(0.5)
+    beta.fill_(-0.25)
+    gemm_ext.general_grouped_gemm_for_grouped_tensor(a, b, d, alpha=alpha, beta=beta)
+    for out, product, old in zip(dv, products, previous):
+        torch.testing.assert_close(out.float(), 0.5 * product - 0.25 * old.float(),
+                                   rtol=0.005, atol=0.01)
+
+
 @pytest.mark.parametrize("path", ["list", "discrete_in", "discrete_out"])
 def test_shared_workspace_concurrent_submissions(path, monkeypatch):
     if path != "list" and torch.cuda.get_device_capability() != (8, 9):

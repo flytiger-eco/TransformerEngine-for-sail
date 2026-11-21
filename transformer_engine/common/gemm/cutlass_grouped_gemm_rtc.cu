@@ -235,16 +235,8 @@ struct ListGemm {
                                kernel.trans_b, kernel.trans_a, kernel.sm_arch, sms);
     if (ne4) select_n_expand(tile, expanded, sms);
 
-    // Specialize shared N/K only when full-width tiles can fill the device.
-    // Short aligned reductions profit from the four-column pipeline. For
-    // row-major B, deeper reductions amortize a separate loop per output tile.
     const int n = cute::get<1>(h.shapes[0]), k = cute::get<2>(h.shapes[0]);
-    const bool prefer_expanded = tile.n_expand && (kernel.trans_b || k < 16 * 64);
-    if (!prefer_expanded && shared_weights_shape && n > 0 && n % 256 == 0 &&
-        k >= 3 * 64 && k <= 32 * 64 && k % 64 == 0 &&
-        tile.tile_m == 256 && tile.tile_n == 256 && (sum_m / 256) * (n / 256) >= sms &&
-        (!forced_tile() || tile.matches(256, 256, 64, 3))) {
-      tile = kDefaultTile;
+    if (shared_weights_shape && select_common_shape(tile, kernel.trans_b, sum_m, n, k, sms)) {
       kernel.common_n = n;
       kernel.common_k = k;
     }
