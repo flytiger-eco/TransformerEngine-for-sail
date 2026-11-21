@@ -8,11 +8,10 @@
 
 #include <climits>
 #include <cstdint>
-#include <cstdlib>
 #include <optional>
-#include <string>
 
 #include "../extensions.h"
+#include "common/common.h"
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
 #include "pybind.h"
@@ -31,129 +30,26 @@ size_t get_size(transformer_engine::pytorch::MaybeTensor tensor, int dim) {
   return 0;
 }
 
-// Reusable host-side storage for the per-expert GEMM descriptors. Rebuilding
-// every NVTETensor on every launch costs about a microsecond per expert, so
-// keep the objects and the arrays handed to nvte_multi_tensor_gemm alive in
-// thread-local storage. A plain torch tensor only needs its data pointer
-// refreshed when the caller passes a different tensor object; quantized
-// tensors embed scale/amax pointers that may change per call, so they are
-// rebuilt on every launch.
+// Dense operands only need their rowwise descriptor. After a quantized operand,
+// replace the wrapper as well so its scale and columnwise state cannot leak.
 struct GroupedGemmHostScratch {
+  struct QuantizedInputs {
+    bool a = false, b = false;
+  };
   std::vector<transformer_engine::TensorWrapper> a, b, d;
   std::vector<NVTETensor> a_v, b_v, d_v;
-  // Identity of the torch tensor each slot was last built from.
-  std::vector<const void*> a_obj, b_obj;
-  std::vector<void*> a_ptr, b_ptr;
-  std::vector<int> a_dtype, b_dtype;
-  // Non-zero when the slot currently holds a quantized descriptor, which
-  // cannot be turned back into a plain one by refreshing the data pointer.
-  std::vector<uint8_t> a_quantized, b_quantized;
+  std::vector<QuantizedInputs> quantized;
 
-  void begin(size_t num_gemms) {
-    if (a.size() < num_gemms) {
-      a.resize(num_gemms);
-      b.resize(num_gemms);
-      d.resize(num_gemms);
-      a_quantized.resize(num_gemms, 0);
-      b_quantized.resize(num_gemms, 0);
-    }
-    if (a_v.capacity() < num_gemms) {
-      a_v.reserve(num_gemms);
-      b_v.reserve(num_gemms);
-      d_v.reserve(num_gemms);
-    }
-    a_v.clear();
-    b_v.clear();
-    d_v.clear();
-    if (a_obj.size() < num_gemms) {
-      a_obj.resize(num_gemms, nullptr);
-      b_obj.resize(num_gemms, nullptr);
-      a_ptr.resize(num_gemms, nullptr);
-      b_ptr.resize(num_gemms, nullptr);
-      a_dtype.resize(num_gemms, -1);
-      b_dtype.resize(num_gemms, -1);
-    }
-  }
-
-  void finish(size_t used) {
-    a.resize(used);
-    b.resize(used);
-    d.resize(used);
-    a_quantized.resize(used);
-    b_quantized.resize(used);
-    // Descriptors of the trimmed slots are gone, so their recorded identities
-    // must go too. Otherwise a later call that re-grows the arrays could see a
-    // matching tensor object, skip the refresh, and hand the kernel a
-    // default-constructed (empty) descriptor.
-    a_obj.resize(used);
-    b_obj.resize(used);
-    a_ptr.resize(used);
-    b_ptr.resize(used);
-    a_dtype.resize(used);
-    b_dtype.resize(used);
+  void resize(size_t count) {
+    a.resize(count);
+    b.resize(count);
+    d.resize(count);
+    a_v.resize(count);
+    b_v.resize(count);
+    d_v.resize(count);
+    quantized.resize(count);
   }
 };
-
-GroupedGemmHostScratch& grouped_gemm_host_scratch() {
-  static thread_local GroupedGemmHostScratch scratch;
-  return scratch;
-}
-
-inline NVTEShape make_nvte_shape(const size_t* dims, size_t ndim) {
-  NVTEShape shape;
-  shape.ndim = ndim;
-  for (size_t i = 0; i < ndim; ++i) {
-    shape.data[i] = dims[i];
-  }
-  return shape;
-}
-
-inline NVTEShape make_nvte_shape(at::IntArrayRef sizes) {
-  NVTEShape shape;
-  shape.ndim = static_cast<size_t>(sizes.size());
-  for (size_t i = 0; i < shape.ndim; ++i) {
-    shape.data[i] = static_cast<size_t>(sizes[i]);
-  }
-  return shape;
-}
-
-inline NVTEShape make_nvte_shape(const std::vector<size_t>& sizes) {
-  return make_nvte_shape(sizes.data(), sizes.size());
-}
-
-inline NVTEShape make_nvte_shape2(size_t d0, size_t d1) {
-  NVTEShape shape;
-  shape.ndim = 2;
-  shape.data[0] = d0;
-  shape.data[1] = d1;
-  return shape;
-}
-
-// The shape a cached descriptor was built with. Object address and data pointer
-// are not enough to identify a tensor: a view can be freed and a new view of the
-// same buffer handed out with a different shape, so the shape must be compared
-// too. Host-side only, no device query.
-inline bool shape_matches(const NVTEShape& cached, at::IntArrayRef sizes) {
-  if (cached.ndim != static_cast<size_t>(sizes.size())) {
-    return false;
-  }
-  for (size_t i = 0; i < cached.ndim; ++i) {
-    if (cached.data[i] != static_cast<size_t>(sizes[i])) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// Off switch for the descriptor cache, used to A/B the host cost of building
-// every NVTETensor from scratch.
-inline bool reuse_grouped_descriptors() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("NVTE_GG_REUSE_DESCRIPTORS");
-    return value == nullptr || std::string(value) != "0";
-  }();
-  return enabled;
-}
 
 // True for ordinary torch tensors, including nn.Parameter. Quantized tensor
 // subclasses are excluded: their descriptors carry per-call scale pointers.
@@ -192,10 +88,11 @@ bool is_low_precision(const DType type) {
   return type == DType::kFloat8E4M3 || type == DType::kFloat8E5M2;
 }
 
-std::vector<size_t> getGemmOutputShape(const NVTEShape& A_shape, const bool transa,
-                                       const NVTEShape& B_shape, const bool transb,
-                                       size_t tp_size = 1, size_t tp_dim = 0) {
+Shape getGemmOutputShape(const NVTEShape& A_shape, const bool transa, const NVTEShape& B_shape,
+                         const bool transb, size_t tp_size = 1, size_t tp_dim = 0) {
   // Flatten outer dims to get 2D matrices
+  NVTE_CHECK(A_shape.ndim >= 1, "Tensor A needs to have at least 1 dimension");
+  NVTE_CHECK(B_shape.ndim >= 1, "Tensor B needs to have at least 1 dimension");
   const auto [A0, A1] = get_2d_dims(A_shape);
   const auto [B0, B1] = get_2d_dims(B_shape);
 
@@ -203,45 +100,21 @@ std::vector<size_t> getGemmOutputShape(const NVTEShape& A_shape, const bool tran
   NVTE_CHECK((transa ? A1 : A0) == (transb ? B0 : B1), "Invalid matrix dimensions for GEMM (A=(",
              A0, ",", A1, "), transa=", transa, ", B=(", B0, ",", B1, "), transb=", transb, ")");
 
-  // Construct output dims
-  std::vector<size_t> ret;
-  if (transb) {
-    ret.emplace_back(B1);
-  } else if (tp_size == 1) {
-    // Unflatten B0
-    for (size_t i = 0; i < B_shape.ndim - 1; ++i) {
-      ret.emplace_back(B_shape.data[i]);
-    }
-  } else {
-    // Keep output tensor in 2D for comm+GEMM overlap
-    ret.emplace_back(B0);
-  }
-  if (transa) {
-    ret.emplace_back(A0);
-  } else {
-    ret.emplace_back(A1);
-  }
+  // Preserve B's leading dimensions unless transposition or comm overlap flattens them.
+  Shape ret = (transb || tp_size != 1) ? Shape{transb ? B1 : B0, 0} : Shape(B_shape);
+  ret.back() = transa ? A0 : A1;
 
   // Correct output dims for comm+GEMM overlap if needed
   if (tp_size > 1) {
     if (tp_dim == 0) {
       // Outer dim is sharded, comm+GEMM overlap would need to do all-gather
-      ret[0] *= tp_size;
+      ret.front() *= tp_size;
     } else {
       // Inner dim is sharded, comm+GEMM overlap would need to do reduce-scatter
-      ret[0] /= tp_size;
+      ret.front() /= tp_size;
     }
   }
   return ret;
-}
-
-bool checkGemmShape(const std::vector<size_t>& expected, const NVTEShape& actual,
-                    size_t tp_size = 1, size_t tp_dim = 0) {
-  if (expected.size() != actual.ndim) return false;
-  for (size_t i = 0; i < expected.size(); ++i) {
-    if (expected[i] != actual.data[i]) return false;
-  }
-  return true;
 }
 
 struct GroupedGemmConfig {
@@ -342,10 +215,8 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
   // Check tensor dimensions
   const auto& A_shape = A_tensor.shape();
   const auto& B_shape = B_tensor.shape();
-  const auto& D_shape =
-      detail::getGemmOutputShape(A_shape, transa, B_shape, transb, tp_size, tp_dim);
-  NVTE_CHECK(A_shape.ndim >= 1, "Tensor A needs to have at least 1 dimension");
-  NVTE_CHECK(B_shape.ndim >= 1, "Tensor B needs to have at least 1 dimension");
+  const std::vector<size_t> D_shape(
+      detail::getGemmOutputShape(A_shape, transa, B_shape, transb, tp_size, tp_dim));
 
   // Check scaling factors
   if (accumulate) {
@@ -367,9 +238,8 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
     std::tie(D_tensor, D) = createOutputTensor(D_shape, output_dtype, quantizer);
   } else {
     D_tensor = makeTransformerEngineTensor(D, quantizer);
-    NVTE_CHECK(detail::checkGemmShape(D_shape, D_tensor.shape()),
-               "GEMM output has invalid dims (expected ", std::to_string(D_shape), ", got ",
-               std::to_string(D_tensor.shape()), ")");
+    NVTE_CHECK(Shape(D_tensor.shape()) == D_shape, "GEMM output has invalid dims (expected ",
+               std::to_string(D_shape), ", got ", std::to_string(D_tensor.shape()), ")");
     if (out_dtype) {
       NVTE_CHECK(*out_dtype == D_tensor.dtype(), "GEMM output has invalid dtype (expected ",
                  static_cast<int>(*out_dtype), ", found ", static_cast<int>(D_tensor.dtype()), ")");
@@ -671,12 +541,28 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     }
   }
   size_t output_offset = 0;
-  // Descriptors and the NVTETensor arrays live in thread-local scratch, so a
-  // steady-state launch refreshes data pointers instead of rebuilding every
-  // expert's tensors, shapes and vector storage.
-  auto& scratch = grouped_gemm_host_scratch();
-  const bool reuse_descriptors = reuse_grouped_descriptors();
-  scratch.begin(A.size());
+  static thread_local GroupedGemmHostScratch scratch;
+  scratch.resize(A.size());
+  auto set_dense = [](TensorWrapper& desc, void* ptr, DType type, const NVTEShape& shape,
+                       bool was_quantized = false) {
+    if (!was_quantized) {
+      desc.set_rowwise_data(ptr, type, shape);
+    } else {
+      desc = TensorWrapper(ptr, shape, type);
+    }
+  };
+  auto set_input = [&](TensorWrapper& desc, bool& was_quantized, py::handle obj, const char* name) {
+    if (is_plain_torch_tensor(obj)) {
+      auto tensor = obj.cast<at::Tensor>();
+      check_tensor(tensor, name);
+      set_dense(desc, tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()),
+                Shape(tensor.sizes()), was_quantized);
+      was_quantized = false;
+    } else {
+      desc = makeTransformerEngineTensor(obj, none);
+      was_quantized = true;
+    }
+  };
   std::vector<TensorWrapper> te_bias_wrappers, te_pre_gelu_out_wrappers;
   std::vector<NVTETensor> te_bias_vector, te_pre_gelu_out_vector;
   te_bias_vector.reserve(A.size());
@@ -713,101 +599,34 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
   std::vector<at::Tensor> tensors_to_zero;
   size_t used = 0;
   for (size_t i = 0; i < A.size(); i++) {
-    // A slice: a plain torch tensor keeps its descriptor between launches, so
-    // only the data pointer (and shape) is refreshed when it changes.
-    TensorWrapper* te_A = &scratch.a[used];
-    at::Tensor a_tensor;
-    if (is_plain_torch_tensor(A[i])) {
-      a_tensor = A[i].cast<at::Tensor>();
-      check_tensor(a_tensor, "A");
-      void* dptr = a_tensor.data_ptr();
-      const int dtype_id = static_cast<int>(a_tensor.scalar_type());
-      if (!reuse_descriptors || scratch.a_quantized[used]) {
-        // A quantized descriptor cannot be refreshed into a plain one.
-        *te_A = makeTransformerEngineTensor(a_tensor);
-        scratch.a_quantized[used] = 0;
-        scratch.a_obj[used] = A[i].ptr();
-        scratch.a_ptr[used] = dptr;
-        scratch.a_dtype[used] = dtype_id;
-      } else if (scratch.a_obj[used] != A[i].ptr() || scratch.a_ptr[used] != dptr ||
-                 scratch.a_dtype[used] != dtype_id ||
-                 !shape_matches(te_A->shape(), a_tensor.sizes())) {
-        te_A->set_rowwise_data(dptr, GetTransformerEngineDType(a_tensor.scalar_type()),
-                               make_nvte_shape(a_tensor.sizes()));
-        scratch.a_obj[used] = A[i].ptr();
-        scratch.a_ptr[used] = dptr;
-        scratch.a_dtype[used] = dtype_id;
-      }
-    } else {
-      *te_A = makeTransformerEngineTensor(A[i], none);
-      scratch.a_quantized[used] = 1;
-      scratch.a_obj[used] = nullptr;
-    }
-
-    // B slice. In the flat path the row range is a raw pointer into the packed
-    // input, so no per-expert torch view is needed.
-    TensorWrapper* te_B = &scratch.b[used];
-    at::Tensor b_tensor;
+    auto& te_A = scratch.a[used];
+    auto& te_B = scratch.b[used];
+    auto& quantized = scratch.quantized[used];
+    set_input(te_A, quantized.a, A[i], "A");
     if (single_input) {
-      void* b_dptr = input.numel() == 0
-                         ? nullptr
-                         : static_cast<char*>(input.data_ptr()) +
-                               input_offset * input.size(1) * input.element_size();
-      const NVTEShape b_shape = make_nvte_shape2(static_cast<size_t>(m_splits[i]),
-                                                 static_cast<size_t>(input.size(1)));
-      if (!reuse_descriptors || scratch.b_quantized[used]) {
-        // The flat path replaces a quantized descriptor with a plain one.
-        *te_B = TensorWrapper(b_dptr, b_shape, input_dtype);
-        scratch.b_quantized[used] = 0;
-      } else {
-        te_B->set_rowwise_data(b_dptr, input_dtype, b_shape);
-      }
-      scratch.b_obj[used] = reinterpret_cast<const void*>(1);  // never hits a torch tensor
+      void* ptr = input.numel() == 0 ? nullptr
+                                     : static_cast<char*>(input.data_ptr()) +
+                                           input_offset * input.size(1) * input.element_size();
+      set_dense(te_B, ptr, input_dtype,
+                Shape{static_cast<size_t>(m_splits[i]), static_cast<size_t>(input.size(1))},
+                quantized.b);
+      quantized.b = false;
       input_offset += m_splits[i];
-    } else if (is_plain_torch_tensor(input_parts[i])) {
-      b_tensor = input_parts[i].cast<at::Tensor>();
-      check_tensor(b_tensor, "B");
-      void* dptr = b_tensor.data_ptr();
-      const int dtype_id = static_cast<int>(b_tensor.scalar_type());
-      if (!reuse_descriptors || scratch.b_quantized[used]) {
-        *te_B = makeTransformerEngineTensor(b_tensor);
-        scratch.b_quantized[used] = 0;
-        scratch.b_obj[used] = input_parts[i].ptr();
-        scratch.b_ptr[used] = dptr;
-        scratch.b_dtype[used] = dtype_id;
-      } else if (scratch.b_obj[used] != input_parts[i].ptr() ||
-                 scratch.b_ptr[used] != dptr || scratch.b_dtype[used] != dtype_id ||
-                 !shape_matches(te_B->shape(), b_tensor.sizes())) {
-        te_B->set_rowwise_data(dptr, GetTransformerEngineDType(b_tensor.scalar_type()),
-                               make_nvte_shape(b_tensor.sizes()));
-        scratch.b_obj[used] = input_parts[i].ptr();
-        scratch.b_ptr[used] = dptr;
-        scratch.b_dtype[used] = dtype_id;
-      }
     } else {
-      *te_B = makeTransformerEngineTensor(input_parts[i], none);
-      scratch.b_quantized[used] = 1;
-      scratch.b_obj[used] = nullptr;
+      set_input(te_B, quantized.b, input_parts[i], "B");
     }
 
-    // if there is single output
     at::Tensor out_tensor;
     // Describe the output slice directly: no per-expert torch tensor, hence no
     // cudaPointerGetAttributes to recover the device from the raw pointer.
     void* out_slice_ptr = nullptr;
-    NVTE_CHECK(te_A->shape().ndim >= 1 && te_B->shape().ndim >= 1,
-               "Grouped GEMM A and B must have at least one dimension.");
-    auto size_t_shape =
-        pytorch::detail::getGemmOutputShape(te_A->shape(), transa, te_B->shape(), transb);
+    const auto out_shape = detail::getGemmOutputShape(te_A.shape(), transa, te_B.shape(), transb);
     size_t D_numel = 1;
-    std::vector<int64_t> D_shape;
-    for (size_t t : size_t_shape) {
+    for (const size_t t : out_shape) {
       NVTE_CHECK(t == 0 || D_numel <= static_cast<size_t>(INT64_MAX) / t,
                  "Grouped GEMM output shape is too large.");
-      D_shape.push_back(t);
       D_numel *= t;
     }
-    auto opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
     if (single_output) {
       NVTE_CHECK(D_numel <= static_cast<size_t>((*D)[0].numel()) - output_offset,
                  "Grouped GEMM D has insufficient single-output capacity.");
@@ -817,26 +636,20 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
                         output_offset * (*D)[0].element_size();
       }
       output_offset += D_numel;
+    } else if (D.has_value()) {
+      out_tensor = (*D)[i];
+      NVTE_CHECK(out_shape == out_tensor.sizes(), "Grouped GEMM D has an invalid output shape.");
     } else {
-      if (D == std::nullopt) {
-        auto opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
-        out_tensor = at::empty(D_shape, opts);
-        D_vectors.emplace_back(out_tensor);
-      } else {
-        out_tensor = (*D)[i];
-        NVTE_CHECK(shape_matches(make_nvte_shape(size_t_shape), out_tensor.sizes()),
-                   "Grouped GEMM D has an invalid output shape.");
-      }
+      const std::vector<int64_t> sizes(out_shape.begin(), out_shape.end());
+      out_tensor = at::empty(sizes, torch::TensorOptions().dtype(dtype).device(device));
+      D_vectors.emplace_back(out_tensor);
     }
 
-    if (te_A->numel() == 0 || te_B->numel() == 0) {
+    if (te_A.numel() == 0 || te_B.numel() == 0) {
       if (!accumulate) {
         if (out_slice_ptr != nullptr) {
-          // The slice lies inside (*D)[0], so pin the device instead of querying the pointer.
-          tensors_to_zero.emplace_back(at::for_blob(out_slice_ptr, D_shape)
-                                           .options(opts)
-                                           .target_device((*D)[0].device())
-                                           .make_tensor());
+          tensors_to_zero.emplace_back(
+              (*D)[0].view({-1}).narrow(0, output_offset - D_numel, D_numel));
         } else if (out_tensor.defined() && out_tensor.numel() != 0) {
           tensors_to_zero.emplace_back(out_tensor);
         }
@@ -848,13 +661,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       continue;
     }
 
-    if (single_output && !out_tensor.defined() && reuse_descriptors) {
-      scratch.d[used].set_rowwise_data(out_slice_ptr, te_D_dtype, make_nvte_shape(size_t_shape));
-    } else if (single_output && !out_tensor.defined()) {
-      scratch.d[used] = makeTransformerEngineTensor(out_slice_ptr, size_t_shape, te_D_dtype);
-    } else {
-      scratch.d[used] = makeTransformerEngineTensor(out_tensor);
-    }
+    set_dense(scratch.d[used], single_output ? out_slice_ptr : out_tensor.data_ptr(), te_D_dtype,
+              out_shape);
 
     if (prev_bias != nullptr && bias[i].is_same(*prev_bias)) {
       te_bias_vector.emplace_back(te_bias_vector.back());
@@ -879,12 +687,12 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       prev_pre_gelu_out = &pre_gelu_out[i];
     }
 
-    scratch.a_v.emplace_back(te_A->data());
-    scratch.b_v.emplace_back(te_B->data());
-    scratch.d_v.emplace_back(scratch.d[used].data());
+    scratch.a_v[used] = te_A.data();
+    scratch.b_v[used] = te_B.data();
+    scratch.d_v[used] = scratch.d[used].data();
     used++;
   }
-  scratch.finish(used);
+  scratch.resize(used);
   for (auto& tensor : tensors_to_zero) tensor.zero_();
 
   if (scratch.a_v.empty()) {

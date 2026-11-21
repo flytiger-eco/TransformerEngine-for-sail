@@ -25,7 +25,7 @@ struct NativeParams {
 
 // Each work item belongs to exactly one expert. A four-column item only
 // drains its A/B pipeline after the fourth output tile has been written.
-template <class Mainloop, class Epilogue, bool EnableNExpand>
+template <class Mainloop, class Epilogue, bool EnableNExpand, int CommonN = 0, int CommonK = 0>
 struct NvteNativeGrouped {
   using Params = NativeParams;
   using TileShape = typename Mainloop::TileShape;
@@ -81,7 +81,12 @@ struct NvteNativeGrouped {
     __syncthreads();
   }
 
-  CUTLASS_DEVICE static void run_tile(const NativeExpert& e, int mi, int ni, char* smem) {
+  CUTLASS_DEVICE static void run_tile(const NativeExpert& expert, int mi, int ni, char* smem) {
+    NativeExpert e = expert;
+    if constexpr (CommonK != 0) {
+      e.n = CommonN;
+      e.k = CommonK;
+    }
     using namespace cute;
     if constexpr (EnableNExpand) {
       if (e.columns == 4) {
@@ -157,7 +162,24 @@ struct NvteNativeGrouped {
       }
       return;
     }
-    uint64_t work = p.control->work, per_group = p.control->per_group;
+    const uint64_t work = p.control->work;
+    if constexpr (CommonK != 0) {
+      // Process each expert's tile range before loading the next descriptor.
+      // Empty experts have identical consecutive end offsets.
+      static_assert(!EnableNExpand && CommonN % BN == 0);
+      constexpr int ntiles = CommonN / BN;
+      uint64_t id = blockIdx.x, start = 0;
+      for (unsigned group = 0; id < work; ++group) {
+        const auto e = p.experts[group];
+        for (; id < e.end; id += gridDim.x) {
+          const uint64_t local = id - start;
+          run_tile(e, int(local / ntiles), int(local % ntiles), smem);
+        }
+        start = e.end;
+      }
+      return;
+    }
+    const uint64_t per_group = p.control->per_group;
     uint64_t group = 0, start = 0;
     for (uint64_t id = blockIdx.x; id < work; id += gridDim.x) {
       if (per_group) {
@@ -184,27 +206,36 @@ struct NvteNativeGrouped {
 
 // The list API already stages per-expert shapes and pointers. Use its existing
 // GemmUniversal ABI and workspace cache even when the allocations are disjoint.
-template <class Ordinary, class Mainloop, class Epilogue>
-struct NvteListNExpand {
+template <class Ordinary, class Mainloop, class Epilogue, int CommonN, int CommonK>
+struct NvteListGrouped {
   using Params = typename Ordinary::Params;
   CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
     using namespace cute;
+    constexpr bool expand = CommonK == 0;
     uint64_t id = blockIdx.x + uint64_t(gridDim.x) * blockIdx.y;
     uint64_t stride = uint64_t(gridDim.x) * gridDim.y;
     for (int g = 0; g < p.problem_shape.num_groups; ++g) {
       auto shape = p.problem_shape.get_problem_shape(g);
-      int m = get<0>(shape), n = get<1>(shape), k = get<2>(shape);
-      int ntiles = n / 1024;
-      uint64_t tiles = uint64_t(m / 256) * ntiles;
+      const int m = get<0>(shape);
+      const int n = expand ? get<1>(shape) : CommonN;
+      const int k = expand ? get<2>(shape) : CommonK;
+      const int ntiles = n / (expand ? 1024 : 256);
+      const uint64_t mtiles = expand ? uint64_t(m / 256) : (uint64_t(m) + 255) / 256;
+      const uint64_t tiles = mtiles * ntiles;
       if (id < tiles) {
         NativeExpert e{};
         e.m = m; e.n = n; e.k = k;
         e.a = reinterpret_cast<uint64_t>(p.mainloop.ptr_A[g]);
         e.b = reinterpret_cast<uint64_t>(p.mainloop.ptr_B[g]);
         e.d = reinterpret_cast<uint64_t>(p.epilogue.ptr_D[g]);
-        for (; id < tiles; id += stride)
-          NvteNativeGrouped<Mainloop, Epilogue, true>::run_nexpand(
-              e, int(id / ntiles), int(id % ntiles) * 4, smem);
+        e.alpha = 1;
+        for (; id < tiles; id += stride) {
+          const int mi = int(id / ntiles), ni = int(id % ntiles);
+          if constexpr (expand)
+            NvteNativeGrouped<Mainloop, Epilogue, true>::run_nexpand(e, mi, ni * 4, smem);
+          else
+            NvteNativeGrouped<Mainloop, Epilogue, false>::run_tile(e, mi, ni, smem);
+        }
       }
       id -= tiles;
     }

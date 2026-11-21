@@ -1197,16 +1197,6 @@ Tensor *convertNVTETensorCheck(const NVTETensor tensor);
 GroupedTensor *convertNVTEGroupedTensor(const NVTEGroupedTensor tensor);
 GroupedTensor *convertNVTEGroupedTensorCheck(const NVTEGroupedTensor tensor);
 
-bool try_native_grouped_gemm(
-    const NVTEGroupedTensor A, int transa, const NVTEGroupedTensor B, int transb,
-    const NVTEGroupedTensor C, NVTEGroupedTensor D, const NVTETensor alpha,
-    const NVTETensor beta, NVTETensor workspace_setup, NVTETensor workspace_cublas,
-    NVTEGroupedMatmulConfig config, cudaStream_t stream, const NVTETensor *A_list = nullptr,
-    size_t num_a = 0, const NVTETensor *C_list = nullptr, NVTETensor *D_list = nullptr,
-    size_t num_d = 0);
-size_t native_grouped_gemm_workspace_size(size_t groups);
-bool native_grouped_gemm_supported_device();
-
 // Helper functions for GroupedTensor validation
 void CheckGroupedTensorShapeArrays(const GroupedTensor &t, std::string_view name);
 void CheckInputGroupedTensor(const GroupedTensor &t, std::string_view name);

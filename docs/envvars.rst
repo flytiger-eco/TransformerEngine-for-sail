@@ -297,8 +297,8 @@ Kernel Configuration
 .. envvar:: NVTE_USE_CUTLASS_GROUPED_GEMM
 
    :Type: ``int`` (0 or 1)
-   :Default: ``0``
-   :Description: Use CUTLASS implementation for grouped GEMM operations instead of cuBLAS. When set to ``1``, enables CUTLASS grouped GEMM kernels, which may provide better performance for certain workloads on Hopper (SM90) GPUs.
+   :Default: unset
+   :Description: On PPU SM89, grouped GEMM automatically selects CUTLASS RTC for compatible groups of small matrices and cuBLAS for larger workloads. Other architectures default to cuBLAS. Set to ``0`` to select cuBLAS or ``1`` to request CUTLASS for all compatible workloads on SM80, SM89, and SM90.
 
 .. envvar:: NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK
 

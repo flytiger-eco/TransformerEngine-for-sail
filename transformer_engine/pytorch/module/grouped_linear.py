@@ -37,7 +37,7 @@ from ..utils import (
     get_device_compute_capability,
     init_method_constant,
     requires_grad,
-    resolve_grouped_linear_single_param_flags,
+    warn_if_single_grouped_param,
     get_nvtx_range_context,
 )
 from ..distributed import (
@@ -72,30 +72,6 @@ from ...debug.pytorch.debug_quantization import DebugQuantizer
 from ...debug.pytorch.debug_state import TEDebugState
 
 __all__ = ["GroupedLinear"]
-
-# Experimental switch; the original split-input path stays the default.
-_USE_FLAT_INPUT = os.getenv("NVTE_GG_FLAT_INPUT", "0") == "1"
-
-# Opt-in output-buffer reuse. Without a caller-provided buffer every forward
-# allocates a fresh output, which costs an at::empty on the host path. Reusing
-# the previous allocation removes it, but aliases consecutive outputs, so it is
-# only safe when the caller consumes each output before the next forward
-# (inference / steady-state benchmarking). Off by default.
-_REUSE_OUTPUT = os.getenv("NVTE_GG_REUSE_OUTPUT", "0") == "1"
-_OUTPUT_BUFFERS = {}
-
-
-def _reuse_output(rows: int, cols: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    key = (device, dtype, rows, cols)
-    buffer = _OUTPUT_BUFFERS.get(key)
-    if buffer is not None and buffer._use_count() == 1:
-        return buffer
-    if len(_OUTPUT_BUFFERS) >= 8:
-        _OUTPUT_BUFFERS.clear()
-    buffer = torch.empty((rows, cols), dtype=dtype, device=device)
-    _OUTPUT_BUFFERS[key] = buffer
-    return buffer
-
 
 class _SplitGroupedWeight(torch.autograd.Function):
     @staticmethod
@@ -306,10 +282,6 @@ class _GroupedLinear(torch.autograd.Function):
         dtype, and device. Validation reads host-side metadata only, with no device sync.
         """
         if buffer is None:
-            # Reusing a buffer aliases consecutive forward outputs, which would
-            # corrupt any autograd graph that keeps them alive.
-            if _REUSE_OUTPUT and not torch.is_grad_enabled():
-                return _reuse_output(rows, cols, dtype, device)
             return torch.empty((rows, cols), dtype=dtype, device=device)
         if buffer.dim() != 2:
             raise ValueError(f"Output buffer must be 2D, got {buffer.dim()}D.")
@@ -665,11 +637,7 @@ class _GroupedLinear(torch.autograd.Function):
         m_splits = m_splits.tolist()
 
         inp_view = inp.reshape(-1, in_features)
-        use_flat_input = (
-            _USE_FLAT_INPUT and not (fp8 or debug or fp8_calibration or cpu_offloading)
-            and activation_dtype in (torch.bfloat16, torch.float16)
-            and type(inp_view) is torch.Tensor
-        )
+        use_flat_input = False
         inputmats: list
         if fp8 and not debug:
             # Disable bulk allocation when CPU offloading is active: offloading skips small
@@ -687,10 +655,16 @@ class _GroupedLinear(torch.autograd.Function):
             )
         else:
             flat_input = cast_if_needed(inp_view, activation_dtype)
-            use_flat_input = use_flat_input and flat_input.is_contiguous()
+            use_flat_input = (
+                not (fp8_calibration or cpu_offloading)
+                and type(flat_input) is torch.Tensor
+                and flat_input.dtype in (torch.float16, torch.bfloat16)
+                and flat_input.is_contiguous()
+            )
             inputmats = (
                 [flat_input] + [None] * (num_gemms - 1)
-                if use_flat_input else torch.split(flat_input, m_splits)
+                if use_flat_input
+                else torch.split(flat_input, m_splits)
             )
 
         if cpu_offloading:
@@ -1404,15 +1378,11 @@ class GroupedLinear(TransformerEngineBaseModule):
     single_grouped_weight : bool, default = False
                        If set to ``True``, grouped weights are stored as a single grouped parameter
                        instead of one parameter per GEMM.
-                       EXPERIMENTAL and subject to change. Gated by the
-                       ``NVTE_GROUPED_LINEAR_SINGLE_PARAM`` environment variable: if the env var
-                       is not set this argument is forced to ``False`` with a warning.
+                       EXPERIMENTAL and subject to change.
     single_grouped_bias : bool, default = False
                        If set to ``True``, grouped biases are stored as a single grouped bias
                        instead of one bias per GEMM.
-                       EXPERIMENTAL and subject to change. Gated by the
-                       ``NVTE_GROUPED_LINEAR_SINGLE_PARAM`` environment variable: if the env var
-                       is not set this argument is forced to ``False`` with a warning.
+                       EXPERIMENTAL and subject to change.
 
     Notes
     -----
@@ -1461,9 +1431,7 @@ class GroupedLinear(TransformerEngineBaseModule):
         self.ub_overlap_ag = ub_overlap_ag
         self.ub_name = ub_name
         self.save_original_input = save_original_input
-        single_grouped_weight, single_grouped_bias = resolve_grouped_linear_single_param_flags(
-            single_grouped_weight, single_grouped_bias
-        )
+        warn_if_single_grouped_param(single_grouped_weight, single_grouped_bias)
         self.single_grouped_weight = single_grouped_weight
         self.single_grouped_bias = single_grouped_bias
         if ub_overlap_rs or ub_overlap_ag:

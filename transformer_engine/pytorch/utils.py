@@ -185,26 +185,10 @@ def interleave_glu_tensor(tensor: torch.Tensor, interleave_size: int) -> torch.T
     return x.reshape(shape)
 
 
-def resolve_grouped_linear_single_param_flags(
-    single_grouped_weight: bool,
-    single_grouped_bias: bool,
-) -> Tuple[bool, bool]:
-    """Gate ``single_grouped_weight`` / ``single_grouped_bias`` on ``NVTE_GROUPED_LINEAR_SINGLE_PARAM``."""
+def warn_if_single_grouped_param(single_grouped_weight: bool, single_grouped_bias: bool) -> None:
+    """Warn about the experimental packed parameter layout when explicitly requested."""
     if not (single_grouped_weight or single_grouped_bias):
-        return single_grouped_weight, single_grouped_bias
-
-    env_enabled = int(os.environ.get("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")) > 0
-    if not env_enabled:
-        warnings.warn(
-            f"GroupedLinear was constructed with single_grouped_weight={single_grouped_weight} "
-            f"and single_grouped_bias={single_grouped_bias}, but the "
-            "NVTE_GROUPED_LINEAR_SINGLE_PARAM environment variable is not set. "
-            "Disabling single grouped weight/bias and falling back to per-expert parameters.",
-            UserWarning,
-            stacklevel=3,
-        )
-        return False, False
-
+        return
     warnings.warn(
         "GroupedLinear is using single_grouped_weight/single_grouped_bias. "
         "This feature is experimental, may change in future "
@@ -212,7 +196,6 @@ def resolve_grouped_linear_single_param_flags(
         UserWarning,
         stacklevel=3,
     )
-    return single_grouped_weight, single_grouped_bias
 
 
 def attention_mask_func(

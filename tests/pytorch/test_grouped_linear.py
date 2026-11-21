@@ -160,7 +160,7 @@ if nvfp4_available:
     fp8_recipes.append(nvfp4_row_scaled())
 
 use_cutlass_grouped_gemm = [False]
-if torch.cuda.get_device_capability() == (9, 0):
+if torch.cuda.get_device_capability() in ((8, 9), (9, 0)):
     use_cutlass_grouped_gemm.append(True)
 
 
@@ -836,8 +836,8 @@ def test_grouped_gemm(shape, dtype, layout, accumulate, use_cutlass, monkeypatch
         grad = True
         single_output = False
 
-    if use_cutlass:
-        monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "1")
+    # The cuBLAS arm checks bitwise agreement with cuBLAS single GEMMs.
+    monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "1" if use_cutlass else "0")
 
     for i in range(z):
         general_gemm(
@@ -874,8 +874,8 @@ def test_grouped_gemm(shape, dtype, layout, accumulate, use_cutlass, monkeypatch
 
 
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() != (9, 0),
-    reason="Only enable CUTLASS grouped gemm on Hopper",
+    torch.cuda.get_device_capability() not in ((8, 9), (9, 0)),
+    reason="CUTLASS grouped GEMM requires PPU SM89 or Hopper",
 )
 @pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
 def test_grouped_gemm_cutlass_empty_groups(layout, monkeypatch):
