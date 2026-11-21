@@ -1173,8 +1173,12 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
       if (a.dtype != input_dtype || b.dtype != input_dtype || d.dtype != output_dtype ||
           !aligned_matrix(a) || !aligned_matrix(b) || !aligned_matrix(d))
         return false;
+      const auto k = b.shape[transb ? 0 : 1];
+      NVTE_CHECK(a.shape[transa ? 1 : 0] == k, "Grouped GEMM inputs have incompatible dimensions.");
+      const size_t output_elements = b.shape[transb ? 1 : 0] * a.shape[transa ? 0 : 1];
+      NVTE_CHECK(d.shape[0] * d.shape[1] >= output_elements,
+                 "Grouped GEMM output storage is too small.");
       if (is_hopper) {
-        const auto k = b.shape[transb ? 0 : 1];
         if (k % 128 || (i && k != first_k)) return false;
         first_k = k;
       }

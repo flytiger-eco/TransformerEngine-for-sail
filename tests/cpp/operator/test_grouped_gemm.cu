@@ -14,6 +14,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -938,6 +939,32 @@ void run_grouped_gemm_discrete_in_graph_case(const TestParams& params) {
 }
 
 class GroupedGemmTest : public ::testing::TestWithParam<TestParams> {};
+
+#ifdef __HGGCCC__
+TEST(MultiTensorGemmTest, ValidatesListShapesOnSm89) {
+  if (getDeviceComputeCapability() != 89) GTEST_SKIP() << "Requires PPU SM89.";
+  constexpr size_t m = 64, n = 256, k = 64;
+  auto a = make_bf16_operand("A", {n, k});
+  auto b = make_bf16_operand("B", {m, k});
+  auto bad_a = make_bf16_operand("A_incompatible_k", {n, 2 * k});
+  Tensor d("D", std::vector<size_t>{m, n}, DType::kBFloat16);
+  // The descriptor advertises half of D; its allocation can hold the complete result.
+  TensorWrapper short_d(d.rowwise_dptr(), std::vector<size_t>{m, n / 2}, DType::kBFloat16);
+  Tensor workspace("workspace", std::vector<size_t>{kCublasWorkspaceBytes}, DType::kByte);
+  auto run = [&](NVTETensor weight, NVTETensor output) {
+    auto input = b.data(), ws = workspace.data();
+    nvte_multi_tensor_gemm(&weight, &input, &output, nullptr, nullptr, 1, true, false, false,
+                           &ws, false, false, 0, nullptr);
+  };
+  EXPECT_THROW(run(bad_a.data(), d.data()), std::runtime_error);
+  EXPECT_THROW(run(a.data(), short_d.data()), std::runtime_error);
+  ASSERT_NO_THROW(run(a.data(), d.data()));
+  NVTE_CHECK_CUDA(cudaDeviceSynchronize());
+  d.to_cpu();
+  const auto* values = d.rowwise_cpu_dptr<bf16>();
+  EXPECT_TRUE(std::all_of(values, values + m * n, [](bf16 x) { return float(x) == 64.f; }));
+}
+#endif
 
 TEST_P(GroupedGemmTest, CompareWithMultiTensorGemm) {
   run_grouped_gemm_case(GetParam());
