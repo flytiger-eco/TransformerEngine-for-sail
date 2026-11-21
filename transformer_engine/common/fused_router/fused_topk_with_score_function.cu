@@ -20,6 +20,184 @@
 namespace transformer_engine {
 namespace fused_router {
 
+template <typename Launch>
+inline void dispatch_router_tiles(int experts, Launch launch) {
+  if (experts == 2 * kThreadsPerWarp) return launch(std::integral_constant<int, 2>{}, std::true_type{});
+  if (experts == 4 * kThreadsPerWarp) return launch(std::integral_constant<int, 4>{}, std::true_type{});
+  if (experts == 6 * kThreadsPerWarp) return launch(std::integral_constant<int, 6>{}, std::true_type{});
+  if (experts == 8 * kThreadsPerWarp) return launch(std::integral_constant<int, 8>{}, std::true_type{});
+  if (experts <= 4 * kThreadsPerWarp) return launch(std::integral_constant<int, 4>{}, std::false_type{});
+  return launch(std::integral_constant<int, 8>{}, std::false_type{});
+}
+
+template <typename DataType, typename Launch>
+inline void dispatch_forward_router_tiles(int experts, Launch launch) {
+  if constexpr (std::is_same_v<DataType, CompType>) {
+    dispatch_router_tiles(experts, launch);
+  } else if (experts <= 4 * kThreadsPerWarp) {
+    launch(std::integral_constant<int, 4>{}, std::false_type{});
+  } else {
+    launch(std::integral_constant<int, 8>{}, std::false_type{});
+  }
+}
+
+template <int Tiles, bool Full>
+__device__ __forceinline__ void cached_small_topk(const CompType *scores, int size, int topk,
+                                                  int *topk_indices, CompType *topk_scores,
+                                                  int lane_id) {
+  constexpr CompType kEmpty = -std::numeric_limits<CompType>::infinity();
+  CompType candidates[Tiles];
+#pragma unroll
+  for (int tile = 0; tile < Tiles; ++tile) {
+    int offset = lane_id + tile * kThreadsPerWarp;
+    candidates[tile] = Full || offset < size ? scores[offset] : kEmpty;
+  }
+#pragma unroll 1
+  for (int rank = 0; rank < topk; ++rank) {
+    CompType value = kEmpty;
+    int index = lane_id;
+#pragma unroll
+    for (int tile = 0; tile < Tiles; ++tile) {
+      if (candidates[tile] > value) {
+        value = candidates[tile];
+        index = lane_id + tile * kThreadsPerWarp;
+      }
+    }
+    for (int stride = kThreadsPerWarp / 2; stride > 0; stride /= 2) {
+      CompType other_value = __shfl_xor_sync(0xffffffff, value, stride);
+      int other_index = __shfl_xor_sync(0xffffffff, index, stride);
+      if (other_value > value) {
+        value = other_value;
+        index = other_index;
+      }
+    }
+    if (lane_id == 0) {
+      topk_scores[rank] = value;
+      topk_indices[rank] = index;
+    }
+    int winner = __shfl_sync(0xffffffff, index, 0);
+#pragma unroll
+    for (int tile = 0; tile < Tiles; ++tile) {
+      if (winner == lane_id + tile * kThreadsPerWarp) candidates[tile] = kEmpty;
+    }
+  }
+}
+
+template <int Tiles, bool Full>
+__device__ __forceinline__ void cached_naive_topk(CompType *scores, int size, int topk,
+                                                  int *indices, CompType *values, int lane_id) {
+  constexpr unsigned int warp = 0xffffffffu;
+  constexpr CompType empty = -std::numeric_limits<CompType>::infinity();
+  int logical_lane = __brev(static_cast<unsigned int>(lane_id)) >> 27;
+  CompType candidates[Tiles];
+#pragma unroll
+  for (int tile = 0; tile < Tiles; ++tile) {
+    int offset = logical_lane + tile * kThreadsPerWarp;
+    candidates[tile] = Full || offset < size ? scores[offset] : empty;
+  }
+  if (topk > 8 && __ballot_sync(warp, isnan(candidates[0]))) {
+    return naive_topk_and_mask_generic(scores, size, topk, indices, values, lane_id);
+  }
+#pragma unroll 1
+  for (int rank = 0; rank < topk; ++rank) {
+    CompType value = empty;
+    int index = logical_lane;
+#pragma unroll
+    for (int tile = 0; tile < Tiles; ++tile) {
+      if (candidates[tile] > value) {
+        value = candidates[tile];
+        index = logical_lane + tile * kThreadsPerWarp;
+      }
+    }
+    CompType maximum = value;
+    for (int stride = kThreadsPerWarp / 2; stride > 0; stride /= 2) {
+      CompType peer = __shfl_xor_sync(warp, maximum, stride);
+      if (peer > maximum) maximum = peer;
+    }
+    int winner = __ffs(__ballot_sync(warp, value == maximum)) - 1;
+    if (lane_id == winner) {
+      indices[rank] = index;
+      values[rank] = value;
+#pragma unroll
+      for (int tile = 0; tile < Tiles; ++tile) {
+        if (index == logical_lane + tile * kThreadsPerWarp) candidates[tile] = empty;
+      }
+    }
+  }
+}
+
+__device__ __forceinline__ void small_post_softmax(CompType *scores, int size, int lane_id) {
+  constexpr CompType empty = -std::numeric_limits<CompType>::infinity();
+  const bool valid = lane_id < size;
+  const CompType value = valid ? scores[lane_id] : empty;
+  if (__any_sync(0xffffffff, valid && !isfinite(value))) {
+    return apply_softmax_on_float(scores, size, lane_id);
+  }
+  if (size == 1) {
+    if (lane_id == 0) scores[0] = 1.0f;
+    __syncwarp();
+    return;
+  }
+  CompType maximum = value;
+  CompType sum = valid ? 1.0f : 0.0f;
+#pragma unroll
+  for (int offset = 4; offset > 0; offset >>= 1) {
+    CompType peer_max = warp_shuffle_xor(maximum, offset);
+    CompType peer_sum = warp_shuffle_xor(sum, offset);
+    if (peer_max != empty) {
+      if (maximum == empty) {
+        maximum = peer_max;
+        sum = peer_sum;
+      } else {
+        CompType next_max = fmaxf(maximum, peer_max);
+        sum = sum * expf(maximum - next_max) + peer_sum * expf(peer_max - next_max);
+        maximum = next_max;
+      }
+    }
+  }
+  if (valid) scores[lane_id] = expf(value - maximum) * (1.0f / sum);
+  __syncwarp();
+}
+
+__device__ __forceinline__ void small_group_scores(const CompType *scores, CompType *group_scores,
+                                                   int num_groups, int group_size, int keep,
+                                                   int lane_id) {
+  constexpr CompType empty = -std::numeric_limits<CompType>::infinity();
+  for (int group = lane_id; group < num_groups; group += kThreadsPerWarp) {
+    const CompType *values = scores + group * group_size;
+    CompType sum = 0.0f;
+    if (keep == 1) {
+      CompType best = empty;
+      for (int column = 0; column < group_size; ++column) {
+        CompType value = values[column];
+        if (value > best) best = value;
+      }
+      sum += best;
+    } else {
+      CompType best[8];
+#pragma unroll
+      for (int rank = 0; rank < 8; ++rank) best[rank] = empty;
+      for (int column = 0; column < group_size; ++column) {
+        CompType value = values[column];
+#pragma unroll
+        for (int rank = 0; rank < 8; ++rank) {
+          if (value > best[rank]) {
+            CompType previous = best[rank];
+            best[rank] = value;
+            value = previous;
+          }
+        }
+      }
+#pragma unroll
+      for (int rank = 0; rank < 8; ++rank) {
+        if (rank < keep) sum += best[rank];
+      }
+    }
+    group_scores[group] = sum;
+  }
+  __syncwarp();
+}
+
 // =============================================================================
 // Simple forward kernel — exact upstream structure (no async loader, no
 // persistent grid, runtime score_function dispatch).  Faster for small topk
@@ -27,7 +205,9 @@ namespace fused_router {
 // =============================================================================
 
 template <typename DataType, typename BiasType, NVTERoutingMapFormat RoutingMapFormat,
-          TopkFuncType TopkFunc = TopkFuncType::Naive, typename IndexType = int32_t>
+          TopkFuncType TopkFunc = TopkFuncType::Naive, typename IndexType = int32_t,
+          int CachedTiles = 0, bool Full = false, bool UseSmallTopk = false,
+          bool ParallelGroupScores = false>
 __global__ void fused_topk_forward_simple_kernel(
     const DataType *logits, int num_tokens, int num_experts, int topk, bool use_pre_softmax,
     int num_groups, int group_topk, float scaling_factor, int score_function,
@@ -88,8 +268,25 @@ __global__ void fused_topk_forward_simple_kernel(
       }
     }
     // Load the logits to shmem
-    for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-      scores[i] = logits[pos_offset + i];
+    if (num_experts <= 256) {
+      // 先发出独立加载，再转成 FP32 并写 shared，避免每个元素都 load/wait/store。
+      // 保留原始 dtype，低精度转换不会提前消费尚未返回的加载结果。
+      constexpr int kLoadSlots = 256 / kThreadsPerWarp;
+      DataType raw_logits[kLoadSlots];
+#pragma unroll
+      for (int slot = 0; slot < kLoadSlots; ++slot) {
+        int i = lane_id + slot * kThreadsPerWarp;
+        if (i < num_experts) raw_logits[slot] = logits[pos_offset + i];
+      }
+#pragma unroll
+      for (int slot = 0; slot < kLoadSlots; ++slot) {
+        int i = lane_id + slot * kThreadsPerWarp;
+        if (i < num_experts) scores[i] = static_cast<CompType>(raw_logits[slot]);
+      }
+    } else {
+      for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+        scores[i] = logits[pos_offset + i];
+      }
     }
     // If group_topk > 0, init the masked_scores to -inf
     if (group_topk > 0) {
@@ -132,20 +329,30 @@ __global__ void fused_topk_forward_simple_kernel(
     }
 
     // Topk selection
+    CompType *final_scores = scores;
     if (group_topk > 0) {
       int group_size = num_experts / num_groups;
-      for (int i = 0; i < num_groups; i++) {
-        topk_and_mask<TopkFunc>(scores + i * group_size, group_size, topk / group_topk,
-                                topk_indices, topk_scores, lane_id);
-        __syncwarp();
-        if (lane_id == 0) {
-          CompType tmp = 0.0;
-          for (int j = 0; j < topk / group_topk; j++) {
-            tmp = tmp + topk_scores[j];
+      if constexpr (ParallelGroupScores) {
+        small_group_scores(scores, group_scores, num_groups, group_size, topk / group_topk, lane_id);
+      } else {
+        for (int i = 0; i < num_groups; i++) {
+          if (!UseSmallTopk && CachedTiles != 0 && group_size <= kThreadsPerWarp && topk / group_topk > 8) {
+            cached_naive_topk<1, false>(scores + i * group_size, group_size, topk / group_topk,
+                                       topk_indices, topk_scores, lane_id);
+          } else {
+            topk_and_mask<TopkFunc>(scores + i * group_size, group_size, topk / group_topk,
+                                    topk_indices, topk_scores, lane_id);
           }
-          group_scores[i] = tmp;
+          __syncwarp();
+          if (lane_id == 0) {
+            CompType tmp = 0.0;
+            for (int j = 0; j < topk / group_topk; j++) {
+              tmp = tmp + topk_scores[j];
+            }
+            group_scores[i] = tmp;
+          }
+          __syncwarp();
         }
-        __syncwarp();
       }
       topk_and_mask<TopkFunc>(group_scores, num_groups, group_topk, topk_indices, topk_scores,
                               lane_id);
@@ -158,9 +365,16 @@ __global__ void fused_topk_forward_simple_kernel(
         }
       }
       __syncwarp();
-      topk_and_mask<TopkFunc>(masked_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
+      final_scores = masked_scores;
+    }
+    if constexpr (UseSmallTopk) {
+      cached_small_topk<CachedTiles, Full>(final_scores, num_experts, topk, topk_indices,
+                                           topk_scores, lane_id);
+    } else if constexpr (CachedTiles != 0) {
+      cached_naive_topk<CachedTiles, Full>(final_scores, num_experts, topk, topk_indices,
+                                           topk_scores, lane_id);
     } else {
-      topk_and_mask<TopkFunc>(scores, num_experts, topk, topk_indices, topk_scores, lane_id);
+      topk_and_mask<TopkFunc>(final_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
     }
     __syncwarp();
 
@@ -173,7 +387,11 @@ __global__ void fused_topk_forward_simple_kernel(
     }
 
     if (!use_pre_softmax && score_function == 1) {
-      apply_softmax_on_float(topk_scores, topk, lane_id);
+      if constexpr (UseSmallTopk) {
+        small_post_softmax(topk_scores, topk, lane_id);
+      } else {
+        apply_softmax_on_float(topk_scores, topk, lane_id);
+      }
       __syncwarp();
       for (int i = lane_id; i < topk; i += kThreadsPerWarp) {
         intermediate_output[pos_offset + topk_indices[i]] = topk_scores[i];
@@ -233,7 +451,7 @@ __global__ void fused_topk_forward_simple_kernel(
 
 template <typename DataType, typename BiasType, NVTERoutingMapFormat RoutingMapFormat,
           TopkFuncType TopkFunc = TopkFuncType::Naive, int ScoreFunc = 0,
-          typename IndexType = int32_t>
+          typename IndexType = int32_t, int CachedTiles = 0, bool Full = false>
 __global__ void fused_topk_with_score_function_forward_kernel(
     const DataType *logits, int num_tokens, int num_experts, int topk, bool use_pre_softmax,
     int num_groups, int group_topk, float scaling_factor, const BiasType *expert_bias,
@@ -417,7 +635,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
       int group_size = num_experts / num_groups;
       // Top2
       for (int i = 0; i < num_groups; i++) {
-        topk_and_mask<TopkFunc>(
+        topk_and_mask<TopkFunc, CachedTiles, Full>(
             /*scores ptr = */ scores + i * group_size,
             /*data size = */ group_size,
             /*topk = */ topk / group_topk,
@@ -437,7 +655,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
       }
 
       // select the topk groups
-      topk_and_mask<TopkFunc>(
+      topk_and_mask<TopkFunc, CachedTiles, Full>(
           /*scores ptr = */ group_scores,
           /*data size = */ num_groups,
           /*topk = */ group_topk,
@@ -454,10 +672,10 @@ __global__ void fused_topk_with_score_function_forward_kernel(
         }
       }
       __syncwarp();
-      topk_and_mask<TopkFunc>(masked_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
+      topk_and_mask<TopkFunc, CachedTiles, Full>(masked_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
 
     } else {
-      topk_and_mask<TopkFunc>(scores, num_experts, topk, topk_indices, topk_scores, lane_id);
+      topk_and_mask<TopkFunc, CachedTiles, Full>(scores, num_experts, topk, topk_indices, topk_scores, lane_id);
     }
     __syncwarp();
 
@@ -539,6 +757,14 @@ __global__ void fused_topk_with_score_function_forward_kernel(
   }
 }
 
+inline void simplify_singleton_top1_groups(int num_experts, int topk, bool use_radix,
+                                           int &num_groups, int &group_topk) {
+  if (!use_radix && topk == 1 && group_topk == 1 && num_groups == num_experts) {
+    num_groups = 0;
+    group_topk = 0;
+  }
+}
+
 template <typename DataType, typename BiasType, NVTERoutingMapFormat RoutingMapFormat>
 void fused_topk_with_score_function_forward_kernel_launcher(
     const DataType *logits, int num_tokens, int num_experts, int topk, bool use_pre_softmax,
@@ -567,6 +793,11 @@ void fused_topk_with_score_function_forward_kernel_launcher(
                "per-group topk must be <= group size, got per_group_topk=", topk / group_topk,
                " group_size=", num_experts / num_groups);
   }
+  // Dispatch: use radix only when it is profitable and supported. Otherwise use the
+  // naive path, which handles very large expert counts without the radix histogram limit.
+  const bool use_radix = topk >= get_radix_topk_threshold() && num_experts <= kMaxExpertsRadixTopk;
+  simplify_singleton_top1_groups(num_experts, topk, use_radix, num_groups, group_topk);
+
   size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
   size_t total_blocks = (num_tokens + num_token_per_block - 1) / num_token_per_block;
   size_t scores_shmem = num_experts * num_token_per_block * sizeof(CompType);
@@ -600,9 +831,8 @@ void fused_topk_with_score_function_forward_kernel_launcher(
     NVTE_CHECK_CUDA(cudaGetLastError());
   };
 
-  // Dispatch: use radix only when it is profitable and supported. Otherwise use the
-  // naive path, which handles very large expert counts without the radix histogram limit.
-  const bool use_radix = topk >= get_radix_topk_threshold() && num_experts <= kMaxExpertsRadixTopk;
+  constexpr bool cache_scores = RoutingMapFormat == NVTE_ROUTING_MAP_FORMAT_BYTEMAP &&
+                                (!std::is_same_v<DataType, CompType> || std::is_same_v<BiasType, CompType>);
   if (!use_radix) {
     // Simple path: no async loader, no persistent grid.
     // Uses the exact upstream kernel structure with runtime score_function dispatch.
@@ -618,10 +848,63 @@ void fused_topk_with_score_function_forward_kernel_launcher(
       NVTE_CHECK_CUDA(cudaGetLastError());
     };
 
+    if constexpr (cache_scores) {
+      if (topk <= 8 && group_topk > 0 && num_groups >= 2 &&
+          num_experts / num_groups <= kThreadsPerWarp && num_experts <= 8 * kThreadsPerWarp) {
+        auto launch_grouped = [&](auto tiles, auto full) {
+          launch_simple(fused_topk_forward_simple_kernel<DataType, BiasType, RoutingMapFormat,
+                        TopkFuncType::Naive, int32_t, decltype(tiles)::value,
+                        decltype(full)::value, true, true>);
+        };
+        if (num_experts <= kThreadsPerWarp) {
+          return launch_grouped(std::integral_constant<int, 1>{}, std::false_type{});
+        }
+        return dispatch_forward_router_tiles<DataType>(num_experts, launch_grouped);
+      }
+      const bool small_post = topk <= 8 && group_topk == 0 && !use_pre_softmax && score_function == 1;
+      if (small_post && num_experts <= kThreadsPerWarp) {
+        return launch_simple(fused_topk_forward_simple_kernel<DataType, BiasType, RoutingMapFormat,
+                             TopkFuncType::Naive, int32_t, 1, false, true>);
+      }
+      if ((topk > 1 || small_post) && num_experts > kThreadsPerWarp &&
+          num_experts <= 8 * kThreadsPerWarp) {
+        dispatch_forward_router_tiles<DataType>(num_experts, [&](auto tiles, auto full) {
+          if (topk <= 8) {
+            return launch_simple(fused_topk_forward_simple_kernel<
+                                 DataType, BiasType, RoutingMapFormat, TopkFuncType::Naive, int32_t,
+                                 decltype(tiles)::value, decltype(full)::value, true>);
+          }
+          launch_simple(fused_topk_forward_simple_kernel<DataType, BiasType, RoutingMapFormat,
+                        TopkFuncType::Naive, int32_t, decltype(tiles)::value,
+                        decltype(full)::value>);
+        });
+        return;
+      }
+    }
     launch_simple(fused_topk_forward_simple_kernel<DataType, BiasType, RoutingMapFormat,
                                                    TopkFuncType::Naive>);
   } else {
     // Optimized path: async loader + persistent grid + radix topk.
+#if defined(__HGGC__)
+    if constexpr (cache_scores) {
+      if (num_experts <= 8 * kThreadsPerWarp) {
+        dispatch_forward_router_tiles<DataType>(num_experts, [&](auto tiles, auto full) {
+          auto cached = [&](auto function) {
+            launch(fused_topk_with_score_function_forward_kernel<DataType, BiasType, RoutingMapFormat,
+                   TopkFuncType::Radix, decltype(function)::value, int32_t, decltype(tiles)::value,
+                   decltype(full)::value>);
+          };
+          switch (score_function) {
+            case 0: return cached(std::integral_constant<int, 0>{});
+            case 1: return cached(std::integral_constant<int, 1>{});
+            case 2: return cached(std::integral_constant<int, 2>{});
+            default: NVTE_ERROR("Unsupported score_function: ", score_function);
+          }
+        });
+        return;
+      }
+    }
+#endif
     switch (score_function) {
       case 0:
         launch(fused_topk_with_score_function_forward_kernel<DataType, BiasType, RoutingMapFormat,
@@ -674,6 +957,9 @@ void fused_topk_with_score_function_forward_with_indices_kernel_launcher(
                ", got ", num_experts);
   }
 
+  const bool use_radix = topk >= get_radix_topk_threshold() && num_experts <= kMaxExpertsRadixTopk;
+  simplify_singleton_top1_groups(num_experts, topk, use_radix, num_groups, group_topk);
+
   size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
   size_t total_blocks = (num_tokens + num_token_per_block - 1) / num_token_per_block;
   size_t scores_shmem = num_experts * num_token_per_block * sizeof(CompType);
@@ -704,7 +990,6 @@ void fused_topk_with_score_function_forward_with_indices_kernel_launcher(
     NVTE_CHECK_CUDA(cudaGetLastError());
   };
 
-  const bool use_radix = topk >= get_radix_topk_threshold() && num_experts <= kMaxExpertsRadixTopk;
   if (!use_radix) {
     // Simple path: no async loader, no persistent grid.
     check_shared_memory_capacity_num_experts(other_shmem, num_experts);
@@ -1103,6 +1388,40 @@ __global__ void fused_topk_with_score_function_backward_kernel(
   }
 }
 
+template <typename DataType, int Tiles, bool Full>
+__global__ void fused_topk_backward_postsoftmax_register_kernel(
+    const uint8_t *routing_map, const CompType *intermediate_output, const DataType *grad_probs,
+    int num_tokens, int num_experts, CompType scaling_factor, DataType *grad_logits) {
+  int token = blockIdx.x * (blockDim.x / kThreadsPerWarp) + threadIdx.x / kThreadsPerWarp;
+  if (token >= num_tokens) return;
+  int lane_id = threadIdx.x % kThreadsPerWarp;
+  int base = token * (Full ? Tiles * kThreadsPerWarp : num_experts) + lane_id;
+  CompType grad[Tiles], act[Tiles];
+  bool routed[Tiles];
+#pragma unroll
+  for (int tile = 0; tile < Tiles; ++tile) {
+    int offset = base + tile * kThreadsPerWarp;
+    bool valid = Full || lane_id + tile * kThreadsPerWarp < num_experts;
+    grad[tile] = valid ? static_cast<CompType>(grad_probs[offset]) : 0.0f;
+    act[tile] = valid ? intermediate_output[offset] : 0.0f;
+    routed[tile] = valid && routing_map[offset] != 0;
+  }
+  CompType dot = 0.0f;
+#pragma unroll
+  for (int tile = 0; tile < Tiles; ++tile) {
+    CompType scaled = grad[tile] * scaling_factor;
+    if (routed[tile]) dot += scaled * act[tile];
+  }
+  dot = warp_allreduce_sum(dot);
+#pragma unroll
+  for (int tile = 0; tile < Tiles; ++tile) {
+    if (Full || lane_id + tile * kThreadsPerWarp < num_experts) {
+      grad_logits[base + tile * kThreadsPerWarp] =
+          static_cast<DataType>(routed[tile] ? act[tile] * fmaf(scaling_factor, grad[tile], -dot) : 0.0f);
+    }
+  }
+}
+
 template <typename DataType, NVTERoutingMapFormat RoutingMapFormat>
 void fused_topk_with_score_function_backward_kernel_launcher(
     const uint8_t *routing_map, const CompType *intermediate_output, const DataType *grad_probs,
@@ -1117,6 +1436,19 @@ void fused_topk_with_score_function_backward_kernel_launcher(
   size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
   size_t total_blocks = (num_tokens + num_token_per_block - 1) / num_token_per_block;
 
+#if defined(__HGGC__)
+  if constexpr (RoutingMapFormat == NVTE_ROUTING_MAP_FORMAT_BYTEMAP) {
+    if (num_experts <= 8 * kThreadsPerWarp && score_function == 1 && !use_pre_softmax) {
+      dispatch_router_tiles(num_experts, [&](auto tiles, auto full) {
+        fused_topk_backward_postsoftmax_register_kernel<DataType, decltype(tiles)::value, decltype(full)::value>
+            <<<total_blocks, kThreadsPerBlock, 0, stream>>>(routing_map, intermediate_output,
+                grad_probs, num_tokens, num_experts, scaling_factor, grad_logits);
+      });
+      NVTE_CHECK_CUDA(cudaGetLastError());
+      return;
+    }
+  }
+#endif
   size_t single_buf_shmem =
       RawAsyncLoader<DataType>::shmem_bytes(num_experts, num_token_per_block, 1) +
       RawAsyncLoader<CompType>::shmem_bytes(num_experts, num_token_per_block, 1) +

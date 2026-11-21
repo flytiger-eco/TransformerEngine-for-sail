@@ -725,6 +725,28 @@ def test_score_for_aux_loss_bitmap_vs_bytemap(dtype, num_tokens, num_experts, to
     torch.testing.assert_close(logits_byte.grad, logits_bit.grad, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_experts", [7, 24, 32, 33, 192, 256, 257])
+@pytest.mark.parametrize("topk", [1, 2, 3, 4, 5, 6, 7])
+def test_simple_router_load_precision(dtype, num_experts, topk):
+    # 13 个 token 覆盖 CTA 尾部；E=257 覆盖有界加载的 fallback。
+    values = torch.linspace(-1.0, 1.0, num_experts, device="cuda", dtype=torch.float32)
+    logits = values.repeat(13, 1).to(dtype).detach().requires_grad_(True)
+    reference = logits.detach().clone().requires_grad_(True)
+    probs, routing_map = fused_topk_with_score_function(
+        logits, topk, False, None, None, 1.2, "softmax", None
+    )
+    expected, expected_map = topk_score_function_pytorch(
+        reference, topk, scaling_factor=1.2, score_function="softmax"
+    )
+    torch.testing.assert_close(routing_map, expected_map, atol=0, rtol=0)
+    torch.testing.assert_close(probs, expected)
+    grad = torch.linspace(-0.5, 0.5, probs.numel(), device="cuda").reshape_as(probs).to(dtype)
+    probs.backward(grad)
+    expected.backward(grad)
+    torch.testing.assert_close(logits.grad, reference.grad)
+
+
 def profile_topk_softmax(
     dtype,
     num_tokens,
