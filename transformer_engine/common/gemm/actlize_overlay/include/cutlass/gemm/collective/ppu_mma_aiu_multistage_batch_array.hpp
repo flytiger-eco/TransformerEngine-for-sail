@@ -272,10 +272,16 @@ struct CollectiveMma<
     (void) k_tile_iter;
     (void) residue_mnk;
     int k_tile = 0;
-    // Prologue, start async loads for all pipes (fill every stage so the
-    // wait/issue point in the main loop can sit one k_block earlier).
+    // Reserve a free shared-memory slot for the first K block to start the next
+    // A/B loads before the CTA waits for the next tile's register prefetch.
+#if NVTE_GG_COMMON_K && NVTE_GG_N_EXPAND != 4 && NVTE_GG_ARCH == 89
+    constexpr bool early_issue = DispatchPolicy::Stages == 3 && size<2>(TileShape{}) == 64;
+#else
+    constexpr bool early_issue = false;
+#endif
+    constexpr int prefill = early_issue ? DispatchPolicy::Stages - 1 : DispatchPolicy::Stages;
     CUTLASS_PRAGMA_UNROLL
-    for (int k_pipe = 0; k_pipe < DispatchPolicy::Stages; ++k_pipe) {
+    for (int k_pipe = 0; k_pipe < prefill; ++k_pipe) {
       if (k_tile_count > 0) {
         copy_aiu<SplitAIU>(
           gmem_tiled_copy_A, tAgA(_,_,_,k_tile), tAsA(_,_,_,k_pipe),
@@ -329,7 +335,7 @@ struct CollectiveMma<
     // Current pipe index in smem to read from
     int smem_pipe_read  = 0;
     // Current pipe index in smem to write to
-    int smem_pipe_write = 0;
+    int smem_pipe_write = early_issue ? prefill : 0;
 
     Tensor tCsA_p = tCsA(_,_,_,smem_pipe_read);
     Tensor tCsB_p = tCsB(_,_,_,smem_pipe_read);
@@ -338,11 +344,8 @@ struct CollectiveMma<
     auto K_BLOCK_MAX = size<2>(tCrA_copy_view);
     auto K_ATOM_PER_COPY = size<2>(tCrA) / size<2>(tCrA_copy_view);
 
-    // PREFETCH register pipeline
-    // Wait until our first prefetched tile is loaded in (the prologue filled
-    // all Stages pipes, so one more group than the classic layout is in
-    // flight and the wait needs to leave one more group outstanding).
-    cp_async_wait<DispatchPolicy::Stages-1>();
+    // Only the first tile must be ready for the initial register load.
+    cp_async_wait<prefill - 1>();
     __syncthreads();
 
     // Prefetch the first rmem from the first k-tile
@@ -350,12 +353,26 @@ struct CollectiveMma<
     copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
 
 
-    // k_block where the pipeline wait and the next gmem issue are fused.
+    // All warps have fetched the last fragment of this stage at this K block.
     // With K_BLOCK_MAX == 1 the single k_block doubles as the issue point
     // (K_BLOCK_MAX - 2 would never match and the loop would never advance).
     constexpr int K_ISSUE_BLOCK = (K_BLOCK_MAX == 1) ? 0 : K_BLOCK_MAX - 2;
 
+    auto issue_next = [&]() {
+      if (k_tile_count > 0) {
+        copy_aiu<SplitAIU>(
+          gmem_tiled_copy_A, tAgA(_,_,_,k_tile), tAsA(_,_,_,smem_pipe_write),
+          gmem_tiled_copy_B, tBgB(_,_,_,k_tile), tBsB(_,_,_,smem_pipe_write),
+          warp_idx
+        );
+      }
+      cp_async_fence();
+    };
+
     auto process_kblock_iterations = [&](auto k_block) {
+      if constexpr (early_issue) {
+        if (k_block == 0) issue_next();
+      }
       // At the last k_block of this tile the next register block (0) belongs to
       // the next smem tile: re-slice the read view before the next prefetch.
       if (k_block == K_BLOCK_MAX - 1) {
@@ -366,7 +383,7 @@ struct CollectiveMma<
 
       // Skip the smem->regs prefetch of the last k_block of the last k-tile:
       // no consumer is left for it.
-      bool is_last_k_block = (k_block == K_BLOCK_MAX - 1) && (k_tile_count == -DispatchPolicy::Stages);
+      bool is_last_k_block = (k_block == K_BLOCK_MAX - 1) && (k_tile_count == -prefill);
       if (!is_last_k_block) {
         if constexpr (K_BLOCK_MAX == 1) {
           // Single k_block per tile: the tile about to be prefetched was
@@ -390,30 +407,23 @@ struct CollectiveMma<
         cute::gemm(tiled_mma, accum, tCrA(_,_,atom_idx), tCrB(_,_,atom_idx), src_accum);
       }
 
-      // Copy gmem to smem after computing gemm on each k-pipe: the wait and
-      // the issue are fused one k_block earlier than the classic layout, so
-      // the wait slot is overlapped by the freshly issued loads.
+      // Make the next read stage visible before any warp fetches from it.
+      // All warps have finished reading the old stage when this barrier retires.
       if (k_block == K_ISSUE_BLOCK) {
         // Commit the smem for smem_pipe_read
         cp_async_wait<DispatchPolicy::Stages-2>();
         __syncthreads();
 
-        if (k_tile_count > 0) {
-          copy_aiu<SplitAIU>(
-            gmem_tiled_copy_A, tAgA(_,_,_,k_tile), tAsA(_,_,_,smem_pipe_write),
-            gmem_tiled_copy_B, tBgB(_,_,_,k_tile), tBsB(_,_,_,smem_pipe_write),
-            warp_idx
-          );
-        }
-        cp_async_fence();
+        if constexpr (!early_issue) issue_next();
         // Advance the tile
         --k_tile_count;
         ++k_tile;
 
         // Advance the pipes
+        if constexpr (early_issue) smem_pipe_write = smem_pipe_read;
         ++smem_pipe_read;
         smem_pipe_read = (smem_pipe_read == DispatchPolicy::Stages) ? 0 : smem_pipe_read;
-        smem_pipe_write = smem_pipe_read;
+        if constexpr (!early_issue) smem_pipe_write = smem_pipe_read;
       }
     };
 
@@ -431,7 +441,7 @@ struct CollectiveMma<
 #else
     CUTLASS_PRAGMA_NO_UNROLL
 #endif
-    while (k_tile_count > -(DispatchPolicy::Stages)) {
+    while (k_tile_count > -prefill) {
       // Pipeline the outer products with a static for loop.
       //
       // Note, the for_each() function is required here to ensure `k_block` is of type Int<x>.
@@ -548,7 +558,11 @@ struct CollectiveMma<
       process_kblock(k_block);
     });
     finish_n_tile();
+#if NVTE_GG_COMMON_K
+    #pragma unroll 3
+#else
     CUTLASS_PRAGMA_NO_UNROLL
+#endif
     while (remaining > -DispatchPolicy::Stages) {
       for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
         process_kblock(k_block);

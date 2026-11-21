@@ -562,6 +562,48 @@ public:
   }
 
 
+  // The caller drains the aliased mainloop storage before entering and fences
+  // its reuse after the last consumer. One warp issues each 128-byte-wide AIU cube.
+  template <int Chunks, int Rows, int Cols, int Stages, class Element, class Consumer>
+  CUTLASS_DEVICE static void with_staged_c(
+      Element const* src, int m, int n, int stride, int row, int col, int thread_idx,
+      char* smem_buf, Consumer consume) {
+    using namespace cute;
+    constexpr int width = 128 / sizeof(Element);
+    static_assert(Cols % width == 0 && Stages > 0 && Stages <= Chunks);
+    constexpr int cubes = Cols / width, cube_elems = Rows * width, chunk_elems = Rows * Cols;
+    using Load = PPU0015_AIU_LOAD<Int<cube_elems * sizeof_bits<Element>::value>, Element,
+                                  false, Rows, width, false>;
+    // padz.linear lays out each row-major cube consecutively in shared memory.
+    using ChunkLayout = Layout<Shape<Int<Rows>, Shape<Int<width>, Int<cubes>>>,
+                               Stride<Int<width>, Stride<_1, Int<cube_elems>>>>;
+    Element* smem = reinterpret_cast<Element*>(smem_buf);
+    AiuDesc desc;
+    desc.init(reinterpret_cast<const uint8_t*>(src), m, n, stride);
+    auto issue = [&](int chunk, int stage) {
+      int warp = thread_idx / 32;
+      if (warp < cubes)
+        Load::copy(smem + stage * chunk_elems + warp * cube_elems, src, desc,
+                   col + warp * width, row + chunk * Rows);
+      cp_async_fence();
+    };
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int stage = 0; stage < Stages; ++stage) issue(stage, stage);
+    CUTLASS_PRAGMA_UNROLL
+    for (int chunk = 0; chunk < Chunks; ++chunk) {
+      if (chunk + 1 < Chunks) cp_async_wait<Stages - 1>();
+      else cp_async_wait<0>();
+      __syncthreads();
+      const int stage = chunk % Stages;
+      consume(chunk, make_tensor(make_smem_ptr(smem + stage * chunk_elems), ChunkLayout{}));
+      if (chunk + Stages < Chunks) {
+        __syncthreads();
+        issue(chunk + Stages, stage);
+      }
+    }
+  }
+
   template<
     class ProblemShapeMNKL,
     class BlockShapeMNK,
@@ -701,137 +743,76 @@ public:
       constexpr int kChunkM = kAiuBlockM / kAiuMmaM;
       constexpr int kChunkN = kAiuBlockN;
       constexpr int kChunks = kAiuMmaM;
-      constexpr int kCubeH  = kChunkM;
-      constexpr int kCubeW  = kAiuCubeW;
-      constexpr int kCubes  = kChunkN / kCubeW;
-      constexpr int kCubeElems  = kCubeH * kCubeW;
-      constexpr int kChunkElems = kChunkM * kChunkN;
       // One stage fills smem_epilogue exactly, so the second one lands on the
       // FusionStorage that follows it. Double buffering is only allowed when
       // that really is an empty shell AND the union as a whole has room for it.
       // If either condition fails, fall back to single buffering silently: that
       // gives up roughly a third of the gain but never runs out of bounds.
-      constexpr int kChunkBytes  = kChunkElems * int(sizeof(ElementC));
+      constexpr int kChunkBytes  = kChunkM * kChunkN * int(sizeof(ElementC));
       constexpr int kWantStages  = 2;
       constexpr bool kSlackFitsC = sizeof(FusionStorage) <= 1 &&
                                    int(CSmemBytes::value) >= kWantStages * kChunkBytes;
       constexpr int kStages =
           (kSlackFitsC && kChunks >= kWantStages) ? kWantStages : 1;
 
-      // Swzl=false selects padz.linear: in smem each cube is stored row-major
-      // and the cubes are laid out one after another.
-      using CAiuLoad = cute::PPU0015_AIU_LOAD<
-          cute::C<kCubeElems * cute::sizeof_bits<ElementC>::value>,
-          ElementC, /*Trans=*/false, kCubeH, kCubeW, /*Swzl=*/false>;
-      using CChunkLayout = Layout<Shape <Int<kCubeH>, Shape <Int<kCubeW>, Int<kCubes>>>,
-                                  Stride<Int<kCubeW>, Stride<        _1, Int<kCubeElems>>>>;
-
-      ElementC* smem_c = reinterpret_cast<ElementC*>(smem_buf);
-      ElementC const* ptr_c = get_c_ptr(params, l_coord, preloadC);
-
-      cute::AiuDesc desc;
-      desc.init(reinterpret_cast<const uint8_t*>(ptr_c), int(M), int(N),
-                int(cute::get<0>(get_stride_c(params, l_coord))));
-
-      const int m_base = int(m_coord) * kAiuBlockM;
-      const int n_base = int(n_coord) * kAiuBlockN;
-      const int warp_idx = thread_idx / 32;
-
-      // The AIU is issued per warp, so a chunk's kCubes cubes are spread over
-      // the first kCubes warps.
-      auto issue_chunk = [&](int chunk, int stage) {
-        if (warp_idx < kCubes) {
-          CAiuLoad::copy(smem_c + stage * kChunkElems + warp_idx * kCubeElems,
-                         ptr_c, desc,
-                         /*coord_w=*/n_base + warp_idx * kCubeW,
-                         /*coord_h=*/m_base + chunk * kChunkM);
-        }
-      };
-
-      // The mainloop leaves its trailing AIU groups undrained on exit, and the
-      // smem_a/smem_b they write aliases the C buffer used here through the
-      // union, so this wait_all is required for correctness — it is not merely
-      // group-count bookkeeping.
+      // Trailing A/B copies may still target the shared storage used for C.
       cp_async_wait<0>();
       __syncthreads();
+      with_staged_c<kChunks, kChunkM, kChunkN, kStages>(
+          get_c_ptr(params, l_coord, preloadC), int(M), int(N),
+          int(cute::get<0>(get_stride_c(params, l_coord))),
+          int(m_coord) * kAiuBlockM, int(n_coord) * kAiuBlockN, thread_idx, smem_buf,
+          [&](int s, auto const& sC_chunk) {
+            Tensor tCsC = tC.partition_D(sC_chunk);
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int st = 0; st < kStages; ++st) {
-        issue_chunk(st, st);
-        cp_async_fence();
-      }
-
-      CUTLASS_PRAGMA_UNROLL
-      for (int s = 0; s < kChunks; ++s) {
-        // Groups are committed in order, so every chunk but the last may leave
-        // kStages-1 groups still in flight.
-        if (s + 1 < kChunks) {
-          cp_async_wait<kStages - 1>();
-        } else {
-          cp_async_wait<0>();
-        }
-        __syncthreads();
-
-        Tensor sC_chunk = make_tensor(
-            make_smem_ptr(smem_c + (s % kStages) * kChunkElems), CChunkLayout{});
-        Tensor tCsC = tC.partition_D(sC_chunk);
-
-        CUTLASS_PRAGMA_UNROLL
-        for (int mma_n = 0; mma_n < kMmaN; ++mma_n) {
-          Tensor tCaC_frag = tCaC(_,s,mma_n);
-          Tensor tCaD_frag = tCaD(_,s,mma_n);
-          Tensor tCcD_frag = tCcD(_,s,mma_n);
-
-          bool any_valid = false;
-          bool all_valid = true;
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < EvtFragSize; ++i) {
-            auto coord = tCcD_frag(i);
-            bool valid = get<0>(coord) < get<0>(residue_mnk) &&
-                         get<1>(coord) < get<1>(residue_mnk);
-            any_valid = any_valid || valid;
-            all_valid = all_valid && valid;
-          }
-
-          if (any_valid) {
-            using MmaAccType = typename FrgEngine::value_type;
-            using AccArray = cutlass::Array<MmaAccType, EvtFragSize>;
-            auto const& accumulator = *reinterpret_cast<const AccArray*>(tCaC_frag.data());
-            // padz already zeroed the out-of-bounds elements in smem, so the
-            // tail chunk does not need a per-element predicate on the C read.
-            Tensor tCrC_frag = make_tensor<ElementC>(shape(tCaC_frag));
-            copy(CopyAtomR2S{}, tCsC(_,0,mma_n), tCrC_frag);
-            AccArray combined;
             CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < EvtFragSize; ++i) {
-              combined[i] = accumulator[i] + static_cast<MmaAccType>(tCrC_frag(i));
-            }
-            auto output = cst_callbacks.visit(combined, s * kMmaN + mma_n, s, mma_n);
-            Tensor tDrD_frag = make_tensor(output.data(), tCaC_frag.layout());
+            for (int mma_n = 0; mma_n < kMmaN; ++mma_n) {
+              Tensor tCaC_frag = tCaC(_,s,mma_n);
+              Tensor tCaD_frag = tCaD(_,s,mma_n);
+              Tensor tCcD_frag = tCcD(_,s,mma_n);
 
-            if (all_valid) {
-              copy(tiled_r2s, tDrD_frag, tCaD_frag);
-            } else {
+              bool any_valid = false;
+              bool all_valid = true;
               CUTLASS_PRAGMA_UNROLL
               for (int i = 0; i < EvtFragSize; ++i) {
                 auto coord = tCcD_frag(i);
-                if (get<0>(coord) < get<0>(residue_mnk) &&
-                    get<1>(coord) < get<1>(residue_mnk)) {
-                  tCaD_frag(i) = tDrD_frag(i);
+                bool valid = get<0>(coord) < get<0>(residue_mnk) &&
+                             get<1>(coord) < get<1>(residue_mnk);
+                any_valid = any_valid || valid;
+                all_valid = all_valid && valid;
+              }
+
+              if (any_valid) {
+                using MmaAccType = typename FrgEngine::value_type;
+                using AccArray = cutlass::Array<MmaAccType, EvtFragSize>;
+                auto const& accumulator = *reinterpret_cast<const AccArray*>(tCaC_frag.data());
+                // padz already zeroed the out-of-bounds elements in smem, so the
+                // tail chunk does not need a per-element predicate on the C read.
+                Tensor tCrC_frag = make_tensor<ElementC>(shape(tCaC_frag));
+                copy(CopyAtomR2S{}, tCsC(_,0,mma_n), tCrC_frag);
+                AccArray combined;
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < EvtFragSize; ++i) {
+                  combined[i] = accumulator[i] + static_cast<MmaAccType>(tCrC_frag(i));
+                }
+                auto output = cst_callbacks.visit(combined, s * kMmaN + mma_n, s, mma_n);
+                Tensor tDrD_frag = make_tensor(output.data(), tCaC_frag.layout());
+
+                if (all_valid) {
+                  copy(tiled_r2s, tDrD_frag, tCaD_frag);
+                } else {
+                  CUTLASS_PRAGMA_UNROLL
+                  for (int i = 0; i < EvtFragSize; ++i) {
+                    auto coord = tCcD_frag(i);
+                    if (get<0>(coord) < get<0>(residue_mnk) &&
+                        get<1>(coord) < get<1>(residue_mnk)) {
+                      tCaD_frag(i) = tDrD_frag(i);
+                    }
+                  }
                 }
               }
             }
-          }
-        }
-
-        if (s + kStages < kChunks) {
-          // Before a buffer is reused, every thread must have finished reading
-          // the current chunk out of it.
-          __syncthreads();
-          issue_chunk(s + kStages, s % kStages);
-          cp_async_fence();
-        }
-      }
+          });
 
       // The next work tile's mainloop immediately issues AIU copies into the
       // aliased smem, so a barrier here is mandatory on the way out.
@@ -1006,11 +987,11 @@ public:
   // legal wherever the whole fragment is inside the valid extent. Re-deriving
   // that alignment on device from the global addresses cost one 64-bit layout
   // evaluation per element and dominated this path on partial tiles.
-  template <class TileShapeType, class Coord, class Acc, class Mma>
+  template <class TileShapeType, class Coord, class Acc, class Mma, class SharedBytes>
   CUTLASS_DEVICE static void compute_native(
       ElementD const* src, ElementD* dst, int M, int N,
       TileShapeType tile_shape, Coord coord, Acc const& acc, Mma mma,
-      int thread_idx, float alpha, float beta, bool aligned) {
+      int thread_idx, float alpha, float beta, bool aligned, char* smem_buf, SharedBytes) {
     using namespace cute;
     if (M <= 0 || N <= 0) return;
 
@@ -1059,6 +1040,34 @@ public:
     };
 
     constexpr int Frag = decltype(size(tAcc(_, 0, 0)))::value;
+
+    constexpr int block_m = decltype(size<0>(gD))::value, block_n = decltype(size<1>(gD))::value;
+    constexpr int chunks = decltype(size<1>(tAcc))::value;
+    constexpr int chunk_m = block_m / chunks, stages = 2;
+    if constexpr (block_m == 256 && block_n == 256 && chunks >= stages &&
+                  stages * chunk_m * block_n * sizeof(ElementD) <= SharedBytes::value) {
+      if (aligned && with_c && reinterpret_cast<uintptr_t>(src) % 16 == 0 &&
+          M - m_base >= block_m && N - n_base >= block_n) {
+        with_staged_c<chunks, chunk_m, block_n, stages>(
+            src, M, N, N, m_base, n_base, thread_idx, smem_buf, [&](int m, auto const& chunk) {
+              auto tC = thread.partition_D(chunk);
+              CUTLASS_PRAGMA_UNROLL
+              for (int n = 0; n < size<2>(tAcc); ++n) {
+                auto a = tAcc(_, m, n);
+                auto c = make_tensor<ElementD>(shape(a));
+                copy(CopyAtomG2R{}, tC(_, 0, n), c);
+                cutlass::Array<float, Frag> values;
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < Frag; ++i)
+                  values[i] = alpha * float(a(i)) + beta * float(c(i));
+                auto out = cutlass::NumericArrayConverter<ElementD, float, Frag>{}(values);
+                auto result = make_tensor(out.data(), a.layout());
+                copy(CopyAtomR2G{}, result, tDst(_, m, n));
+              }
+            });
+        return;
+      }
+    }
 
     CUTLASS_PRAGMA_UNROLL
     for (int mma_m = 0; mma_m < size<1>(tAcc); ++mma_m) {
