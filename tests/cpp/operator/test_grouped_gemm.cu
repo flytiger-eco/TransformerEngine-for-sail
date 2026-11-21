@@ -964,6 +964,57 @@ TEST(MultiTensorGemmTest, ValidatesListShapesOnSm89) {
   const auto* values = d.rowwise_cpu_dptr<bf16>();
   EXPECT_TRUE(std::all_of(values, values + m * n, [](bf16 x) { return float(x) == 64.f; }));
 }
+
+TEST(GroupedGemmNativeTest, StagedCWithPerExpertScalarsAndEdgeTiles) {
+  if (getDeviceComputeCapability() != 89) GTEST_SKIP() << "Requires PPU SM89.";
+  constexpr size_t groups = 3, m = 528, n = 520, k = 37;
+  auto pack = [&](Tensor& t, size_t rows, size_t cols) {
+    GroupedTensorWrapper grouped(groups, std::vector<size_t>{groups * rows, cols});
+    grouped.set_rowwise_data(t.rowwise_dptr(), t.dtype(), std::vector<size_t>{groups * rows * cols});
+    return grouped;
+  };
+  auto a = make_bf16_operand("A", {groups * k, n});
+  auto b = make_bf16_operand("B", {groups * k, m});
+  auto ga = pack(a, k, n), gb = pack(b, k, m);
+  Tensor alpha("alpha", std::vector<size_t>{groups}, DType::kFloat32);
+  Tensor beta("beta", std::vector<size_t>{groups}, DType::kFloat32);
+  const float scales_a[] = {0.5f, -1.f, 1.f}, scales_b[] = {-1.f, 0.f, 0.5f};
+  std::copy_n(scales_a, groups, alpha.rowwise_cpu_dptr<float>());
+  std::copy_n(scales_b, groups, beta.rowwise_cpu_dptr<float>());
+  alpha.from_cpu();
+  beta.from_cpu();
+  Tensor ws("workspace", std::vector<size_t>{nvte_get_grouped_gemm_setup_workspace_size(groups)},
+            DType::kByte);
+
+  auto check = [&](auto value) {
+    using T = decltype(value);
+    Tensor c("C", std::vector<size_t>{groups * m, n}, TypeInfo<T>::dtype);
+    Tensor d("D", std::vector<size_t>{groups * m, n}, TypeInfo<T>::dtype);
+    auto gc = pack(c, m, n), gd = pack(d, m, n);
+    const size_t count = groups * m * n;
+    auto source = [n](size_t i) { return float(int((i + 3 * (i / n)) % 13) - 6); };
+    auto* values = c.rowwise_cpu_dptr<T>();
+    for (size_t i = 0; i < count; ++i) values[i] = T(source(i));
+    c.from_cpu();
+    for (bool in_place : {false, true}) {
+      if (in_place) {
+        NVTE_CHECK_CUDA(cudaMemcpy(d.rowwise_dptr(), c.rowwise_dptr(), count * sizeof(T),
+                                   cudaMemcpyDeviceToDevice));
+      }
+      nvte_grouped_gemm(ga.data(), false, gb.data(), true, in_place ? gd.data() : gc.data(),
+                        gd.data(), alpha.data(), beta.data(), ws.data(), nullptr, nullptr, 0);
+      d.to_cpu();
+      const auto* result = d.rowwise_cpu_dptr<T>();
+      for (size_t i = 0; i < count; ++i) {
+        const size_t group = i / (m * n);
+        ASSERT_EQ(float(result[i]), scales_a[group] * float(k) + scales_b[group] * source(i))
+            << "group=" << group << ", element=" << i << ", in_place=" << in_place;
+      }
+    }
+  };
+  check(bf16{});
+  check(float{});
+}
 #endif
 
 TEST_P(GroupedGemmTest, CompareWithMultiTensorGemm) {

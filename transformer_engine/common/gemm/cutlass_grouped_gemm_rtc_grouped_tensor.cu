@@ -345,9 +345,20 @@ void launch_native(NativeSetup setup, TileConfig cfg, int64_t sum_m, cudaStream_
     NVTE_CALL_CHECK_CUDA_DRIVER(cuOccupancyMaxActiveBlocksPerMultiprocessor, &blocks_per_sm,
                                 kernel.function, threads, kernel.smem_size);
   }
+  int blocks = setup.sms * std::max(1, blocks_per_sm);
+  if constexpr (TA && !TB) {
+    // Packed wgrad can have equal M/N but very different reduction lengths. Give the
+    // hardware queue independent output tiles to fill CUs as shorter experts finish.
+    if (setup.a.first && setup.b.first && !setup.a.last && !setup.b.last &&
+        group_tiles > 0 && setup.sms == cuda::sm_count(cuda::current_device())) {
+      const uint64_t cap = uint64_t(setup.sms) * 16;
+      const uint64_t tiles = std::min(group_tiles, 2 * cap) * setup.groups;
+      blocks = std::max(blocks, int(std::min(cap, (tiles + 1) / 2)));
+    }
+  }
   void* args[] = {&params};
   NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchKernel, kernel.function,
-                              setup.sms * std::max(1, blocks_per_sm), 1, 1, threads, 1, 1,
+                              blocks, 1, 1, threads, 1, 1,
                               kernel.smem_size, static_cast<CUstream>(stream), args, nullptr);
 }
 }  // namespace

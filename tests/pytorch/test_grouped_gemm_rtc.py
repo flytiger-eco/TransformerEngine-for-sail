@@ -127,8 +127,8 @@ def test_rtc_common_weight_shape_cache(auto_backend, layout):
         shape = (first, second) if layout == "TN" else (second, first)
         return torch.randn(shape, device="cuda", dtype=dtype)
 
-    for n, ks in [(1024, (768, 768)), (2048, (768, 768)), (2048, (512, 512)),
-                  (2048, (512, 768))]:
+    for n, ks in [(1024, (768, 768)), (1024, (4096, 4096)), (2048, (768, 768)),
+                  (2048, (512, 512)), (2048, (512, 768))]:
         a = [matrix(n, k) for k in ks]
         b = [matrix(m, k) for m, k in zip(rows, ks)]
         out = [torch.empty(m, n, device="cuda", dtype=dtype) for m in rows]
@@ -796,10 +796,13 @@ def _expert_views(storage, shapes):
     return views
 
 
-def test_grouped_tensor_common_shape_device_scalars(auto_backend):
+@pytest.mark.parametrize("rows,expand", [
+    ([0, 777, 513, 1023] * 4, False),
+    ([0, 2048, 2047, 4097] * 4, True),
+])
+def test_grouped_tensor_common_shape_device_scalars(auto_backend, rows, expand):
     if torch.cuda.get_device_capability() != (8, 9):
         pytest.skip("Native GroupedTensor requires PPU sm89")
-    rows = [0, 777, 513, 1023] * 4
     n, k = 2048, 512
     weights, inputs, outputs = [(n, k)] * len(rows), [(m, k) for m in rows], [(m, n) for m in rows]
     a, b, d = [_packed_storage(shapes, torch.bfloat16, mirror=True)
@@ -813,7 +816,8 @@ def test_grouped_tensor_common_shape_device_scalars(auto_backend):
         torch.cuda.synchronize()
     kernels = [e.name for e in prof.events() if e.name.startswith("nvte_grouped_gemm3_")
                and e.device_type == torch.autograd.DeviceType.CUDA]
-    assert len(kernels) == 1 and kernels[0].endswith(f"_grouped_tensor_n{n}k{k}")
+    suffix = "_grouped_tensor_ne4" if expand else "_grouped_tensor"
+    assert len(kernels) == 1 and kernels[0].endswith(f"{suffix}_n{n}k{k}")
     for out, ref in zip(dv, products):
         torch.testing.assert_close(out.float(), ref, rtol=0.005, atol=0.01)
 
@@ -941,6 +945,8 @@ def test_rtc_nexpand(api, layout, m, n, k, expand):
                and e.device_type == torch.autograd.DeviceType.CUDA]
     assert len(kernels) == 1
     assert ("_ne4" in kernels[0]) == expand
+    if expand and k == 512:
+        assert kernels[0].endswith(f"_ne4_n{n}k{k}")
     assert ("_grouped_tensor" in kernels[0]) == (api == "grouped_tensor")
     for weight, inp, out in zip(av, bv, dv):
         ref = inp.float() @ (weight.float().t() if layout == "TN" else weight.float())
