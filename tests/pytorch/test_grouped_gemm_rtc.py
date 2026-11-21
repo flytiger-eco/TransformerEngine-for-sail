@@ -78,21 +78,21 @@ def auto_backend(_rtc_env, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "rows,columns,offset_operand,output_dtype,expect_rtc",
+    "rows,columns,k,offset_operand,output_dtype,expect_rtc",
     [
-        ([64, 96], 128, None, torch.float32, True),
-        ([64], 128, None, torch.bfloat16, False),
-        ([1536, 1536], 1024, None, torch.bfloat16, False),
-        ([2304, 2304], 2048, None, torch.bfloat16, False),
-        ([64, 64, 64, 4096], 2048, None, torch.bfloat16, False),
-        *[([64, 96], 128, operand, torch.bfloat16, False) for operand in ("a", "b", "d")],
+        ([64, 96], 128, 64, None, torch.float32, True),
+        ([64], 128, 64, None, torch.bfloat16, False),
+        ([1536, 1536], 1024, 64, None, torch.bfloat16, False),
+        ([1024] * 3, 256, 8192, None, torch.float32, False),
+        ([2304, 2304], 2048, 64, None, torch.bfloat16, False),
+        ([64, 64, 64, 4096], 2048, 64, None, torch.bfloat16, False),
+        *[([64, 96], 128, 64, operand, torch.bfloat16, False) for operand in ("a", "b", "d")],
     ],
 )
-def test_grouped_gemm_auto_backend(auto_backend, rows, columns, offset_operand, output_dtype,
+def test_grouped_gemm_auto_backend(auto_backend, rows, columns, k, offset_operand, output_dtype,
                                    expect_rtc):
     if torch.cuda.get_device_capability() != (8, 9):
         pytest.skip("Automatic RTC dispatch targets PPU SM89")
-    k = 64
 
     def matrix(name, shape, value, dtype=torch.bfloat16):
         offset = int(name == offset_operand)

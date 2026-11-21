@@ -1166,7 +1166,7 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
              reinterpret_cast<uintptr_t>(t.dptr) % 16 == 0;
     };
     size_t first_k = 0;
-    double tiles = 0, squared_tiles = 0;
+    double tiles = 0, squared_tiles = 0, reduction_panels = 0;
     for (int i = 0; i < num_gemms; ++i) {
       const auto &a = convertNVTETensorCheck(A[i])->data;
       const auto &b = convertNVTETensorCheck(B[i])->data;
@@ -1174,13 +1174,14 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
       if (a.dtype != input_dtype || b.dtype != input_dtype || d.dtype != output_dtype ||
           !aligned_matrix(a) || !aligned_matrix(b) || !aligned_matrix(d))
         return false;
+      const auto k = b.shape[transb ? 0 : 1];
       if (use_cutlass < 0) {
         const double output_tiles = double((d.shape[0] + 255) / 256) * ((d.shape[1] + 255) / 256);
         tiles += output_tiles;
         squared_tiles += output_tiles * output_tiles;
+        reduction_panels += output_tiles * (k / 256);
       }
       if (is_hopper) {
-        const auto k = b.shape[transb ? 0 : 1];
         if (k % 128 || (i && k != first_k)) return false;
         first_k = k;
       }
@@ -1188,9 +1189,11 @@ void nvte_multi_tensor_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor
     // One persistent launch amortizes small experts. On PPU SM89, multi-stream
     // cuBLAS wins once large experts dominate. Weight each expert by its number
     // of 256x256 output tiles so a long tail of small experts cannot hide it.
-    // A handful of experts amortizes less launch overhead than a full batch.
+    // Few experts also expose less parallelism along a long reduction. Count
+    // full 256-element K panels with the same weighting as the output tiles.
     const int max_tiles_per_expert = 8 * std::min(num_gemms, 8);
-    return use_cutlass >= 0 || (tiles > 0 && squared_tiles <= max_tiles_per_expert * tiles);
+    return use_cutlass >= 0 || (tiles > 0 && squared_tiles <= max_tiles_per_expert * tiles &&
+                                reduction_panels <= num_gemms * tiles);
   };
 
   if (!should_use_cutlass()) {
