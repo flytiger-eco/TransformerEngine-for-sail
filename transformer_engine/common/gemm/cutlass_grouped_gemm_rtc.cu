@@ -195,8 +195,10 @@ struct ListGemm {
   void prepare(const NVTETensor* A, const NVTETensor* B, const NVTETensor* D) {
     const auto h = layout.view(staging.data());
     int64_t sum_m = 0, sum_n = 0, sum_k = 0;
-    bool ne4 = kernel.sm_arch == 89 && kernel.input_dtype == DType::kBFloat16 && !kernel.trans_a &&
-               !accumulate;
+    const bool overwrite_bf16 =
+        kernel.sm_arch == 89 && kernel.input_dtype == DType::kBFloat16 && !accumulate;
+    bool ne4 = overwrite_bf16 && !kernel.trans_a;
+    bool shared_weights_shape = overwrite_bf16 && kernel.output_dtype == DType::kBFloat16;
     uint64_t expanded = 0;
     for (int i = 0; i < groups; ++i) {
       const auto& a = convertNVTETensorCheck(A[i])->data;
@@ -217,6 +219,8 @@ struct ListGemm {
       sum_m += m;
       sum_n += n;
       sum_k += k;
+      shared_weights_shape = shared_weights_shape && n == cute::get<1>(h.shapes[0]) &&
+                             k == cute::get<2>(h.shapes[0]);
       if (ne4) {
         ne4 = ne4_shape(m, n, k) &&
               ((reinterpret_cast<uintptr_t>(a.dptr) | reinterpret_cast<uintptr_t>(b.dptr) |
@@ -230,6 +234,20 @@ struct ListGemm {
     tile = select_grouped_tile(sum_m / groups, sum_n / groups, sum_k / groups, groups,
                                kernel.trans_b, kernel.trans_a, kernel.sm_arch, sms);
     if (ne4) select_n_expand(tile, expanded, sms);
+
+    // Specialize shared N/K only when full-width tiles can fill the device.
+    // Short aligned reductions profit from the four-column pipeline. For
+    // row-major B, deeper reductions amortize a separate loop per output tile.
+    const int n = cute::get<1>(h.shapes[0]), k = cute::get<2>(h.shapes[0]);
+    const bool prefer_expanded = tile.n_expand && (kernel.trans_b || k < 16 * 64);
+    if (!prefer_expanded && shared_weights_shape && n > 0 && n % 256 == 0 &&
+        k >= 3 * 64 && k <= 32 * 64 && k % 64 == 0 &&
+        tile.tile_m == 256 && tile.tile_n == 256 && (sum_m / 256) * (n / 256) >= sms &&
+        (!forced_tile() || tile.matches(256, 256, 64, 3))) {
+      tile = kDefaultTile;
+      kernel.common_n = n;
+      kernel.common_k = k;
+    }
   }
 
   void* upload(size_t scratch) {

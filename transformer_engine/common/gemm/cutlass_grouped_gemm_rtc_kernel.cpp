@@ -38,7 +38,8 @@ std::string kernel_symbol(const KernelConfig& kernel, const TileConfig& tile) {
       "nvte_grouped_gemm3_", input, "_", input, "_", output, "_acc_fp32_LA_",
       kernel.trans_a ? "CM" : "RM", "_LB_", kernel.trans_b ? "CM" : "RM", "_LC_RM_sm",
       kernel.sm_arch, "_tb", tile.tile_m, "x", tile.tile_n, "x", tile.tile_k, "_s", tile.stages,
-      "_C", output, kernel.grouped_tensor ? "_grouped_tensor" : "", tile.n_expand ? "_ne4" : "");
+      "_C", output, kernel.grouped_tensor ? "_grouped_tensor" : "", tile.n_expand ? "_ne4" : "",
+      kernel.common_k ? concat_strings("_n", kernel.common_n, "k", kernel.common_k) : "");
 }
 
 std::string resolve_cutlass_include_dir() {
@@ -232,6 +233,8 @@ std::vector<std::string> compiler_options(const KernelConfig& kernel, const Tile
       concat_strings("-DNVTE_GG_OUT_FP32=", int(kernel.output_dtype == DType::kFloat32)),
       concat_strings("-DNVTE_GG_GROUPED_TENSOR=", int(kernel.grouped_tensor)),
       concat_strings("-DNVTE_GG_N_EXPAND=", tile.n_expand ? 4 : 1),
+      concat_strings("-DNVTE_GG_COMMON_N=", kernel.common_n),
+      concat_strings("-DNVTE_GG_COMMON_K=", kernel.common_k),
       concat_strings("-DNVTE_GG_TILE_M=", tile.tile_m),
       concat_strings("-DNVTE_GG_TILE_N=", tile.tile_n),
       concat_strings("-DNVTE_GG_TILE_K=", tile.tile_k),
@@ -292,7 +295,7 @@ const CompiledKernel& get_or_compile(int device, const KernelConfig& kernel, con
   const auto key =
       std::make_tuple(device, kernel.sm_arch, kernel.trans_a, kernel.trans_b, kernel.input_dtype,
                       kernel.output_dtype, kernel.grouped_tensor, tile.tile_m, tile.tile_n,
-                      tile.tile_k, tile.stages, tile.n_expand);
+                      tile.tile_k, tile.stages, tile.n_expand, kernel.common_n, kernel.common_k);
   static std::map<std::decay_t<decltype(key)>, CompiledKernel> cache;
   static std::mutex cache_mutex;
   auto lookup = [&]() -> const CompiledKernel* {

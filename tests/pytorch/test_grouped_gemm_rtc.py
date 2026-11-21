@@ -81,11 +81,11 @@ def auto_backend(_rtc_env, monkeypatch):
     "rows,columns,k,offset_operand,output_dtype,expect_rtc",
     [
         ([64, 96], 128, 64, None, torch.float32, True),
-        ([64], 128, 64, None, torch.bfloat16, False),
-        ([1536, 1536], 1024, 64, None, torch.bfloat16, False),
-        ([1024] * 3, 256, 8192, None, torch.float32, False),
-        ([2304, 2304], 2048, 64, None, torch.bfloat16, False),
-        ([64, 64, 64, 4096], 2048, 64, None, torch.bfloat16, False),
+        ([64], 128, 64, None, torch.bfloat16, True),
+        ([1536, 1536], 1024, 64, None, torch.bfloat16, True),
+        ([1024] * 3, 256, 8192, None, torch.float32, True),
+        ([2304, 2304], 2048, 64, None, torch.bfloat16, True),
+        ([64, 64, 64, 4096], 2048, 64, None, torch.bfloat16, True),
         *[([64, 96], 128, 64, operand, torch.bfloat16, False) for operand in ("a", "b", "d")],
     ],
 )
@@ -111,6 +111,39 @@ def test_grouped_gemm_auto_backend(auto_backend, rows, columns, k, offset_operan
     assert any(name.startswith("nvte_grouped_gemm3_") for name in kernels) == expect_rtc
     for i, result in enumerate(out):
         assert torch.all(result == (i + 1) * k - 1)
+
+
+@pytest.mark.parametrize("layout", ["TN", "NT"])
+def test_rtc_common_weight_shape_cache(auto_backend, layout):
+    """Change N and K between calls, then use a distinct K for the last expert."""
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Automatic RTC dispatch targets PPU SM89")
+    torch.manual_seed(71)
+    dtype = torch.bfloat16
+    cus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    rows = [256 * cus - tail for tail in (8, 136)]
+
+    def matrix(first, second):
+        shape = (first, second) if layout == "TN" else (second, first)
+        return torch.randn(shape, device="cuda", dtype=dtype)
+
+    for n, ks in [(1024, (768, 768)), (2048, (768, 768)), (2048, (512, 512)),
+                  (2048, (512, 768))]:
+        a = [matrix(n, k) for k in ks]
+        b = [matrix(m, k) for m, k in zip(rows, ks)]
+        out = [torch.empty(m, n, device="cuda", dtype=dtype) for m in rows]
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+            general_grouped_gemm(a, b, out, [None] * len(rows), dtype, layout=layout,
+                                 m_splits=rows if layout == "TN" else list(ks))
+            torch.cuda.synchronize()
+        kernels = [e.name for e in prof.events() if e.name.startswith("nvte_grouped_gemm3_")
+                   and e.device_type == torch.autograd.DeviceType.CUDA]
+        assert len(kernels) == 1
+        assert kernels[0].endswith(f"_n{n}k{ks[0]}") == (ks[0] == ks[1])
+        for result, weight, inp in zip(out, a, b):
+            left, right = (inp, weight.T) if layout == "TN" else (inp.T, weight)
+            reference = left.float() @ right.float()
+            torch.testing.assert_close(result.float(), reference, rtol=0.005, atol=0.01)
 
 
 def test_grouped_gemm_auto_graph_capture(auto_backend, monkeypatch):

@@ -6,7 +6,7 @@
 
 // Compiled by NVRTC with the same tile, layouts and output type as the host launcher.
 #include "cutlass/gemm/kernel/nvte_grouped_gemm_traits.hpp"
-#if NVTE_GG_GROUPED_TENSOR || NVTE_GG_N_EXPAND == 4
+#if NVTE_GG_GROUPED_TENSOR || NVTE_GG_N_EXPAND == 4 || NVTE_GG_COMMON_K
 #include "cutlass/gemm/kernel/nvte_grouped_tensor.hpp"
 #endif
 
@@ -20,10 +20,11 @@ using Traits = transformer_engine::grouped_gemm_rtc::GemmTraits<
 using GemmKernel =
     cutlass::gemm::kernel::NvteNativeGrouped<Traits::CollectiveMainloop, Traits::CollectiveEpilogue,
                                              NVTE_GG_N_EXPAND == 4>;
-#elif NVTE_GG_N_EXPAND == 4
+#elif NVTE_GG_N_EXPAND == 4 || NVTE_GG_COMMON_K
 using GemmKernel =
-    cutlass::gemm::kernel::NvteListNExpand<Traits::GemmKernel, Traits::CollectiveMainloop,
-                                           Traits::CollectiveEpilogue>;
+    cutlass::gemm::kernel::NvteListGrouped<Traits::GemmKernel, Traits::CollectiveMainloop,
+                                           Traits::CollectiveEpilogue, NVTE_GG_COMMON_N,
+                                          NVTE_GG_COMMON_K>;
 #else
 using GemmKernel = Traits::GemmKernel;
 #endif

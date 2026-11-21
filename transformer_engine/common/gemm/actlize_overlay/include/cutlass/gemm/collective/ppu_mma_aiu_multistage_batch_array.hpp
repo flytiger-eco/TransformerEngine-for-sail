@@ -424,7 +424,13 @@ struct CollectiveMma<
       process_kblock_iterations(k_block);
     }); // for_each
 
+    // With a common compile-time reduction length, one complete three-stage
+    // rotation exposes fixed shared-memory offsets to the compiler.
+#if NVTE_GG_COMMON_K
+    #pragma unroll 3
+#else
     CUTLASS_PRAGMA_NO_UNROLL
+#endif
     while (k_tile_count > -(DispatchPolicy::Stages)) {
       // Pipeline the outer products with a static for loop.
       //
