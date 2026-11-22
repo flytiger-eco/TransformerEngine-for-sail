@@ -42,7 +42,7 @@ std::string kernel_symbol(const KernelConfig& kernel, const TileConfig& tile) {
       kernel.common_k ? concat_strings("_n", kernel.common_n, "k", kernel.common_k) : "");
 }
 
-std::string resolve_cutlass_include_dir() {
+std::string resolve_cutlass_include_dir(bool required = true) {
   namespace fs = std::filesystem;
   auto check = [](const fs::path& p) {
     return !p.empty() && fs::exists(p / "ppu_include.hpp") &&
@@ -99,6 +99,7 @@ std::string resolve_cutlass_include_dir() {
   fs::path fallback = repo_root / "3rdparty" / "cutlass3" / "include";
   if (check(fallback)) return fallback.string();
 
+  if (!required) return {};
   NVTE_ERROR(
       "Could not locate CUTLASS 3.x + PPU include directory. "
       "Searched: NVTE_CUTLASS3_INCLUDE_DIR, baked=",
@@ -276,6 +277,17 @@ std::string compile_cubin(const std::string& symbol, const std::vector<std::stri
   return cubin;
 }
 }  // namespace
+
+bool grouped_tensor_headers_available() {
+  // Resolve the installed wheel or source-build headers once. A forced RTC
+  // launch still enters the compiler so it can report a missing dependency.
+  static const bool available = [] {
+    const std::filesystem::path root = resolve_cutlass_include_dir(false);
+    return !root.empty() && std::filesystem::is_regular_file(root / "cute/tensor.hpp") &&
+           std::filesystem::is_regular_file(root / "cutlass/gemm/kernel/nvte_grouped_tensor.hpp");
+  }();
+  return available || getenv<bool>("NVTE_FORCE_RTC_NO_FALLBACK", false);
+}
 
 CompiledKernel::CompiledKernel(int device, const std::string& symbol, std::string cubin,
                                int host_smem)

@@ -242,3 +242,125 @@ extern "C" __global__ __launch_bounds__(128) void nvte_mega_moe_combine(const vo
   else
     combine_slots<1>(slots, output, tokens, topk, hidden);
 }
+
+namespace {
+
+struct RouteRow {
+  Element* data;
+  bool remote;
+};
+
+__device__ RouteRow transport_row(int id, int position, Element* peer0, Element* peer1,
+                                  long long capacity, int hidden, int experts, int rank) {
+  if (id < 0 || id >= 2 * experts || position < 0 || position >= capacity) return {nullptr, false};
+  const int owner = id >= experts;
+  return {(owner ? peer1 : peer0) + static_cast<long long>(position) * hidden, owner != rank};
+}
+
+#if defined(__HGGCCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890 && !NVTE_MOE_FP16
+// Every lane passes the same 512-byte segment address. Each receives/stores
+// 128 bits. Remote fabric accesses have dedicated load and store instructions.
+__device__ __forceinline__ uint4 load_route(const RouteRow& row, long long offset) {
+  if (!row.data) return make_uint4(0, 0, 0, 0);
+  const auto* src = row.data + offset;
+  return row.remote ? __ppu_remote_load_bulk_b32x4(src) : __ppu_global_ldcg_bulk_b32x4(src);
+}
+
+__device__ __forceinline__ void store_route(const RouteRow& row, long long offset, uint4 value) {
+  if (!row.data) return;
+  auto* dst = row.data + offset;
+  if (row.remote)
+    __ppu_remote_store_bulk_volatile_b32x4(dst, value);
+  else
+    __ppu_global_store_bulk_volatile_b32x4(dst, value);
+}
+
+__device__ __forceinline__ uint4 sum_bf16_vectors(uint4 a, uint4 b) {
+  uint4 result;
+  const auto* av = reinterpret_cast<const __nv_bfloat162*>(&a);
+  const auto* bv = reinterpret_cast<const __nv_bfloat162*>(&b);
+  auto* out = reinterpret_cast<__nv_bfloat162*>(&result);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 x = __bfloat1622float2(av[i]), y = __bfloat1622float2(bv[i]);
+    out[i] = __floats2bfloat162_rn(x.x + y.x, x.y + y.y);
+  }
+  return result;
+}
+
+template <bool Pull>
+__device__ void transport_two(Element* local, RouteRow a, RouteRow b, int hidden) {
+  constexpr int segment = 512 / sizeof(Element);
+  const int warp = threadIdx.x / kWarpThreads;
+  for (long long offset = warp * segment; offset < hidden; offset += 4 * segment) {
+    if constexpr (Pull) {
+      const uint4 value = sum_bf16_vectors(load_route(a, offset), load_route(b, offset));
+      __ppu_global_store_bulk_volatile_b32x4(local + offset, value);
+    } else {
+      const uint4 value = __ppu_global_ldcg_bulk_b32x4(local + offset);
+      store_route(a, offset, value);
+      store_route(b, offset, value);
+    }
+  }
+}
+#endif
+
+template <bool Pull>
+__device__ void transport_tokens(void* data, const int* ids, const int* positions, void* buffer0,
+                                 void* buffer1, long long tokens, long long capacity, int hidden,
+                                 int topk, int experts, int rank, long long row_stride,
+                                 long long col_stride, long long id_row_stride,
+                                 long long id_slot_stride) {
+  auto* local = static_cast<Element*>(data);
+  auto* p0 = static_cast<Element*>(buffer0);
+  auto* p1 = static_cast<Element*>(buffer1);
+  for (long long t = blockIdx.x; t < tokens; t += gridDim.x) {
+    auto* row = local + t * row_stride;
+    const auto* id = ids + t * id_row_stride;
+    const auto* pos = positions + t * topk;
+#if defined(__HGGCCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890 && !NVTE_MOE_FP16
+    const auto alignment = reinterpret_cast<unsigned long long>(row) |
+                           reinterpret_cast<unsigned long long>(p0) |
+                           reinterpret_cast<unsigned long long>(p1);
+    if (topk == 2 && hidden % 256 == 0 && col_stride == 1 && alignment % 512 == 0) {
+      auto a = transport_row(id[0], pos[0], p0, p1, capacity, hidden, experts, rank);
+      auto b = transport_row(id[id_slot_stride], pos[1], p0, p1, capacity, hidden, experts, rank);
+      transport_two<Pull>(row, a, b, hidden);
+      continue;
+    }
+#endif
+    // Arbitrary top-k, source strides, and row tails use the same route order.
+    for (long long col = threadIdx.x; col < hidden; col += blockDim.x) {
+      float sum = 0.f;
+      Element value;
+      if constexpr (!Pull) value = row[col * col_stride];
+      for (int k = 0; k < topk; ++k) {
+        auto route =
+            transport_row(id[k * id_slot_stride], pos[k], p0, p1, capacity, hidden, experts, rank);
+        if (!route.data) continue;
+        if constexpr (Pull)
+          sum += promote(route.data[col]);
+        else
+          route.data[col] = value;
+      }
+      if constexpr (Pull) row[col * col_stride] = round_element(sum);
+    }
+  }
+}
+}  // namespace
+
+extern "C" __global__ __launch_bounds__(128) void nvte_mega_moe_bulk_push(
+    void* local, const int* ids, const int* positions, void* peer0, void* peer1, long long tokens,
+    long long capacity, int hidden, int topk, int experts, int rank, long long row_stride,
+    long long col_stride, long long id_row_stride, long long id_slot_stride) {
+  transport_tokens<false>(local, ids, positions, peer0, peer1, tokens, capacity, hidden, topk,
+                          experts, rank, row_stride, col_stride, id_row_stride, id_slot_stride);
+}
+
+extern "C" __global__ __launch_bounds__(128) void nvte_mega_moe_bulk_pull(
+    void* local, const int* ids, const int* positions, void* peer0, void* peer1, long long tokens,
+    long long capacity, int hidden, int topk, int experts, int rank, long long row_stride,
+    long long col_stride, long long id_row_stride, long long id_slot_stride) {
+  transport_tokens<true>(local, ids, positions, peer0, peer1, tokens, capacity, hidden, topk,
+                         experts, rank, row_stride, col_stride, id_row_stride, id_slot_stride);
+}

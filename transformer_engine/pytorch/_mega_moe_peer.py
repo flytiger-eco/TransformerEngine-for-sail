@@ -6,6 +6,7 @@
 
 import socket
 import threading
+from importlib.util import find_spec
 from weakref import WeakKeyDictionary, finalize
 
 import torch
@@ -24,6 +25,7 @@ class _Workspace:
     def __init__(self):
         self.lock = threading.RLock()
         self.supported = None
+        self.bulk_supported = False
         self.device = None
         self.storage = None
         self.handle = None
@@ -101,7 +103,9 @@ def _peer_supported(group, device):
             # UUIDs also handle per-rank CUDA_VISIBLE_DEVICES permutations. Each
             # direction must be addressable from the participating device.
             peers = [None] * group.size()
-            dist.all_gather_object(peers, (socket.gethostname(), uuid, reachable), group)
+            dist.all_gather_object(
+                peers, (socket.gethostname(), uuid, reachable, find_spec("triton") is not None), group
+            )
             devices = {item[1] for item in peers}
             state.supported = (
                 len({item[0] for item in peers}) == 1
@@ -109,6 +113,7 @@ def _peer_supported(group, device):
                 and len(devices) == len(peers)
                 and all(devices <= item[2] for item in peers)
             )
+            state.bulk_supported = group.size() == 2 and all(item[3] for item in peers)
             state.device = device
         return state.supported
 
@@ -125,6 +130,12 @@ def peer_forward(x, ids, probs, fc1, fc2, ep_group_name):
             return None
         state = _workspace(group)
         with state.lock:
+            if state.bulk_supported:
+                from .triton.mega_moe_bulk import bulk_forward
+
+                output = bulk_forward(x, ids, probs, fc1, fc2, group, state)
+                if output is not None:
+                    return output
             tokens, topk = ids.shape
             hidden = x.size(1)
             fields = (tokens, ids.numel(), x.device == state.device)

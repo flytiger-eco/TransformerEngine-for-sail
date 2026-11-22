@@ -49,6 +49,14 @@ void fc1(const MegaMoEProblem &p, void *projection, void *activation, cudaStream
 
 }  // namespace
 
+void mega_moe_bulk_transport(const MegaMoEBulkTransport &p, void *local, bool pull,
+                             cudaStream_t stream) {
+  if (!p.tokens || !p.hidden) return;
+  launch(false, pull ? "nvte_mega_moe_bulk_pull" : "nvte_mega_moe_bulk_push", false, p.tokens,
+         stream, local, p.ids, p.positions, p.peer0, p.peer1, p.tokens, p.capacity, p.hidden,
+         p.topk, p.experts, p.rank, p.row_stride, p.col_stride, p.id_row_stride, p.id_slot_stride);
+}
+
 void mega_moe_combine(const void *slots, void *output, int64_t tokens, int topk, int hidden,
                       bool fp16, cudaStream_t stream) {
   const int64_t blocks = (tokens * hidden - 1) / 128 + 1;

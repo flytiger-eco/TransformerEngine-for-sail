@@ -156,9 +156,11 @@ def bf16_mega_moe(
     routes in FP32. Shared experts are caller-owned. ep_group=None is local.
 
     The PPU runtime compiles the expert kernels for the input precision. On
-    peer-accessible EP groups, FC1 reads tokens from symmetric peer buffers
-    and FC2 writes back into each source rank's route slots. Other groups use
-    variable-split all-to-all. First-order backward routes gradients to the
+    peer-accessible EP groups, tokens and results travel through symmetric buffers.
+    Large two-rank BF16 batches push tokens directly into expert-major rows for
+    grouped GEMM and pull the results into an FP32 top-k reduction. Other peer
+    batches read input rows in FC1 and return output slots in FC2. Groups without
+    peer access use variable-split all-to-all. First-order backward routes gradients to the
     expert owners, recomputes FC1, and returns gradients for x, routing weights
     and both local expert parameter lists.
     """

@@ -255,3 +255,17 @@ done < tags.txt
 (the report pair of case 1 in section 5), `uneven_m_asys.asysrep` (the trace
 of case 2), `cmds.txt` (every command), `smoke_grouped_linear.py` /
 `grouped_gemm_mpe2048_k2096_n1536.py` (harnesses).
+
+## 8. BF16 MegaMoE and DeepEP forward replay
+
+The two-rank benchmark maps the eight-expert NT tag with `m=[4490,4490,4490,4490,4490,4490,4489,4489]`, `n=1024`, and `k=2048` to the first SwiGLU projection. Each rank owns eight experts and supplies 17,959 tokens with top-k two, hidden size 2,048, and intermediate size 512. Each source sends half its routes to the other rank. A token can select two experts on either rank.
+
+```bash
+PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
+    benchmarks/gemm/benchmark_mega_moe_deepep.py --route-variants 3 --warmup 8 --rounds 10 --iters 12 \
+    --output /tmp/mega-moe-deepep.json
+```
+
+This measures dispatch, two BF16 grouped projections with weighted SwiGLU, and combine on both paths. It checks the outputs against an independent reference, alternates method order and route maps, and reports event and wall times for the slower rank. DeepEP V2 uses all available CUs for this sequential forward. Its SM89 JIT needs PCCL's CUDA-compatible device headers in `$EP_PCCL_ROOT_DIR/include_cuda`. Use `--automatic-rtc` to exercise the installation's dispatch settings or `--deepep-implementation legacy` with Megatron-LM on `PYTHONPATH` to measure the legacy dispatcher.
+
+On a pair of 39-CU SM89 PPUs with PyTorch 2.10.0 and DeepEP 2.2.0, two seeds measured 1.569 ms for MegaMoE and 1.832 ms for DeepEP V2 with 39 communication CUs. The 20 paired round medians gave 14.1–14.6% lower end-to-end forward time. Both paths produced identical BF16 outputs on all six sampled routing tables per rank.

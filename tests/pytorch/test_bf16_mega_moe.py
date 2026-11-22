@@ -159,6 +159,30 @@ def test_rtc_training(dtype, scenario):
     _check(ids, dtype, 4)
 
 
+def test_large_bf16_packed_forward_with_empty_expert():
+    _require_sm89()
+    import transformer_engine_torch as tex
+
+    # Ragged expert boundaries also exercise the final partial CUTLASS tile.
+    counts = [257, 0, 511, 256]
+    ids = torch.arange(4, dtype=torch.int32).repeat_interleave(torch.tensor(counts))[:, None]
+    x, probs, w1, w2, dy = _inputs(ids, torch.bfloat16, 4, hidden=512, intermediate=256)
+    expected, _ = _reference(ids, x, probs, w1, w2, dy)
+    x = x.cuda()
+    offsets = torch.tensor([0, 257, 257, 768, 1024], dtype=torch.int32, device="cuda")
+    weights = ([_device(w) for w in w1], [_device(w) for w in w2])
+    args = (probs.flatten().cuda(), offsets, *weights)
+    out = tex.mega_moe_local_forward(x, *args)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0.02, atol=0.02)
+
+    # The peer path can replace a packed input with its FC2 result after FC1.
+    tex.mega_moe_local_forward(x, *args, out=x)
+    torch.testing.assert_close(x, out, rtol=0, atol=0)
+    storage = x.new_empty((x.size(0) + 1, x.size(1)))
+    with pytest.raises(RuntimeError, match="overlaps"):
+        tex.mega_moe_local_forward(storage[:-1], *args, out=storage[1:])
+
+
 @pytest.mark.parametrize("hidden,intermediate", [(0, 7), (5, 0)])
 def test_empty_feature_dimension(hidden, intermediate):
     _require_sm89()
