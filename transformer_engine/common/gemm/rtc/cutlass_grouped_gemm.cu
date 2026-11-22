@@ -24,8 +24,8 @@ using GemmKernel =
 #elif NVTE_GG_N_EXPAND == 4 || NVTE_GG_COMMON_K
 using GemmKernel =
     cutlass::gemm::kernel::NvteListGrouped<Traits::GemmKernel, Traits::CollectiveMainloop,
-                                          Traits::CollectiveEpilogue, NVTE_GG_COMMON_N,
-                                          NVTE_GG_COMMON_K>;
+                                          Traits::CollectiveEpilogue, NVTE_GG_N_EXPAND == 4,
+                                          NVTE_GG_COMMON_N, NVTE_GG_COMMON_K>;
 #else
 using GemmKernel = Traits::GemmKernel;
 #endif

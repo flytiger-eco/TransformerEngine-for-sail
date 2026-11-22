@@ -49,9 +49,13 @@ struct NvteNativeGrouped {
     return stride;
   }
 
-  CUTLASS_DEVICE static void run_nexpand(const NativeExpert& e, int mi, int ni, char* smem) {
+  CUTLASS_DEVICE static void run_nexpand(NativeExpert e, int mi, int ni, char* smem) {
     using namespace cute;
     static_assert(BM == 256 && BN == 256 && BK == 64 && Mainloop::DispatchPolicy::Stages == 3);
+    if constexpr (CommonK != 0) {
+      e.n = CommonN;
+      e.k = CommonK;
+    }
     int tid = int(threadIdx.x);
     auto* dst = reinterpret_cast<ElementD*>(e.d);
     TiledMma mma;
@@ -86,6 +90,10 @@ struct NvteNativeGrouped {
     if constexpr (CommonK != 0) {
       e.n = CommonN;
       e.k = CommonK;
+      // Adjacent M tile rows traverse the expert's B tiles in opposite order.
+      if constexpr (!EnableNExpand) {
+        if (mi & 1) ni = CommonN / BN - 1 - ni;
+      }
     }
     using namespace cute;
     if constexpr (EnableNExpand) {
@@ -127,7 +135,8 @@ struct NvteNativeGrouped {
         Epilogue::compute_native_rows(dst, e.m, e.n, TileShape{}, coordinate, acc, mma, tid);
     } else {
       Epilogue::compute_native(reinterpret_cast<const ElementD*>(e.c), dst, e.m, e.n,
-                               TileShape{}, coordinate, acc, mma, tid, e.alpha, e.beta, aligned);
+                               TileShape{}, coordinate, acc, mma, tid, e.alpha, e.beta, aligned,
+                               smem, Int<SharedStorageSize>{});
     }
     __syncthreads();
   }
@@ -138,9 +147,19 @@ struct NvteNativeGrouped {
       for (uint64_t id = blockIdx.x; id < p.uniform.end; id += gridDim.x) {
         int group, local, mi, ni;
         p.tiles_per_group(group, local, int(id));
-        p.tiles_per_row(mi, ni, local);
+        if constexpr (CommonK != 0 && !EnableNExpand) {
+          constexpr int ntiles = CommonN / BN;
+          mi = local / ntiles;
+          ni = local % ntiles;
+        } else {
+          p.tiles_per_row(mi, ni, local);
+        }
         const uint64_t g = group;
         auto e = p.uniform;
+        if constexpr (CommonK != 0) {
+          e.n = CommonN;
+          e.k = CommonK;
+        }
         e.a += g * e.m * e.k * sizeof(ElementA);
         e.b += g * e.n * e.k * sizeof(ElementB);
         const uint64_t offset = g * e.m * e.n * sizeof(ElementD);
@@ -148,25 +167,28 @@ struct NvteNativeGrouped {
         e.d += offset;
         e.alpha = p.alpha[g * p.scalar_stride];
         e.beta = p.beta[g * p.scalar_stride];
-        ni *= e.columns;
         if constexpr (EnableNExpand) {
+          ni *= e.columns;
           if (e.alpha == 1 && e.beta == 0) {
             run_nexpand(e, mi, ni, smem);
-            continue;
+          } else {
+            // Device scalars may change between launches. Each column needs
+            // the general epilogue when the caller requests accumulation.
+            const int columns = e.columns;
+            e.columns = 1;
+            for (int col = 0; col < columns; ++col) run_tile(e, mi, ni + col, smem);
           }
+        } else {
+          run_tile(e, mi, ni, smem);
         }
-        // A caller can change a device scalar between launches.
-        const int columns = e.columns;
-        e.columns = 1;
-        for (int col = 0; col < columns; ++col) run_tile(e, mi, ni + col, smem);
       }
       return;
     }
     const uint64_t work = p.control->work;
-    if constexpr (CommonK != 0) {
+    if constexpr (CommonK != 0 && !EnableNExpand) {
       // Process each expert's tile range before loading the next descriptor.
       // Empty experts have identical consecutive end offsets.
-      static_assert(!EnableNExpand && CommonN % BN == 0);
+      static_assert(CommonN % BN == 0);
       constexpr int ntiles = CommonN / BN;
       uint64_t id = blockIdx.x, start = 0;
       for (unsigned group = 0; id < work; ++group) {
@@ -206,21 +228,20 @@ struct NvteNativeGrouped {
 
 // The list API already stages per-expert shapes and pointers. Use its existing
 // GemmUniversal ABI and workspace cache even when the allocations are disjoint.
-template <class Ordinary, class Mainloop, class Epilogue, int CommonN, int CommonK>
+template <class Ordinary, class Mainloop, class Epilogue, bool Expand, int CommonN, int CommonK>
 struct NvteListGrouped {
   using Params = typename Ordinary::Params;
   CUTLASS_DEVICE void operator()(Params const& p, char* smem) {
     using namespace cute;
-    constexpr bool expand = CommonK == 0;
     uint64_t id = blockIdx.x + uint64_t(gridDim.x) * blockIdx.y;
     uint64_t stride = uint64_t(gridDim.x) * gridDim.y;
     for (int g = 0; g < p.problem_shape.num_groups; ++g) {
       auto shape = p.problem_shape.get_problem_shape(g);
       const int m = get<0>(shape);
-      const int n = expand ? get<1>(shape) : CommonN;
-      const int k = expand ? get<2>(shape) : CommonK;
-      const int ntiles = n / (expand ? 1024 : 256);
-      const uint64_t mtiles = expand ? uint64_t(m / 256) : (uint64_t(m) + 255) / 256;
+      const int n = CommonK ? CommonN : get<1>(shape);
+      const int k = CommonK ? CommonK : get<2>(shape);
+      const int ntiles = n / (Expand ? 1024 : 256);
+      const uint64_t mtiles = Expand ? uint64_t(m / 256) : (uint64_t(m) + 255) / 256;
       const uint64_t tiles = mtiles * ntiles;
       if (id < tiles) {
         NativeExpert e{};
@@ -231,10 +252,12 @@ struct NvteListGrouped {
         e.alpha = 1;
         for (; id < tiles; id += stride) {
           const int mi = int(id / ntiles), ni = int(id % ntiles);
-          if constexpr (expand)
-            NvteNativeGrouped<Mainloop, Epilogue, true>::run_nexpand(e, mi, ni * 4, smem);
+          if constexpr (Expand)
+            NvteNativeGrouped<Mainloop, Epilogue, true, CommonN, CommonK>::run_nexpand(
+                e, mi, ni * 4, smem);
           else
-            NvteNativeGrouped<Mainloop, Epilogue, false>::run_tile(e, mi, ni, smem);
+            NvteNativeGrouped<Mainloop, Epilogue, false, CommonN, CommonK>::run_tile(
+                e, mi, ni, smem);
         }
       }
       id -= tiles;
