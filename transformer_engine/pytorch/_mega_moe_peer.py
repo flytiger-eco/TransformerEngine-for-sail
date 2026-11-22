@@ -26,12 +26,16 @@ class _Workspace:
         self.lock = threading.RLock()
         self.supported = None
         self.bulk_supported = False
+        self.fused_supported = False
+        self.fused = None
         self.device = None
         self.storage = None
         self.handle = None
         self.done = None
 
     def wait_for_completion(self):
+        if self.fused is not None:
+            self.fused.done.synchronize()
         if self.done is not None:
             self.done.synchronize()
 
@@ -104,7 +108,15 @@ def _peer_supported(group, device):
             # direction must be addressable from the participating device.
             peers = [None] * group.size()
             dist.all_gather_object(
-                peers, (socket.gethostname(), uuid, reachable, find_spec("triton") is not None), group
+                peers,
+                (
+                    socket.gethostname(),
+                    uuid,
+                    reachable,
+                    find_spec("triton") is not None,
+                    supported and tex.mega_moe_fused_available(),
+                ),
+                group,
             )
             devices = {item[1] for item in peers}
             state.supported = (
@@ -114,6 +126,7 @@ def _peer_supported(group, device):
                 and all(devices <= item[2] for item in peers)
             )
             state.bulk_supported = group.size() == 2 and all(item[3] for item in peers)
+            state.fused_supported = group.size() == 2 and all(item[4] for item in peers)
             state.device = device
         return state.supported
 
@@ -130,6 +143,17 @@ def peer_forward(x, ids, probs, fc1, fc2, ep_group_name):
             return None
         state = _workspace(group)
         with state.lock:
+            if state.fused_supported:
+                from ._mega_moe_fused import FusedWorkspace
+
+                # Reserve two positive generations for a possible collective resize.
+                if state.fused is None or state.fused.epoch >= 2**31 - 3:
+                    if state.fused is not None:
+                        state.fused.done.synchronize()
+                    state.fused = FusedWorkspace(group, state.device)
+                output = state.fused.forward(x, ids, probs, fc1, fc2, group)
+                if output is not None:
+                    return output
             if state.bulk_supported:
                 from .triton.mega_moe_bulk import bulk_forward
 

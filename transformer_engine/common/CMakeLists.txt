@@ -256,6 +256,7 @@ list(APPEND transformer_engine_cpp_sources
      gemm/config.cpp
      gemm/cutlass_grouped_gemm_rtc_kernel.cpp
      rtc/mega_moe.cpp
+     rtc/mega_moe_fused.cpp
      normalization/common.cpp
      normalization/rtc_dispatch.cpp
      normalization/layernorm/ln_api.cpp
@@ -732,6 +733,13 @@ foreach(kernel mega_moe mega_moe_backward)
 endforeach()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/rtc/mega_moe_device.cuh")
+foreach(header mega_moe_fused_args.h mega_moe_fused_route.cuh mega_moe_fused_protocol.cuh
+               mega_moe_fused_l1.cuh mega_moe_fused_l2.cuh)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${CMAKE_CURRENT_SOURCE_DIR}/rtc/${header}")
+  string(REPLACE "." "_" symbol "${header}")
+  make_string_header_from_file(rtc/${header} string_code_${symbol})
+endforeach()
 make_string_header_from_file(rtc/mega_moe_device.cuh string_code_mega_moe_device_cuh)
 make_string_header_from_file(utils.cuh
                              string_code_utils_cuh)

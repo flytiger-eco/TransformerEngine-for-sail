@@ -12,6 +12,7 @@ namespace transformer_engine::grouped_gemm_rtc {
 
 struct TileConfig;
 bool grouped_tensor_headers_available();
+std::vector<std::string> actlize_compiler_options();
 
 struct KernelConfig {
   int sm_arch;

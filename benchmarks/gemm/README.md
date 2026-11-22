@@ -258,14 +258,22 @@ of case 2), `cmds.txt` (every command), `smoke_grouped_linear.py` /
 
 ## 8. BF16 MegaMoE and DeepEP forward replay
 
-The two-rank benchmark maps the eight-expert NT tag with `m=[4490,4490,4490,4490,4490,4490,4489,4489]`, `n=1024`, and `k=2048` to the first SwiGLU projection. Each rank owns eight experts and supplies 17,959 tokens with top-k two, hidden size 2,048, and intermediate size 512. Each source sends half its routes to the other rank. A token can select two experts on either rank.
+The two-rank benchmark maps the eight-expert NT tag with `m=[4490,4490,4490,4490,4490,4490,4489,4489]`, `n=1024`, and `k=2048` to the first SwiGLU projection. Each SM89 PPU owns eight experts and supplies 17,959 tokens with top-k two, H=2,048 and I=512. Half the routes cross the peer link.
+
+After workspace setup, the public BF16 forward issues three kernels per rank:
+
+1. **Pre-dispatch** builds per-expert lists of source slots and routing weights, records inverse slot indices and stages the inputs needed by the peer.
+2. **L1** uses persistent copy CTAs to fetch 256-row tiles from both sources. Each tile signals readiness independently. Compute CTAs project gate and up together, apply weighted SwiGLU and write BF16 activations. Copy CTAs join the compute queue after their last tile.
+3. **L2** projects FC2 directly into the expert owner's symmetric buffer. For this shape, once 1,024 output columns are ready on both owners, 15 CTAs fetch and sum their two routes in FP32 while the other 24 project the remaining columns.
+
+After queuing both layers, the host checks the collective pre-dispatch status to surface invalid IDs. The route lists, readiness signals and FC2 results stay on device. First use and workspace growth run a collective allocation and a second pre-dispatch. Other shapes, precisions and topologies can use the existing bulk, generic peer or all-to-all implementations. The backward pass recomputes activations.
 
 ```bash
 PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
-    benchmarks/gemm/benchmark_mega_moe_deepep.py --route-variants 3 --warmup 8 --rounds 10 --iters 12 \
-    --output /tmp/mega-moe-deepep.json
+    benchmarks/gemm/benchmark_mega_moe_deepep.py --expect-three-kernels --deep-ep-sms 39 \
+    --route-variants 3 --warmup 8 --rounds 10 --iters 12 --output /tmp/mega-moe-deepep.json
 ```
 
-This measures dispatch, two BF16 grouped projections with weighted SwiGLU, and combine on both paths. It checks the outputs against an independent reference, alternates method order and route maps, and reports event and wall times for the slower rank. DeepEP V2 uses all available CUs for this sequential forward. Its SM89 JIT needs PCCL's CUDA-compatible device headers in `$EP_PCCL_ROOT_DIR/include_cuda`. Use `--automatic-rtc` to exercise the installation's dispatch settings or `--deepep-implementation legacy` with Megatron-LM on `PYTHONPATH` to measure the legacy dispatcher.
+The benchmark verifies the three physical GPU launches and compares BF16 outputs with DeepEP and an independent reference. It alternates method order and route maps, recording event and synchronized wall times for the slower rank. DeepEP V2 uses all 39 CUs for the sequential baseline. Its SM89 JIT needs PCCL's CUDA-compatible device headers in `$EP_PCCL_ROOT_DIR/include_cuda`. Use `--automatic-rtc` to exercise the installation's dispatch settings or `--deepep-implementation legacy` with Megatron-LM on `PYTHONPATH` to measure the legacy dispatcher.
 
-On a pair of 39-CU SM89 PPUs with PyTorch 2.10.0 and DeepEP 2.2.0, two seeds measured 1.569 ms for MegaMoE and 1.832 ms for DeepEP V2 with 39 communication CUs. The 20 paired round medians gave 14.1–14.6% lower end-to-end forward time. Both paths produced identical BF16 outputs on all six sampled routing tables per rank.
+On two pairs of 39-CU SM89 PPUs (PyTorch 2.10.0 and DeepEP 2.2.0), three seeds gave 1.521–1.531 ms for the three-kernel path and 1.831–1.834 ms for DeepEP. This reduced median forward latency by 16.4–17.0%. BF16 outputs matched elementwise for all nine routing tables on both ranks.

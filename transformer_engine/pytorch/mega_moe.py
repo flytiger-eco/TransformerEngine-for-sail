@@ -157,9 +157,11 @@ def bf16_mega_moe(
 
     The PPU runtime compiles the expert kernels for the input precision. On
     peer-accessible EP groups, tokens and results travel through symmetric buffers.
-    Large two-rank BF16 batches push tokens directly into expert-major rows for
-    grouped GEMM and pull the results into an FP32 top-k reduction. Other peer
-    batches read input rows in FC1 and return output slots in FC2. Groups without
+    Large top-2 batches on two SM89 PPUs with compatible BF16 weights use three
+    kernels after workspace setup. Pre-dispatch builds expert route lists. FC1
+    overlaps fetching expert input tiles with the gate/up projection and weighted
+    SwiGLU. FC2 makes output columns available for cross-rank FP32 reduction.
+    Other peer shapes use the bulk or generic peer implementation. Groups without
     peer access use variable-split all-to-all. First-order backward routes gradients to the
     expert owners, recomputes FC1, and returns gradients for x, routing weights
     and both local expert parameter lists.

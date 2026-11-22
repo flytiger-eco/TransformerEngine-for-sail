@@ -36,6 +36,10 @@ struct MegaMoEBulkTransport {
   int hidden, topk, experts, rank;
 };
 
+struct MegaMoEFusedArgs;
+void mega_moe_fused_pre_dispatch(const MegaMoEFusedArgs &p, cudaStream_t stream);
+void mega_moe_fused_layers(const MegaMoEFusedArgs &p, cudaStream_t stream);
+
 void mega_moe_bulk_transport(const MegaMoEBulkTransport &p, void *local, bool pull,
                              cudaStream_t stream);
 

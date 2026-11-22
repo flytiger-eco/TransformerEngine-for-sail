@@ -215,39 +215,26 @@ std::string read_cubin(const std::filesystem::path& path) {
 
 std::vector<std::string> compiler_options(const KernelConfig& kernel, const TileConfig& tile,
                                           bool line_info) {
-  const auto cuda_include = cuda::include_directory(true);
-  std::vector<std::string> opts{
-      // hgrtc's disk cache does not account for edits to included headers.
-      "--no-cache",
-      "--std=c++17",
-      "-DNDEBUG",
-      "-DUSE_SAIL=1",
-      kernel.sm_arch == 80 ? "--gpu-architecture=sm_80a" : "--gpu-architecture=sm_89",
-      "-I" + cuda_include,
-      "-I" + cuda_include + "/cccl",
-      "-I" + get_cutlass_include_dir(),
-      "-I/usr/local/PPU_SDK/targets/x86_64-linux/include",
-      concat_strings("-DNVTE_GG_TRANS_A=", int(kernel.trans_a)),
-      concat_strings("-DNVTE_GG_TRANS_B=", int(kernel.trans_b)),
-      concat_strings("-DNVTE_GG_ARCH=", kernel.sm_arch),
-      concat_strings("-DNVTE_GG_DTYPE=", int(kernel.input_dtype == DType::kFloat16)),
-      concat_strings("-DNVTE_GG_OUT_FP32=", int(kernel.output_dtype == DType::kFloat32)),
-      concat_strings("-DNVTE_GG_GROUPED_TENSOR=", int(kernel.grouped_tensor)),
-      concat_strings("-DNVTE_GG_N_EXPAND=", tile.n_expand ? 4 : 1),
-      concat_strings("-DNVTE_GG_COMMON_N=", kernel.common_n),
-      concat_strings("-DNVTE_GG_COMMON_K=", kernel.common_k),
-      concat_strings("-DNVTE_GG_TILE_M=", tile.tile_m),
-      concat_strings("-DNVTE_GG_TILE_N=", tile.tile_n),
-      concat_strings("-DNVTE_GG_TILE_K=", tile.tile_k),
-      concat_strings("-DNVTE_GG_STAGES=", tile.stages),
-      "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
-      "-D__HGGC_FP16_H__=1",
-      "-D_HGGC_FP16_H_=1",
-      "-DHGGC_FP16_H=1",
-      "-D__HGGC_BF16_H__=1",
-      "-D__HGGC_BF16_HPP__=1",
-      "-D__BF16_DEFINED__=1",
-  };
+  auto opts = actlize_compiler_options();
+  opts.insert(
+      opts.end(),
+      {
+          "--std=c++17",
+          kernel.sm_arch == 80 ? "--gpu-architecture=sm_80a" : "--gpu-architecture=sm_89",
+          concat_strings("-DNVTE_GG_TRANS_A=", int(kernel.trans_a)),
+          concat_strings("-DNVTE_GG_TRANS_B=", int(kernel.trans_b)),
+          concat_strings("-DNVTE_GG_ARCH=", kernel.sm_arch),
+          concat_strings("-DNVTE_GG_DTYPE=", int(kernel.input_dtype == DType::kFloat16)),
+          concat_strings("-DNVTE_GG_OUT_FP32=", int(kernel.output_dtype == DType::kFloat32)),
+          concat_strings("-DNVTE_GG_GROUPED_TENSOR=", int(kernel.grouped_tensor)),
+          concat_strings("-DNVTE_GG_N_EXPAND=", tile.n_expand ? 4 : 1),
+          concat_strings("-DNVTE_GG_COMMON_N=", kernel.common_n),
+          concat_strings("-DNVTE_GG_COMMON_K=", kernel.common_k),
+          concat_strings("-DNVTE_GG_TILE_M=", tile.tile_m),
+          concat_strings("-DNVTE_GG_TILE_N=", tile.tile_n),
+          concat_strings("-DNVTE_GG_TILE_K=", tile.tile_k),
+          concat_strings("-DNVTE_GG_STAGES=", tile.stages),
+      });
   if (line_info) opts.emplace_back("-lineinfo");
   return opts;
 }
@@ -277,6 +264,25 @@ std::string compile_cubin(const std::string& symbol, const std::vector<std::stri
   return cubin;
 }
 }  // namespace
+
+std::vector<std::string> actlize_compiler_options() {
+  const auto cuda_include = cuda::include_directory(true);
+  // HGRTC's disk cache does not track changes to included ACTLIZE headers.
+  return {"--no-cache",
+          "-DNDEBUG",
+          "-DUSE_SAIL=1",
+          "-I" + cuda_include,
+          "-I" + cuda_include + "/cccl",
+          "-I" + get_cutlass_include_dir(),
+          "-I/usr/local/PPU_SDK/targets/x86_64-linux/include",
+          "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+          "-D__HGGC_FP16_H__=1",
+          "-D_HGGC_FP16_H_=1",
+          "-DHGGC_FP16_H=1",
+          "-D__HGGC_BF16_H__=1",
+          "-D__HGGC_BF16_HPP__=1",
+          "-D__BF16_DEFINED__=1"};
+}
 
 bool grouped_tensor_headers_available() {
   // Resolve the installed wheel or source-build headers once. A forced RTC

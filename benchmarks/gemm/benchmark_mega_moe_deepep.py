@@ -19,6 +19,7 @@ import math
 import os
 import random
 import statistics
+import sys
 import time
 from collections import Counter
 from importlib.metadata import version
@@ -355,6 +356,11 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=73)
     parser.add_argument("--verify-kernels", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--expect-three-kernels",
+        action="store_true",
+        help="Check that the warmed MegaMoE forward launches only pre-dispatch, L1 and L2.",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if (
@@ -471,7 +477,7 @@ def main():
                 if not (metrics["relative_l2"] < 0.012 and metrics["max_abs"] < 0.15):
                     raise AssertionError((pair, metrics))
             result["correctness"].append(checks)
-        if args.verify_kernels:
+        if args.verify_kernels or args.expect_three_kernels:
             profiles = {
                 name: profile_kernels(lambda: fn(*cases[0])) for name, fn in methods.items()
             }
@@ -497,6 +503,17 @@ def main():
             for fragment in (*fragments, "scaled_gated_forward_kernel"):
                 if sum(count for name, count in kernels["deepep"].items() if fragment in name) != 1:
                     raise AssertionError(f"baseline did not launch one {fragment}")
+            if args.expect_three_kernels:
+                expected = [
+                    f"nvte_mega_moe_fused_{stage}" for stage in ("pre_dispatch", "l1", "l2")
+                ]
+                actual = [
+                    event["name"]
+                    for event in profiles["mega"][1]
+                    if event["name"] != "measured_moe_forward"
+                ]
+                if actual != expected:
+                    raise AssertionError(f"expected the three fused MegaMoE launches, got {actual}")
             result["kernel_names"] = kernels
             result["profiled_device_events"] = {name: data[1] for name, data in profiles.items()}
         for i in range(args.warmup):
@@ -547,8 +564,11 @@ def main():
                 args.output.write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(summary, indent=2), flush=True)
     finally:
-        baseline.buffer.destroy()
-        dist.destroy_process_group()
+        # Teardown is collective. On a local failure let torchrun stop peers
+        # that may still be inside the forward.
+        if sys.exc_info()[0] is None:
+            baseline.buffer.destroy()
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
