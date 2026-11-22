@@ -22,6 +22,8 @@
 
 namespace transformer_engine::pytorch {
 
+void init_mega_moe_bindings(pybind11::module &m);
+
 PyTypeObject *Float8TensorPythonClass = nullptr;  /// TODO Remove
 PyTypeObject *Float8TensorStoragePythonClass = nullptr;
 PyTypeObject *Float8QuantizerClass = nullptr;
@@ -527,6 +529,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // fused router
   transformer_engine::pytorch::init_router_bindings(m);
+  transformer_engine::pytorch::init_mega_moe_bindings(m);
 
   // Dropout
   m.def("dropout_fwd", transformer_engine::pytorch::dropout_fwd, "Dropout forward with 8-bit RNG",
