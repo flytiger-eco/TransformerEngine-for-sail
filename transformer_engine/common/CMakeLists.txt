@@ -726,14 +726,14 @@ make_string_header_from_file(fused_softmax/scaled_aligned_causal_masked_softmax.
                              string_code_fused_softmax_scaled_aligned_causal_masked_softmax_cu)
 make_string_header_from_file(gemm/rtc/cutlass_grouped_gemm.cu
                              string_code_gemm_rtc_cutlass_grouped_gemm_cu)
-foreach(kernel mega_moe mega_moe_backward)
+foreach(kernel mega_moe mega_moe_backward mega_moe_backward_gemm)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
                "${CMAKE_CURRENT_SOURCE_DIR}/rtc/${kernel}.cu")
   make_string_header_from_file(rtc/${kernel}.cu string_code_${kernel}_cu)
 endforeach()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/rtc/mega_moe_device.cuh")
-foreach(header mega_moe_fused_args.h mega_moe_fused_route.cuh mega_moe_fused_protocol.cuh
+foreach(header mega_moe_grad_args.h mega_moe_fused_args.h mega_moe_fused_route.cuh mega_moe_fused_protocol.cuh
                mega_moe_fused_l1.cuh mega_moe_fused_l2.cuh)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
                "${CMAKE_CURRENT_SOURCE_DIR}/rtc/${header}")

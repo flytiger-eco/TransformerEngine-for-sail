@@ -36,6 +36,14 @@ struct MegaMoEBulkTransport {
   int hidden, topk, experts, rank;
 };
 
+struct MegaMoEGradArgs;
+enum class MegaMoEGradGemm { kRecompute, kDgrad, kWgrad };
+void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16, bool fp32_out,
+                        cudaStream_t stream);
+void mega_moe_activation_backward(const MegaMoEProblem &p, const void *projection,
+                                  const void *dactivation, void *activation, void *dprojection,
+                                  float *dp, cudaStream_t stream);
+
 struct MegaMoEFusedArgs;
 void mega_moe_fused_pre_dispatch(const MegaMoEFusedArgs &p, cudaStream_t stream);
 void mega_moe_fused_layers(const MegaMoEFusedArgs &p, cudaStream_t stream);

@@ -66,9 +66,20 @@ def _compare(inputs, *, gradients=False, profile=False, fallback=False):
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
             actual = evaluate()
             torch.cuda.synchronize()
-        kernels = [e.name for e in prof.events()]
+        events = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+        kernels = [e.name for e in events]
         for name in ("_bulk_push", "_bulk_pull"):
             assert any(name in kernel for kernel in kernels), (name, kernels)
+        if gradients:
+            # The public gradient uses a stable per-source slot prefix, including
+            # repeated expert IDs, and writes both gradients back through the peer mapping.
+            assert any("_backward_positions" in name for name in kernels), kernels
+            assert not any("AllToAll" in name or "all_to_all" in name for name in kernels), kernels
+            compute = {
+                e.device_resource_id for e in events if "mega_moe" in e.name and "wgrad" in e.name
+            }
+            returns = {e.device_resource_id for e in events if "_backward_pull" in e.name}
+            assert compute and returns and compute.isdisjoint(returns), (compute, returns)
     else:
         actual = evaluate()
     for observed, reference in zip(actual, expected):
@@ -84,22 +95,40 @@ def _check_streams(inputs):
     x, ids, probs, w1, w2 = inputs
     with torch.no_grad():
         calls = [
-            (x * scale, torch.where(ids >= 0, (ids + i) % 4, ids), probs * (-1) ** i, w1, w2)
+            (
+                (x * scale).requires_grad_(),
+                torch.where(ids >= 0, (ids + i) % 4, ids),
+                (probs * (-1) ** i).requires_grad_(),
+                w1,
+                w2,
+            )
             for i, scale in enumerate((1.0, -1.0, 2.0, -2.0))
         ]
-        with patch.object(peer, "_peer_supported", return_value=False):
-            references = [_run(args) for args in calls]
-        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
-        for stream in streams:
-            stream.wait_stream(torch.cuda.current_stream())
-        results = []
-        for i, args in enumerate(calls):
-            with torch.cuda.stream(streams[i % 2]):
-                results.append(_run(args))
-        torch.cuda.synchronize()
-        for observed, reference in zip(results, references):
+        dy = torch.randn_like(x)
+
+    def evaluate(y, args, retain=False):
+        return (y, *torch.autograd.grad(y, (args[0], args[2], *w1, *w2), dy, retain_graph=retain))
+
+    with patch.object(peer, "_peer_supported", return_value=False):
+        references = [evaluate(_run(args), args) for args in calls]
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+    results = []
+    for i, args in enumerate(calls):
+        with torch.cuda.stream(streams[i % 2]):
+            results.append(evaluate(_run(args), args, retain=True))
+    # The two caller streams alternately reuse the workspace and its return
+    # stream while the earlier graphs and their gradient results stay live.
+    for i in reversed(range(len(calls))):
+        with torch.cuda.stream(streams[i % 2]):
+            results.append(evaluate(results[i][0], calls[i]))
+    torch.cuda.synchronize()
+    for result, expected in zip(results, references + references[::-1]):
+        for observed, reference in zip(result, expected):
             torch.testing.assert_close(observed, reference, rtol=0, atol=0)
-        # Reuse the original tensor objects with changed routing and probabilities.
+    # Reuse the original tensor objects with changed routing and probabilities.
+    with torch.no_grad():
         ids.copy_(calls[-1][1])
         probs.mul_(2)
         x.neg_()
@@ -120,6 +149,9 @@ def _worker():
         inputs = _case(rank, tokens, topk)
         _compare(inputs, gradients=True, profile=True)
         _check_streams(inputs)
+        # Activation and output-gradient transport also accepts FP16; one source
+        # has no tokens while its experts still receive routes from the other rank.
+        _compare(_case(rank, 2049 if rank == 0 else 0, 2, dtype=torch.float16), gradients=True)
 
         # Only rank 1 has tokens, all experts they select belong to rank 0.
         empty = _case(rank, 0 if rank == 0 else 2050, 2)

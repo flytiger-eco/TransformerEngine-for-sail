@@ -115,7 +115,7 @@ extern "C" __global__ __launch_bounds__(kThreads) void nvte_mega_moe_wgrad(
 
 extern "C" __global__ __launch_bounds__(kThreads) void nvte_mega_moe_swiglu_backward(
     const void* dact_ptr, const void* projection_ptr, const float* probs, void* dprojection_ptr,
-    float* dp, int rows, int intermediate) {
+    float* dp, void* activation_ptr, int rows, int intermediate) {
   const auto* dact = static_cast<const Element*>(dact_ptr);
   const auto* projection = static_cast<const Element*>(projection_ptr);
   auto* dprojection = static_cast<Element*>(dprojection_ptr);
@@ -130,6 +130,9 @@ extern "C" __global__ __launch_bounds__(kThreads) void nvte_mega_moe_swiglu_back
       const float dh = promote(dact[base + i]);
       const float sigmoid = 1.f / (1.f + expf(-gate));
       const float silu = gate * sigmoid;
+      if (activation_ptr != nullptr)
+        static_cast<Element*>(activation_ptr)[base + i] =
+            round_element((gate / (1.f + expf(-gate))) * up * prob);
       sum += dh * (silu * up);
       const float scaled = dh * prob;
       dprojection[gate_pos] = round_element(scaled * up * sigmoid * (1.f + gate * (1.f - sigmoid)));

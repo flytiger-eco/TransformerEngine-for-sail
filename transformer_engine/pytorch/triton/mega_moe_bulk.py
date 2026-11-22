@@ -23,6 +23,7 @@ def _route_header(
     ids,
     local_positions,
     header,
+    block_counts,
     slots,
     experts,
     hidden,
@@ -32,6 +33,8 @@ def _route_header(
     slot_stride: tl.constexpr,
     bounds: tl.constexpr,
     check_ids: tl.constexpr,
+    stable: tl.constexpr,
+    bins: tl.constexpr,
     block: tl.constexpr,
 ):
     if check_ids:
@@ -41,8 +44,20 @@ def _route_header(
             ids + token * row_stride + (slot % topk) * slot_stride, mask=slot < slots, other=-1
         )
         valid = (expert >= 0) & (expert < 2 * experts)
-        pos = tl.atomic_add(header + tl.where(valid, expert, 0), 1, mask=valid, sem="relaxed")
-        tl.store(local_positions + slot, tl.where(valid, pos, -1), mask=slot < slots)
+        if stable:
+            # Backward must keep a reproducible reduction order for weight gradients.
+            counts = tl.histogram(tl.where(valid, expert, bins - 1), bins)
+            g = tl.arange(0, bins)
+            tl.store(
+                block_counts + g * tl.num_programs(0) + tl.program_id(0),
+                counts,
+                mask=g < 2 * experts,
+            )
+            tl.atomic_add(header + g, counts, mask=(g < 2 * experts) & (counts > 0), sem="relaxed")
+            tl.store(local_positions + slot, -1, mask=(slot < slots) & ~valid)
+        else:
+            pos = tl.atomic_add(header + tl.where(valid, expert, 0), 1, mask=valid, sem="relaxed")
+            tl.store(local_positions + slot, tl.where(valid, pos, -1), mask=slot < slots)
         if tl.sum(((expert != -1) & ~valid).to(tl.int32), 0):
             tl.atomic_or(header + bounds + 5, 1, sem="relaxed")
     if tl.program_id(0) == 0:
@@ -109,16 +124,16 @@ def _route_positions(
     tl.store(positions + slot, index, mask=valid)
 
 
-def bulk_forward(x, ids, probs, fc1, fc2, group, state):
-    """Return None collectively when the two ranks should use the generic peer path."""
-    tokens, topk = ids.shape
+def _bulk_plan(x, ids, fc1, fc2, group, state, backward=False):
+    """Exchange counts and construct the packed owner layout for this invocation."""
+    topk = ids.size(1)
     hidden = x.size(1)
     intermediate = fc2[0].size(1)
     experts = len(fc1)
     slots = ids.numel()
     can_pack = (
         x.device == state.device
-        and x.dtype == torch.bfloat16
+        and (x.dtype == torch.bfloat16 or (backward and x.dtype == torch.float16))
         and hidden >= 256
         and hidden % 8 == 0
         and intermediate >= 128
@@ -130,10 +145,12 @@ def bulk_forward(x, ids, probs, fc1, fc2, group, state):
     header = ids.new_zeros(_STRIDE)
     positions = ids.new_empty(slots) if can_pack else header
     blocks = max(1, triton.cdiv(slots, 256)) if can_pack else 1
+    counts = ids.new_empty((2 * experts, blocks)) if can_pack and backward else header
     _route_header[(blocks,)](
         ids if slots else header,
         positions if slots else header,
         header,
+        counts,
         min(slots, _INT_MAX),
         experts,
         hidden,
@@ -142,7 +159,9 @@ def bulk_forward(x, ids, probs, fc1, fc2, group, state):
         *ids.stride(),
         _BOUNDS,
         can_pack,
-        256
+        backward,
+        triton.next_power_of_2(2 * experts + 1) if can_pack and backward else 1,
+        256,
     )
     both = ids.new_empty(2 * _STRIDE)
     dist.all_gather_into_tensor(both, header, group=group)
@@ -160,14 +179,24 @@ def bulk_forward(x, ids, probs, fc1, fc2, group, state):
     sizes = [sum(sum(p[r * experts : (r + 1) * experts]) for p in peers) for r in range(2)]
     if sum(sizes) > _INT_MAX:
         return None
-    if not max(sizes):
-        return torch.zeros_like(x, memory_format=torch.contiguous_format)
     offsets = ids.new_empty(experts + 1)
     src_bases = ids.new_empty(2 * experts)
     _expert_layout[(1,)](
         both, src_bases, offsets, experts, rank, _STRIDE, triton.next_power_of_2(2 * experts)
     )
 
+    return sizes, positions, src_bases, offsets, counts
+
+
+def bulk_forward(x, ids, probs, fc1, fc2, group, state):
+    """Return None collectively when the two ranks should use the generic peer path."""
+    plan = _bulk_plan(x, ids, fc1, fc2, group, state)
+    if plan is None:
+        return None
+    sizes, positions, src_bases, offsets, _ = plan
+    if not max(sizes):
+        return torch.zeros_like(x, memory_format=torch.contiguous_format)
+    rank, slots, topk, experts, hidden = group.rank(), ids.numel(), ids.size(1), len(fc1), x.size(1)
     # The same tile-aligned capacity on both ranks keeps rendezvous collective when
     # routing changes. FC2 writes back over the packed scratch after FC1 consumes it.
     capacity = triton.cdiv(max(sizes), 1024) * 1024
@@ -189,7 +218,7 @@ def bulk_forward(x, ids, probs, fc1, fc2, group, state):
             topk,
             *ids.stride(),
             *probs.stride(),
-            256
+            256,
         )
         tex.mega_moe_bulk_push(x, ids, positions, *buffers, experts, rank)
     state.handle.barrier(channel=0)

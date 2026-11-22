@@ -53,6 +53,12 @@ def _rtc_backward(
     fc2: list[Tensor],
     ep_group: str,
 ) -> tuple[Tensor, Tensor, list[Tensor], list[Tensor]]:
+    if ep_group and x.is_cuda:
+        from ._mega_moe_peer import peer_backward
+
+        gradients = peer_backward(dy, x, ids, probs, fc1, fc2, ep_group)
+        if gradients is not None:
+            return gradients
     x, probs, offsets, order, plan = _pack(x, ids, probs, len(fc1), ep_group)
     routed_dy = redispatch(dy.unsqueeze(1).expand(-1, ids.size(1), -1), plan)
     dx, dp, dw1, dw2 = tex.mega_moe_local_backward(
@@ -162,9 +168,18 @@ def bf16_mega_moe(
     overlaps fetching expert input tiles with the gate/up projection and weighted
     SwiGLU. FC2 makes output columns available for cross-rank FP32 reduction.
     Other peer shapes use the bulk or generic peer implementation. Groups without
-    peer access use variable-split all-to-all. First-order backward routes gradients to the
-    expert owners, recomputes FC1, and returns gradients for x, routing weights
-    and both local expert parameter lists.
+    peer access use variable-split all-to-all.
+
+    First-order backward recomputes FC1 and returns gradients for x, routing
+    weights and both local expert weight lists. Two peer-accessible SM89 PPUs
+    with Triton use symmetric backward dispatch when H >= 256 and I >= 128
+    are multiples of eight, each rank has at most 64 experts and K <= 8, and
+    at least one rank has 4096 or more T*K slots. The sources send x, output
+    gradients and routing weights to expert-major rows on their owners. On the
+    grouped GEMM path, a separate stream returns the per-route input and
+    routing-weight gradients once FC1 dgrad finishes, while the owner computes
+    its two weight gradients on the caller's stream. Other EP shapes use
+    variable-split all-to-all for backward dispatch and return.
     """
     return _mega_moe(
         x,

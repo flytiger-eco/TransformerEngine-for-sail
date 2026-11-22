@@ -277,3 +277,29 @@ PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-nod
 The benchmark verifies the three physical GPU launches and compares BF16 outputs with DeepEP and an independent reference. It alternates method order and route maps, recording event and synchronized wall times for the slower rank. DeepEP V2 uses all 39 CUs for the sequential baseline. Its SM89 JIT needs PCCL's CUDA-compatible device headers in `$EP_PCCL_ROOT_DIR/include_cuda`. Use `--automatic-rtc` to exercise the installation's dispatch settings or `--deepep-implementation legacy` with Megatron-LM on `PYTHONPATH` to measure the legacy dispatcher.
 
 On two pairs of 39-CU SM89 PPUs (PyTorch 2.10.0 and DeepEP 2.2.0), three seeds gave 1.521–1.531 ms for the three-kernel path and 1.831–1.834 ms for DeepEP. This reduced median forward latency by 16.4–17.0%. BF16 outputs matched elementwise for all nine routing tables on both ranks.
+
+## 9. MegaMoE backward on captured grouped GEMM shapes
+
+`benchmark_mega_moe_backward_tags.py` runs the owner-local MegaMoE gradient stages with the full per-expert row distribution from each tag. For RTC, NN records dgrad and TN records wgrad. The script also replays accumulating cuBLAS NT wgrad and derives the two adjoints of each RTC NT forward capture. The CSV keeps the source line, original backend and layout, expert splits, operation, and whether the case was captured directly or derived.
+
+```bash
+tag=gg_tags_20261118-174428.txt
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD" python benchmarks/gemm/benchmark_mega_moe_backward_tags.py \
+    "$tag" --backend megamoe --output /tmp/mega-grads.csv
+```
+
+Use `--backend tag` to replay the original backend and recorded tile of each directly captured backward GEMM. Use `--backend legacy` to compile the original MegaMoE dgrad and wgrad kernels from `--legacy-revision` and reproduce their launch geometry. Each stage uses identical seeded BF16 operands across backends. The comparison tests every expert against sampled full-length FP32 dot products and measures repeated CUDA-event intervals after warmup. MegaMoE traces also check the optimized gradient kernel identity.
+
+The 179-line capture contains 66 direct dgrads, 24 direct wgrads and 89 forward tags. Including both adjoints of each forward tag gives 268 cases. The capture records only operand precision for its 14 accumulating wgrads. Replaying those with both BF16 and FP32 destinations gives 282 measurements. For accumulating wgrad, the legacy comparison adds the old BF16 result into the destination, and the original cuBLAS comparison uses beta=1 directly. Use `--line N` for a single tag or `--shards N --shard I` to distribute the cases over independent processes.
+
+To time the public two-rank backward, select which projection each forward tag represents. The benchmark generates a seeded top-2 route map that reproduces the exact row counts at each expert owner. It verifies the full input, probability and parameter gradients against independent per-expert FP32 math with the operator's BF16 rounding. The CUDA event interval covers dispatch, FC1 recomputation, SwiGLU backward, both dgrads, both wgrads and returning source gradients. The JSON also records kernel names, start times, durations and stream IDs for each rank.
+
+```bash
+PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
+    benchmarks/gemm/benchmark_mega_moe_backward.py --tag-file gg_tags_20261118-174428.txt \
+    --cases 26:fc1 29:fc1 151:fc2 1:fc1 --output /tmp/megamoe-ep2-backward.json
+```
+
+On the 39-CU SM89 PPU, the median single-stage dgrad time over 155 cases went from 32.393 ms to 0.542 ms compared with MegaMoE at `91a4ee48`. Across 127 wgrad cases it went from 28.064 ms to 0.510 ms. Against each captured backend, 65/66 dgrads beat the recorded RTC tile (median 1.34×), and 5/10 wgrads beat RTC (median 1.00×). All 14 accumulating wgrads beat cuBLAS with both BF16 and FP32 destinations (median 1.51× and 1.52×). The largest regression against the captured backend was line 12 dgrad, 0.334 ms versus 0.278 ms. ACU measured 70.56% / 72.17% TFU for FC1 dgrad / wgrad and 72.42% / 61.89% for FC2 on line 26.
+
+The full two-rank backward medians for lines 26, 29, 151 and 1 were 3.231, 2.640, 7.568 and 1.621 ms respectively, down from 116.762, 78.796, 309.846 and 50.981 ms. With identical owner kernels, the complete P2P backward including overlap was 1.90–2.28× faster than the collective variant. With the same two-CU reservation for P2P, overlapping the return with wgrad reduced total backward time by 0.8–6.2% compared with a serialized return. Kineto measured 215–818 µs of return/wgrad overlap across the eight rank/case pairs.

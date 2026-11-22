@@ -28,6 +28,8 @@ class _Workspace:
         self.bulk_supported = False
         self.fused_supported = False
         self.fused = None
+        self.grad_stream = None
+        self.grad_ready = None
         self.device = None
         self.storage = None
         self.handle = None
@@ -198,3 +200,20 @@ def peer_forward(x, ids, probs, fc1, fc2, ep_group_name):
             output = tex.mega_moe_combine(output_slots.view(tokens, topk, hidden))
             state.done.record(torch.cuda.current_stream(x.device))
             return output
+
+
+def peer_backward(dy, x, ids, probs, fc1, fc2, ep_group_name):
+    """Dispatch activations and output gradients directly to two peer-accessible experts' ranks."""
+    group = dist.distributed_c10d._resolve_process_group(ep_group_name)
+    if group.size() != 2:
+        return None
+    with torch.cuda.device(x.device):
+        if not _peer_supported(group, x.device):
+            return None
+        state = _workspace(group)
+        if not state.bulk_supported:
+            return None
+        from .triton.mega_moe_backward import bulk_backward
+
+        with state.lock:
+            return bulk_backward(dy, x, ids, probs, fc1, fc2, group, state)
