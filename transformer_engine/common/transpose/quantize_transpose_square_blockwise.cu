@@ -546,7 +546,9 @@ void quantize_transpose_square_blockwise(const SimpleTensor& input, SimpleTensor
               const bool full_tile =
                   row_length % BLOCK_TILE_DIM == 0 && num_rows % BLOCK_TILE_DIM == 0;
 
-              if (full_tile) {
+              const bool enable_tma = transformer_engine::cuda::sm_arch() >= 90;
+
+              if (full_tile && enable_tma) {
                 CUtensorMap tensor_map_output_trans;
                 if (return_transpose) {
                   tensor_map_output_trans =
