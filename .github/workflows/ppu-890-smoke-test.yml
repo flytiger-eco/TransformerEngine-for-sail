@@ -20,7 +20,6 @@ env:
   NAMESPACE: "ppu-sched"
   NODE_SELECTOR: "board-type=ZW-M890P"
   HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
-  ARTIFACT_SUBDIR: "te-ci/${{ github.run_id }}-${{ inputs.build_attempt }}"
   ARTIFACT_DIR: "/mnt/wl_nas/te-ci/${{ github.run_id }}-${{ inputs.build_attempt }}"
   TE_REPO: "https://github.com/flytiger-eco/TransformerEngine-for-sail.git"
   PCCL_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
@@ -102,7 +101,3 @@ jobs:
             ${{ env.ENV_SETUP }}
             ${{ env.TEST_SETUP }}
             ${{ env.SMOKE_TEST }}
-
-      - name: "清理 NAS 产物"
-        if: always()
-        run: rm -rf "/wl_nas/${{ env.ARTIFACT_SUBDIR }}"
