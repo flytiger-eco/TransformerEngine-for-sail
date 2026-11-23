@@ -9,22 +9,16 @@
 
 namespace transformer_engine::rtc::fused_moe {
 
-// Each rank owns its control page. Only the peer writes kEntered, kRouted
-// and the six peer header fields, so publishing a new generation needs no
-// remote atomic. The host zeroes the entire page at the initial rendezvous.
+// Each sender owns one mailbox in every rank's control page, so publishing a
+// generation needs no remote atomic. The host zeroes the pages at rendezvous.
 enum RouteControl {
-  kEntryClaim,
-  kEntered,
-  kRetiring,
-  kRouted,
-  kInvalid,
-  kPeerMode,
-  kPeerHidden,
-  kPeerIntermediate,
-  kPeerExperts,
-  kPeerTokens,
-  kPeerInvalid,
-  kClaimCounts = 64,  // 2 * kMaxExperts, local scratch
+  kEntryClaim = 0,
+  kRetiring = 1,
+  kInvalid = 2,
+  kEntered = 8,        // one mailbox per sender
+  kRouted = 16,        // one mailbox per sender
+  kPeerHeader = 64,    // seven fields per sender
+  kClaimCounts = 256,  // world * kMaxExperts, local scratch
 };
 
 __device__ inline void stage_inputs(const MegaMoEFusedArgs &p) {
@@ -43,11 +37,11 @@ __device__ inline void stage_inputs(const MegaMoEFusedArgs &p) {
       int vecs = p.hidden / 8;
       for (int tok = warp; tok < p.tokens; tok += stride) {
         const int *ids = p.ids + static_cast<long long>(tok) * p.id_stride0;
-        const int e0 = ids[0], e1 = ids[p.id_stride1];
-        const int peer_begin = (1 - p.rank) * p.experts;
-        const int peer_end = peer_begin + p.experts;
-        const bool remote =
-            (e0 >= peer_begin && e0 < peer_end) || (e1 >= peer_begin && e1 < peer_end);
+        bool remote = false;
+        for (int k = 0; k < p.topk; ++k) {
+          const int e = ids[k * p.id_stride1];
+          remote |= e >= 0 && e < p.world * p.experts && e / p.experts != p.rank;
+        }
         if (remote)
           for (int v = lane; v < vecs; v += 32) {
             auto off = static_cast<long long>(tok) * vecs + v;
@@ -68,8 +62,8 @@ __device__ inline void stage_inputs(const MegaMoEFusedArgs &p) {
 // Claim one contiguous interval per nonempty (CTA, expert). Slot identities
 // make duplicate experts distinguishable even when two probabilities differ.
 __device__ inline void stage_routes(const MegaMoEFusedArgs &p, int *histogram) {
-  const int experts = 2 * p.experts;
-  const long long slots = 2ll * p.tokens;
+  const int experts = p.world * p.experts;
+  const long long slots = static_cast<long long>(p.topk) * p.tokens;
   auto *control = p.control[p.rank];
   for (long long first = static_cast<long long>(blockIdx.x) * blockDim.x; first < slots;
        first += static_cast<long long>(gridDim.x) * blockDim.x) {
@@ -80,7 +74,7 @@ __device__ inline void stage_routes(const MegaMoEFusedArgs &p, int *histogram) {
     int position = 0;
     float weight = 0;
     if (slot < slots) {
-      const long long row = slot / 2, k = slot % 2;
+      const long long row = slot / p.topk, k = slot % p.topk;
       id = p.ids[row * p.id_stride0 + k * p.id_stride1];
       if (id >= 0 && id < experts) {
         position = atomicAdd(histogram + id, 1);
@@ -97,7 +91,7 @@ __device__ inline void stage_routes(const MegaMoEFusedArgs &p, int *histogram) {
     }
     __syncthreads();
     if (id >= 0) {
-      const long long start = static_cast<long long>(id) * 2 * p.capacity;
+      const long long start = static_cast<long long>(id) * p.topk * p.capacity;
       const int ordinal = histogram[id] + position;
       p.source_routes[p.rank][start + ordinal] =
           (static_cast<unsigned long long>(__float_as_uint(weight)) << 32) |
@@ -113,17 +107,20 @@ __device__ inline void stage_routes(const MegaMoEFusedArgs &p, int *histogram) {
 extern "C" __global__ void nvte_mega_moe_fused_pre_dispatch(
     transformer_engine::rtc::MegaMoEFusedArgs p) {
   using namespace transformer_engine::rtc::fused_moe;
-  int *local = p.control[p.rank], *peer = p.control[1 - p.rank];
+  int *local = p.control[p.rank];
   // A rank can reach the next call while its peer still combines the previous
-  // one. Enter on both streams before overwriting any peer-visible storage.
+  // one. Enter on every stream before overwriting any peer-visible storage.
   // The first scheduled CTA posts the arrival even on oversubscribed grids.
   if (threadIdx.x == 0) {
-    if (atomicExch(local + kEntryClaim, p.epoch) != p.epoch) publish(peer + kEntered, p.epoch);
-    wait_epoch(local + kEntered, p.epoch);
+    if (atomicExch(local + kEntryClaim, p.epoch) != p.epoch) {
+      for (int dst = 0; dst < p.world; ++dst) publish(p.control[dst] + kEntered + p.rank, p.epoch);
+    }
+    for (int src = 0; src < p.world; ++src) wait_epoch(local + kEntered + src, p.epoch);
   }
   __syncthreads();
 
-  __shared__ int histogram[2 * transformer_engine::rtc::MegaMoEFusedArgs::kMaxExperts];
+  __shared__ int histogram[transformer_engine::rtc::MegaMoEFusedArgs::kMaxRanks *
+                           transformer_engine::rtc::MegaMoEFusedArgs::kMaxExperts];
   if (p.eligible == p.kReady) {
     if (blockIdx.x == 0 && threadIdx.x == 0) *p.work_count = 0;
     stage_routes(p, histogram);
@@ -147,36 +144,48 @@ extern "C" __global__ void nvte_mega_moe_fused_pre_dispatch(
   __syncthreads();
   if (!last) return;
 
-  if (p.eligible == p.kReady && threadIdx.x < 2 * p.experts) {
+  if (p.eligible == p.kReady && threadIdx.x < p.world * p.experts) {
     p.counts[p.rank][threadIdx.x] = local[kClaimCounts + threadIdx.x];
     local[kClaimCounts + threadIdx.x] = 0;
   }
   if (threadIdx.x == 0) {
-    __stbl(peer + kPeerMode, p.eligible);
-    __stbl(peer + kPeerHidden, p.hidden);
-    __stbl(peer + kPeerIntermediate, p.intermediate);
-    __stbl(peer + kPeerExperts, p.experts);
-    __stbl(peer + kPeerTokens, p.tokens);
-    __stbl(peer + kPeerInvalid, local[kInvalid]);
+    for (int dst = 0; dst < p.world; ++dst) {
+      int *header = p.control[dst] + kPeerHeader + 7 * p.rank;
+      __stbl(header, p.eligible);
+      __stbl(header + 1, p.hidden);
+      __stbl(header + 2, p.intermediate);
+      __stbl(header + 3, p.experts);
+      __stbl(header + 4, p.tokens);
+      __stbl(header + 5, local[kInvalid]);
+      __stbl(header + 6, p.topk);
+    }
   }
   release_warp_writes();
   __syncthreads();
   if (threadIdx.x == 0) {
-    publish(peer + kRouted, p.epoch);
-    wait_epoch(local + kRouted, p.epoch);
-    const int peer_mode = __ldbl(local + kPeerMode);
-    const int max_tokens = max(p.tokens, __ldbl(local + kPeerTokens));
+    for (int dst = 0; dst < p.world; ++dst) publish(p.control[dst] + kRouted + p.rank, p.epoch);
+    for (int src = 0; src < p.world; ++src) wait_epoch(local + kRouted + src, p.epoch);
+    int max_tokens = 0;
+    bool allocation_failed = false, unsupported = false, needs_capacity = false, invalid = false;
+    for (int src = 0; src < p.world; ++src) {
+      const int *header = local + kPeerHeader + 7 * src;
+      int mode = __ldbl(header);
+      allocation_failed |= mode == p.kOutputAllocationFailed;
+      unsupported |= mode == p.kUnsupported || __ldbl(header + 1) != p.hidden ||
+                     __ldbl(header + 2) != p.intermediate || __ldbl(header + 3) != p.experts ||
+                     __ldbl(header + 6) != p.topk;
+      needs_capacity |= mode == p.kNeedsCapacity;
+      invalid |= __ldbl(header + 5) != 0;
+      max_tokens = max(max_tokens, __ldbl(header + 4));
+    }
     int status = 0;
-    if (p.eligible == p.kOutputAllocationFailed || peer_mode == p.kOutputAllocationFailed) {
+    if (allocation_failed) {
       status = 4;
-    } else if (p.eligible == p.kUnsupported || peer_mode == p.kUnsupported ||
-               p.hidden != __ldbl(local + kPeerHidden) ||
-               p.intermediate != __ldbl(local + kPeerIntermediate) ||
-               p.experts != __ldbl(local + kPeerExperts) || max_tokens < 2048) {
+    } else if (unsupported || max_tokens < 2048) {
       status = 1;
-    } else if (p.eligible == p.kNeedsCapacity || peer_mode == p.kNeedsCapacity) {
+    } else if (needs_capacity) {
       status = 3;
-    } else if (local[kInvalid] || __ldbl(local + kPeerInvalid)) {
+    } else if (invalid) {
       status = 2;
     }
     local[kInvalid] = 0;

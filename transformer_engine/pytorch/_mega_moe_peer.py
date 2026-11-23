@@ -5,6 +5,7 @@
 """Intra-node MegaMoE dispatch and combine through symmetric PPU memory."""
 
 import socket
+import os
 import threading
 from importlib.util import find_spec
 from weakref import WeakKeyDictionary, finalize
@@ -128,7 +129,11 @@ def _peer_supported(group, device):
                 and all(devices <= item[2] for item in peers)
             )
             state.bulk_supported = group.size() == 2 and all(item[3] for item in peers)
-            state.fused_supported = group.size() == 2 and all(item[4] for item in peers)
+            state.fused_supported = (
+                group.size() in (2, 8)
+                and (group.size() == 2 or os.getenv("NVTE_MOE_EP8_FUSED", "1") == "1")
+                and all(item[4] for item in peers)
+            )
             state.device = device
         return state.supported
 

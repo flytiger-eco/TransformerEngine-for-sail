@@ -163,8 +163,10 @@ def bf16_mega_moe(
 
     The PPU runtime compiles the expert kernels for the input precision. On
     peer-accessible EP groups, tokens and results travel through symmetric buffers.
-    Large top-2 batches on two SM89 PPUs with compatible BF16 weights use three
-    kernels after workspace setup. Pre-dispatch builds expert route lists. FC1
+    Batches with K <= 8 on two or eight SM89 PPUs use three kernels after workspace
+    setup when H and I are multiples of 256, the BF16 weights are contiguous and
+    aligned, each rank has at most 16 experts, and at least one rank has 2048 or
+    more input tokens. Pre-dispatch builds expert route lists. FC1
     overlaps fetching expert input tiles with the gate/up projection and weighted
     SwiGLU. FC2 makes output columns available for cross-rank FP32 reduction.
     Other peer shapes use the bulk or generic peer implementation. Groups without

@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""Reusable two-rank IPC mappings for the SM89 three-kernel BF16 forward."""
+"""Reusable IPC mappings for the SM89 three-kernel BF16 forward (EP <= 8)."""
 
 import torch
 import torch.distributed as dist
@@ -12,7 +12,7 @@ import transformer_engine_torch as tex
 
 def _mapping(group, tensor):
     handle = symm.rendezvous(tensor, group)
-    buffers = [handle.get_buffer(r, tensor.shape, tensor.dtype) for r in range(2)]
+    buffers = [handle.get_buffer(r, tensor.shape, tensor.dtype) for r in range(group.size())]
     return tensor, handle, buffers
 
 
@@ -20,7 +20,7 @@ class FusedWorkspace:
     def __init__(self, group, device):
         # Initialize before rendezvous so a remote rank can safely signal its
         # first epoch as soon as it acquires the mapped addresses.
-        control = symm.empty(256, dtype=torch.int32, device=device)
+        control = symm.empty(1024, dtype=torch.int32, device=device)
         control.zero_()
         torch.cuda.current_stream(device).synchronize()
         self.control = _mapping(group, control)
@@ -36,12 +36,12 @@ class FusedWorkspace:
         self.done = torch.cuda.Event()
 
     def _resize(self, group, shape, capacity, device):
-        # Keep the old mapping alive until both ranks allocated replacements.
+        # Keep the old mapping alive until all ranks allocated replacements.
         # A peer that cannot allocate must signal before entering rendezvous.
         local = payload = error = None
         try:
-            peer_bytes, local_bytes, flags, flag_bytes = (
-                tex.mega_moe_fused_workspace_sizes(capacity, *shape)
+            peer_bytes, local_bytes, flags, flag_bytes = tex.mega_moe_fused_workspace_sizes(
+                capacity, *shape
             )
             local = torch.empty(local_bytes, dtype=torch.uint8, device=device)
             local.narrow(0, flags, flag_bytes).zero_()
@@ -49,9 +49,7 @@ class FusedWorkspace:
         except RuntimeError as exc:
             local = payload = None
             error = exc
-        code = (
-            2 if isinstance(error, torch.OutOfMemoryError) else int(error is not None)
-        )
+        code = 2 if isinstance(error, torch.OutOfMemoryError) else int(error is not None)
         self.allocation_status.fill_(code)
         dist.all_reduce(self.allocation_status, op=dist.ReduceOp.MAX, group=group)
         failure = self.allocation_status.item()
@@ -70,7 +68,7 @@ class FusedWorkspace:
     def forward(self, x, ids, probs, fc1, fc2, group):
         stream = torch.cuda.current_stream(self.control[0].device)
         stream.wait_event(self.done)
-        shape = (x.size(1), fc2[0].size(1), len(fc1))
+        shape = (x.size(1), fc2[0].size(1), len(fc1), group.size(), ids.size(1))
         while True:
             self.epoch += 1
             configured = self.shape == shape
@@ -96,12 +94,10 @@ class FusedWorkspace:
             if status == 2:
                 raise ValueError("Expected expert IDs in range or -1")
             if status == 4:
-                raise torch.OutOfMemoryError(
-                    "A rank could not allocate its MegaMoE output"
-                )
+                raise torch.OutOfMemoryError("A rank could not allocate its MegaMoE output")
             if status != 3:
                 raise RuntimeError(f"Unexpected MegaMoE pre-dispatch status {status}")
-            # Both ranks finished the previous epoch and requested the same
+            # All ranks finished the previous epoch and requested the same
             # capacity. The second pre-dispatch uses the new mappings.
             capacity = (max_tokens + 255) // 256 * 256
             self._resize(group, shape, capacity, x.device)

@@ -84,19 +84,18 @@ __device__ __forceinline__ float sigmoid(Bf16 gate, const float* table) {
 }
 
 struct Tile {
-  int expert, source0_rows, valid_rows, first_expert_row;
+  int expert, valid_rows, first_expert_row;
 };
 
 // The expert tables fit in one warp. A thread's inclusive prefix gives its
 // expert's past-the-end tile number; the ballot maps a tile ID to an expert.
-__device__ __forceinline__ Tile find_tile(int tile, int prefix, int source0, int total) {
+__device__ __forceinline__ Tile find_tile(int tile, int prefix, int total) {
   unsigned end_after = __ballot_sync(0xffffffffu, prefix > tile);
   int expert = __ffs(end_after) - 1;
   int first = __shfl_sync(0xffffffffu, prefix, expert > 0 ? expert - 1 : 0);
   if (!expert) first = 0;
   int in_expert = (tile - first) * kRows;
-  return {expert, __shfl_sync(0xffffffffu, source0, expert),
-          min(kRows, __shfl_sync(0xffffffffu, total, expert) - in_expert), in_expert};
+  return {expert, min(kRows, __shfl_sync(0xffffffffu, total, expert) - in_expert), in_expert};
 }
 
 __device__ __forceinline__ void copy_tile(const MegaMoEFusedArgs& p, int tile, Tile t) {
@@ -107,20 +106,35 @@ __device__ __forceinline__ void copy_tile(const MegaMoEFusedArgs& p, int tile, T
   // Issuing one dependent fabric load per warp would serialize route lookup.
   extern __shared__ char smem[];
   auto* slot_by_row = reinterpret_cast<int*>(smem);
+  auto* source_by_row = slot_by_row + kRows;
   if (threadIdx.x < t.valid_rows) {
     int row = threadIdx.x;
     int expert_row = t.first_expert_row + row;
-    int src = int(expert_row >= t.source0_rows);
-    int idx = expert_row - (src ? t.source0_rows : 0);
+    int src = 0, first = 0, prefix = 0;
+    // All lanes must execute the same count loads. A divergent early exit in
+    // this search can make a mixed-source warp retain the next source's route
+    // base while retaining the current source's row ordinal on the PPU.
+#pragma unroll
+    for (int r = 0; r < NVTE_MOE_FUSED_WORLD; ++r) {
+      int count = __ldbl(p.counts[r] + global_expert);
+      bool belongs = expert_row >= prefix && expert_row < prefix + count;
+      src = belongs ? r : src;
+      first = belongs ? prefix : first;
+      prefix += count;
+    }
+    int idx = expert_row - first;
     const auto rec = __ldbl(p.source_routes[src] +
-                            static_cast<long long>(global_expert) * (2 * p.capacity) + idx);
+                            static_cast<long long>(global_expert) * p.topk * p.capacity + idx);
     slot_by_row[row] = int(rec);
+    source_by_row[row] = src;
     p.packed_probs[tile * kRows + row] = __uint_as_float(static_cast<unsigned>(rec >> 32));
   }
+  if (threadIdx.x >= t.valid_rows && threadIdx.x < kRows)
+    p.packed_probs[tile * kRows + threadIdx.x] = 0.f;
   __syncthreads();
   for (int row = warp; row < t.valid_rows; row += Gemm::MaxThreadsPerBlock / 32) {
-    int src = int(t.first_expert_row + row >= t.source0_rows);
-    int token = slot_by_row[row] / 2;
+    int src = source_by_row[row];
+    int token = slot_by_row[row] / p.topk;
     const void* input = src == p.rank && p.x_stride0 == kHidden && p.x_stride1 == 1 &&
                                 !(reinterpret_cast<unsigned long long>(p.x) % 16)
                             ? p.x
@@ -149,6 +163,13 @@ __device__ __forceinline__ void copy_tile(const MegaMoEFusedArgs& p, int tile, T
           __ppu_global_store_bulk_volatile_b32x4(dst + (first + j) * 256, data[j]);
     }
   }
+  // Every expert occupies complete 256-row tiles. Initialize the tail explicitly
+  // so both AIU GEMMs can use full-tile descriptors, including ragged experts.
+  for (int row = t.valid_rows + warp; row < kRows; row += Gemm::MaxThreadsPerBlock / 32) {
+    Bf16* dst = pool + int64_t(row) * kHidden;
+    for (int col = 0; col < kHidden; col += 256)
+      __ppu_global_store_bulk_volatile_b32x4(dst + col, make_uint4(0, 0, 0, 0));
+  }
   release_warp_writes();
   __syncthreads();
   if (threadIdx.x == 0) publish(p.tile_ready + tile, p.epoch);
@@ -175,11 +196,10 @@ __device__ __forceinline__ void project(const MegaMoEFusedArgs& p, int tile, int
   const int start = tile * kRows;
   auto const* x = static_cast<const Bf16*>(p.packed_x) + int64_t(start) * kHidden;
   auto const* w = static_cast<const Bf16*>(p.w1[t.expert]);
-  const auto da =
-      Gemm::template packed_stride<typename Mainloop::InternalStrideA>(t.valid_rows, kHidden);
+  const auto da = Gemm::template packed_stride<typename Mainloop::InternalStrideA>(kRows, kHidden);
   const auto db =
       Gemm::template packed_stride<typename Mainloop::InternalStrideB>(2 * kIntermediate, kHidden);
-  auto a = make_tensor(make_gmem_ptr(x), make_shape(t.valid_rows, Int<kHidden>{}), da);
+  auto a = make_tensor(make_gmem_ptr(x), make_shape(Int<kRows>{}, Int<kHidden>{}), da);
   auto b = make_tensor(make_gmem_ptr(w), make_shape(Int<2 * kIntermediate>{}, Int<kHidden>{}), db);
   auto coord = make_coord(0, column, _);
   auto ga = local_tile(make_mix_tensor_like(a), Shape{}, coord, Step<_1, Underscore, _1>{});
@@ -187,9 +207,9 @@ __device__ __forceinline__ void project(const MegaMoEFusedArgs& p, int tile, int
   Mma mma;
   auto acc = partition_fragment_C(mma, take<0, 2>(Shape{}));
   clear(acc);
-  Mainloop mainloop(make_shape(t.valid_rows, 2 * kIntermediate, kHidden), da, db);
+  Mainloop mainloop(make_shape(kRows, 2 * kIntermediate, kHidden), da, db);
   mainloop(acc, ga, gb, acc, make_coord_iterator(shape<2>(ga)), Int<kHidden / 64>{},
-           make_coord(t.valid_rows, 2 * kIntermediate - column * kCols, 0), int(threadIdx.x), smem);
+           make_coord(kRows, 2 * kIntermediate - column * kCols, 0), int(threadIdx.x), smem);
   cp_async_wait<0>();
   __syncthreads();
   // For this fixed MMA layout each lane owns 128 FP32 accumulators: the
@@ -207,7 +227,7 @@ __device__ __forceinline__ void project(const MegaMoEFusedArgs& p, int tile, int
   for (int row = 0; row < 8; ++row) {
     int first = (row / 2) * 8 + (row % 2) * 2;
     int r = get<0>(coords(first));
-    if (r < t.valid_rows) {
+    if (r < kRows) {
       float prob = __ldbl(p.packed_probs + start + r);
       CUTLASS_PRAGMA_UNROLL
       for (int pair = 0; pair < 4; ++pair) {
@@ -238,8 +258,10 @@ extern "C" __global__ __launch_bounds__(512) void nvte_mega_moe_fused_l1(
   extern __shared__ char smem[];
   int lane = threadIdx.x % 32;
   int expert = p.rank * p.experts + lane;
-  int source0 = lane < p.experts ? __ldbl(p.counts[0] + expert) : 0;
-  int total = source0 + (lane < p.experts ? __ldbl(p.counts[1] + expert) : 0);
+  int total = 0;
+  if (lane < p.experts) {
+    for (int src = 0; src < p.world; ++src) total += __ldbl(p.counts[src] + expert);
+  }
   int prefix = (total + kRows - 1) / kRows;
 #pragma unroll
   for (int delta = 1; delta < 32; delta *= 2) {
@@ -250,10 +272,10 @@ extern "C" __global__ __launch_bounds__(512) void nvte_mega_moe_fused_l1(
   // At most one CTA per physical CU. Copy CTAs can always make forward
   // progress while consumers await individual M tiles. They join the same
   // compute queue when all of their assigned copies have completed.
-  int producers = min(8, int(gridDim.x) - 1);
+  int producers = min(NVTE_MOE_FUSED_COPY_SMS, int(gridDim.x) - 1);
   if (int(blockIdx.x) < producers) {
     for (int tile = blockIdx.x; tile < tiles; tile += producers)
-      copy_tile(p, tile, find_tile(tile, prefix, source0, total));
+      copy_tile(p, tile, find_tile(tile, prefix, total));
   }
   initialize_sigmoid_table(smem);
   constexpr int columns = 2 * kIntermediate / kCols;
@@ -266,7 +288,7 @@ extern "C" __global__ __launch_bounds__(512) void nvte_mega_moe_fused_l1(
     __syncthreads();
     if (id >= tiles * columns) break;
     int tile = id / columns, column = id % columns;
-    auto t = find_tile(tile, prefix, source0, total);
+    auto t = find_tile(tile, prefix, total);
     if (threadIdx.x == 0) wait_epoch(p.tile_ready + tile, p.epoch);
     __syncthreads();
     project(p, tile, column, t, smem);

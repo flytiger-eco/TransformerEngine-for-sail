@@ -303,3 +303,46 @@ PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-nod
 On the 39-CU SM89 PPU, the median single-stage dgrad time over 155 cases went from 32.393 ms to 0.542 ms compared with MegaMoE at `91a4ee48`. Across 127 wgrad cases it went from 28.064 ms to 0.510 ms. Against each captured backend, 65/66 dgrads beat the recorded RTC tile (median 1.34×), and 5/10 wgrads beat RTC (median 1.00×). All 14 accumulating wgrads beat cuBLAS with both BF16 and FP32 destinations (median 1.51× and 1.52×). The largest regression against the captured backend was line 12 dgrad, 0.334 ms versus 0.278 ms. ACU measured 70.56% / 72.17% TFU for FC1 dgrad / wgrad and 72.42% / 61.89% for FC2 on line 26.
 
 The full two-rank backward medians for lines 26, 29, 151 and 1 were 3.231, 2.640, 7.568 and 1.621 ms respectively, down from 116.762, 78.796, 309.846 and 50.981 ms. With identical owner kernels, the complete P2P backward including overlap was 1.90–2.28× faster than the collective variant. With the same two-CU reservation for P2P, overlapping the return with wgrad reduced total backward time by 0.8–6.2% compared with a serialized return. Kineto measured 215–818 µs of return/wgrad overlap across the eight rank/case pairs.
+
+## 10. BF16 EP8 / top-k eight forward replay
+
+`benchmark_mega_moe_ep8.py` compares full dispatch, expert computation and combine on eight peer-accessible SM89 PPUs. The default case has 64 experts (eight per rank), 2,048 received rows per expert, H=3,584 and I=3,072. FC1 is 3,584 -> 6,144, weighted SwiGLU reduces to 3,072, and FC2 is 3,072 -> 3,584. Each rank supplies 2,048 tokens and each token selects eight distinct experts. Random route maps preserve exactly 256 rows from every source to every expert, giving 87.5% remote routes.
+
+The EP8 fused path extends the three-kernel protocol in section 8 to eight source ranks and up to eight routes per token. L1 packs each input tile once, uses 256x256x64 GEMMs with three pipeline stages, and applies weighted SwiGLU in its epilogue. L2 overlaps the second projection partition with first-partition return and reduction. Expert tails are zero-padded to 256 rows. The final reduction preserves route order, accumulates in FP32, and stores BF16 once.
+
+On eight 39-CU ZW-M890P PPUs with ICN64 connectivity, PyTorch 2.11 and PCCL 2.2.0, the measured complete-forward latencies were:
+
+| Seed | DeepEP V2 + RTC grouped GEMM | Fused MegaMoE, tuned |
+|---|---:|---:|
+| 73 | 4.228080 ms | 4.680850 ms |
+| 991 | 4.229800 ms | 4.681490 ms |
+| 5741 | 4.229700 ms | 4.685250 ms |
+| Pooled median | 4.229145 ms | 4.683245 ms |
+
+Each seed restarts all eight ranks and uses three route maps, eight warmups and ten alternating AB/BA rounds of twelve forwards per implementation. The table pools 360 samples per implementation, taking the slowest rank for every sample. Timing excludes initialization, RTC compilation, workspace growth and reference calculations. Profiler collection is disabled for these measurements. Pooled p10/p90 were 4.219/4.252 ms for DeepEP and 4.668/4.711 ms for MegaMoE.
+
+The previous generic EP8 peer path took 147.909 ms on the same case, so the tuned fused path is 31.58x faster. It remains 10.74% slower than DeepEP. The earlier DeepEP baseline was 4.229195 ms, consistent with the new measurement. The generic path uses 16x64x32 tiles with repeated weight requests and synchronous K-loop loads; FC1 requests each source input again for each of 48 output tiles. Those source-level request counts do not measure actual ICN or HBM traffic because caches can serve repeated requests.
+
+The selected partition uses eight copy CTAs, four combine CTAs and batches four route loads before accumulating in the original order. Defaults remain eight copy CTAs, fifteen combine CTAs and one route per batch. A short sweep gave 4.970 ms with defaults and 4.690 ms with the selected settings; sixteen copy CTAs, only two combine CTAs, or serial combine did not improve this case. These are case-specific tuning results, not universal settings.
+
+With a built Transformer Engine and a compatible DeepEP V2 installation, run from the repository root:
+
+```bash
+for seed in 73 991 5741; do
+  PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" OMP_NUM_THREADS=1 \
+    NVTE_MOE_EP8_FUSED=1 NVTE_MOE_FUSED_COPY_SMS=8 \
+    NVTE_MOE_FUSED_COMBINE_SMS=4 NVTE_MOE_FUSED_ROUTE_BATCH=4 \
+    python -m torch.distributed.run --standalone --nproc-per-node=8 \
+    benchmarks/gemm/benchmark_mega_moe_ep8.py --seed "$seed" \
+    --route-variants 3 --warmup 8 --rounds 10 --iters 12 \
+    --output "/tmp/mega-moe-ep8-${seed}.json"
+done
+```
+
+The benchmark enables the RTC grouped GEMM backend and uses 39 CUs for DeepEP by default. DeepEP's SM89 JIT also needs the PCCL CUDA-compatible headers described in section 8. Add `--profile` to collect kernel identities outside the timed loop. Set `NVTE_MOE_EP8_FUSED=0` to replay the generic EP8 peer path.
+
+All 72 rank/map/seed checks passed the independent FP32 reference with BF16 storage rounding. Maximum relative L2 was 0.001403459 for MegaMoE versus reference, 0.002536992 for DeepEP versus reference, and 0.002278959 between implementations; maximum absolute error was 0.015625. The outputs need not match elementwise: this DeepEP configuration pre-reduces routes belonging to the same owner into BF16 before return, whereas MegaMoE returns each route and performs one ordered FP32 top-k sum.
+
+Seven EP8 checks also passed under both default and tuned settings: unbalanced source/expert counts, empty sources, skipped/duplicate/zero-weight routes, owners with no expert rows, capacity growth and cross-stream reuse. Their maximum relative L2 was 0.000388306 and maximum absolute error was 0.0078125. The existing EP2 fused-forward and bulk-transport tests both passed, including backward, fallback, and workspace transitions.
+
+The fused public path admits EP2/EP8, BF16, top-k one through eight, H and I divisible by 256, at most sixteen local experts, and aligned contiguous expert weights. At least one rank must supply 2,048 tokens; other sources may be empty. All peers must pass the IPC, cooperative-launch and device capability checks. Other inputs retain their existing fallback behavior. The selected case reserves about 1.6724 GiB of workspace per rank for the worst route imbalance; that reservation is larger than the balanced case's actual owner row count.

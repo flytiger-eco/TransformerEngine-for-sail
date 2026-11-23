@@ -2,6 +2,7 @@
  * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * See LICENSE for license information.
  ************************************************************************/
+#include <cstdlib>
 #include <mutex>
 #include <set>
 
@@ -17,6 +18,16 @@
 
 namespace transformer_engine::rtc {
 namespace {
+int partition_sms(const char *name, int fallback, int minimum, int maximum) {
+  const char *raw = std::getenv(name);
+  if (raw == nullptr) return fallback < maximum ? fallback : maximum;
+  char *end = nullptr;
+  const auto value = std::strtol(raw, &end, 10);
+  NVTE_CHECK(end != raw && *end == '\0' && value >= minimum && value <= maximum, name,
+             " must be an integer between ", minimum, " and ", maximum);
+  return static_cast<int>(value);
+}
+
 std::vector<Header> headers() {
   return {{string_code_mega_moe_fused_args_h, "mega_moe_fused_args.h"},
           {string_code_mega_moe_fused_protocol_cuh, "mega_moe_fused_protocol.cuh"}};
@@ -25,7 +36,13 @@ std::vector<Header> headers() {
 void layer(const MegaMoEFusedArgs &p, bool first, cudaStream_t stream) {
   auto &manager = KernelManager::instance();
   const char *name = first ? "nvte_mega_moe_fused_l1" : "nvte_mega_moe_fused_l2";
-  const auto label = concat_strings(name, "_h", p.hidden, "_i", p.intermediate);
+  const int copy_sms = partition_sms("NVTE_MOE_FUSED_COPY_SMS", 8, 1, cuda::sm_count() - 1);
+  const int combine_sms = partition_sms("NVTE_MOE_FUSED_COMBINE_SMS", 15, 0, cuda::sm_count() - 1);
+  const int route_batch = partition_sms("NVTE_MOE_FUSED_ROUTE_BATCH", 1, 1, 4);
+  const auto partition = first ? concat_strings("_copy", copy_sms)
+                               : concat_strings("_combine", combine_sms, "_rb", route_batch);
+  const auto label = concat_strings(name, "_h", p.hidden, "_i", p.intermediate, "_ep", p.world,
+                                    "_topk", p.topk, partition);
   constexpr int threads = 512;
   const int smem = first ? 229376 : 196608;
   // The driver attribute belongs to a device function, even when identical
@@ -41,7 +58,12 @@ void layer(const MegaMoEFusedArgs &p, bool first, cudaStream_t stream) {
                   {"-DNVTE_GG_ARCH=89", "-DNVTE_GG_TRANS_A=0", "-DNVTE_GG_TRANS_B=1",
                    first ? "-DNVTE_GG_COMMON_K=0" : "-DNVTE_GG_COMMON_K=1", "-DNVTE_GG_N_EXPAND=1",
                    concat_strings("-DNVTE_MOE_FUSED_HIDDEN=", p.hidden),
-                   concat_strings("-DNVTE_MOE_FUSED_INTERMEDIATE=", p.intermediate)});
+                   concat_strings("-DNVTE_MOE_FUSED_INTERMEDIATE=", p.intermediate),
+                   concat_strings("-DNVTE_MOE_FUSED_WORLD=", p.world),
+                   concat_strings("-DNVTE_MOE_FUSED_TOPK=", p.topk),
+                   concat_strings("-DNVTE_MOE_FUSED_COPY_SMS=", copy_sms),
+                   concat_strings("-DNVTE_MOE_FUSED_COMBINE_SMS=", combine_sms),
+                   concat_strings("-DNVTE_MOE_FUSED_ROUTE_BATCH=", route_batch)});
       manager.compile(label, name,
                       first ? string_code_mega_moe_fused_l1_cuh : string_code_mega_moe_fused_l2_cuh,
                       first ? "mega_moe_fused_l1.cu" : "mega_moe_fused_l2.cu", opts, headers());
