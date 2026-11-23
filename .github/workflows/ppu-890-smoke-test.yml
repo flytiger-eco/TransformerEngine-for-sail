@@ -1,18 +1,15 @@
 name: ppu-890-smoke-test
 
 on:
-  workflow_run:
-    workflows:
-      - "ppu-890-build"
-    types:
-      - completed
+  workflow_call:
+    inputs:
+      build_attempt:
+        description: Run attempt that produced the wheel
+        required: true
+        type: number
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
-  cancel-in-progress: true
 
 defaults:
   run:
@@ -23,8 +20,8 @@ env:
   NAMESPACE: "ppu-sched"
   NODE_SELECTOR: "board-type=ZW-M890P"
   HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
-  ARTIFACT_SUBDIR: "te-ci/${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}"
-  ARTIFACT_DIR: "/mnt/wl_nas/te-ci/${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}"
+  ARTIFACT_SUBDIR: "te-ci/${{ github.run_id }}-${{ inputs.build_attempt }}"
+  ARTIFACT_DIR: "/mnt/wl_nas/te-ci/${{ github.run_id }}-${{ inputs.build_attempt }}"
   TE_REPO: "https://github.com/flytiger-eco/TransformerEngine-for-sail.git"
   PCCL_URL: "https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz"
 
@@ -86,7 +83,6 @@ env:
 
 jobs:
   test:
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest

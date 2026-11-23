@@ -2,8 +2,6 @@ name: ppu-890-build
 
 on:
   pull_request:
-    branches:
-      - 'v2.16-SAIL'
   schedule:
     - cron: '0 2 * * 1'
   workflow_dispatch:
@@ -73,6 +71,8 @@ env:
 
 jobs:
   build:
+    outputs:
+      build_attempt: ${{ github.run_attempt }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -91,3 +91,11 @@ jobs:
           command: |
             ${{ env.ENV_SETUP }}
             ${{ env.BUILD_COMMAND }}
+
+  smoke:
+    name: ppu-890-smoke-test
+    needs: build
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/ppu-890-smoke-test.yml
+    with:
+      build_attempt: ${{ fromJSON(needs.build.outputs.build_attempt) }}

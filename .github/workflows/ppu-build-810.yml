@@ -2,8 +2,6 @@ name: ppu-810-build
 
 on:
   pull_request:
-    branches:
-      - 'v2.16-SAIL'
   workflow_dispatch:
 
 concurrency:
