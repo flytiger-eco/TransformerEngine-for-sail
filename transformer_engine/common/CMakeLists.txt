@@ -303,7 +303,8 @@ list(APPEND transformer_engine_cuda_sources
      fused_rope/fused_rope.cu
      fused_router/fused_moe_aux_loss.cu
      fused_router/fused_score_for_moe_aux_loss.cu
-     fused_router/fused_topk_with_score_function.cu
+     fused_router/fused_topk_with_score_function_forward.cu
+     fused_router/fused_topk_with_score_function_backward.cu
      recipe/current_scaling.cu
      recipe/delayed_scaling.cu
      recipe/fp8_block_scaling.cu
@@ -770,6 +771,16 @@ target_compile_definitions(transformer_engine
                            NVTE_BUILD_LEGACY_STATIC_NORM=$<BOOL:${NVTE_BUILD_LEGACY_STATIC_NORM}>)
 
 # Compiler options
+option(NVTE_FUSED_ROUTER_FWD_NO_SIMT "Use --no-simt for fused router forward when supported" ON)
+if(NVTE_FUSED_ROUTER_FWD_NO_SIMT)
+  include(CheckCompilerFlag)
+  check_compiler_flag(CUDA "--no-simt" NVTE_CUDA_HAS_NO_SIMT)
+  if(NVTE_CUDA_HAS_NO_SIMT)
+    set_property(SOURCE fused_router/fused_topk_with_score_function_forward.cu
+                 APPEND PROPERTY COMPILE_OPTIONS "--no-simt")
+  endif()
+endif()
+
 set(nvte_sources_with_fast_math)
 list(APPEND nvte_sources_with_fast_math fused_softmax/scaled_masked_softmax.cu
                                         fused_softmax/scaled_upper_triang_masked_softmax.cu

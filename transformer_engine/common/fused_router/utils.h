@@ -8,6 +8,8 @@
 #define TRANSFORMER_ENGINE_FUSED_ROUTER_UTILS_H_
 
 #include <cassert>
+#include <type_traits>
+#include <vector>
 
 #include "../util/logging.h"
 #include "../util/system.h"
@@ -23,6 +25,19 @@ inline void check_routing_map_format(NVTERoutingMapFormat routing_map_format) {
                  routing_map_format == NVTE_ROUTING_MAP_FORMAT_BITMAP_U8,
              "routing_map_format must be BYTEMAP (0) or BITMAP_U8 (1), got ",
              static_cast<int>(routing_map_format));
+}
+
+// Build the expected routing_map shape for a given NVTERoutingMapFormat.
+//   BYTEMAP   -> [num_tokens, num_experts]
+//   BITMAP_U8 -> [num_tokens, ceil(num_experts/8)]
+inline std::vector<size_t> expected_routing_map_shape(int num_tokens, int num_experts,
+                                                     NVTERoutingMapFormat format) {
+  const size_t tokens = static_cast<size_t>(num_tokens);
+  const size_t experts = static_cast<size_t>(num_experts);
+  if (format == NVTE_ROUTING_MAP_FORMAT_BITMAP_U8) {
+    return {tokens, (experts + 7) / 8};
+  }
+  return {tokens, experts};
 }
 
 // Topk values below this threshold use naive O(K*E) selection;
@@ -62,6 +77,16 @@ constexpr size_t kThreadsPerWarp = 32;
 constexpr int kThreadsPerBlock =
     128;  // Using 4 warps in 1 CTA, Each warp is responsible for 1 token.
 constexpr float epsilon = 1e-20;
+
+template <typename Launch>
+inline void dispatch_router_tiles(int experts, Launch launch) {
+  if (experts == 2 * kThreadsPerWarp) return launch(std::integral_constant<int, 2>{}, std::true_type{});
+  if (experts == 4 * kThreadsPerWarp) return launch(std::integral_constant<int, 4>{}, std::true_type{});
+  if (experts == 6 * kThreadsPerWarp) return launch(std::integral_constant<int, 6>{}, std::true_type{});
+  if (experts == 8 * kThreadsPerWarp) return launch(std::integral_constant<int, 8>{}, std::true_type{});
+  if (experts <= 4 * kThreadsPerWarp) return launch(std::integral_constant<int, 4>{}, std::false_type{});
+  return launch(std::integral_constant<int, 8>{}, std::false_type{});
+}
 
 enum ReduceFuncType {
   SUM,
