@@ -734,7 +734,7 @@ endforeach()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/rtc/mega_moe_device.cuh")
 foreach(header mega_moe_grad_args.h mega_moe_fused_args.h mega_moe_fused_route.cuh mega_moe_fused_protocol.cuh
-               mega_moe_fused_l1.cuh mega_moe_fused_l2.cuh)
+               mega_moe_fused_l1.cuh mega_moe_fused_l2.cuh mega_moe_train.cuh)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
                "${CMAKE_CURRENT_SOURCE_DIR}/rtc/${header}")
   string(REPLACE "." "_" symbol "${header}")

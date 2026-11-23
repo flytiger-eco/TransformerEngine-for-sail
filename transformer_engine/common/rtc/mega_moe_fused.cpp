@@ -15,6 +15,7 @@
 #include "string_code_mega_moe_fused_l2_cuh.h"
 #include "string_code_mega_moe_fused_protocol_cuh.h"
 #include "string_code_mega_moe_fused_route_cuh.h"
+#include "string_code_mega_moe_train_cuh.h"
 
 namespace transformer_engine::rtc {
 namespace {
@@ -90,5 +91,35 @@ void mega_moe_fused_pre_dispatch(const MegaMoEFusedArgs &p, cudaStream_t stream)
 void mega_moe_fused_layers(const MegaMoEFusedArgs &p, cudaStream_t stream) {
   layer(p, true, stream);
   layer(p, false, stream);
+}
+
+void mega_moe_train_linear(const MegaMoETrainArgs &p, bool pull, bool transpose,
+                           cudaStream_t stream) {
+  if (!p.tiles) return;
+  auto &manager = KernelManager::instance();
+  const auto name =
+      concat_strings("nvte_mega_moe_", transpose ? "fwd_" : "dgrad_", pull ? "pull" : "scatter");
+  const auto label = concat_strings(name, "_k", p.k, "_n", p.n);
+  static std::mutex mutex;
+  static std::set<std::pair<int, std::string>> configured;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!configured.count({cuda::current_device(), label})) {
+      auto opts = grouped_gemm_rtc::actlize_compiler_options();
+      opts.insert(
+          opts.end(),
+          {"-DNVTE_GG_ARCH=89", "-DNVTE_GG_TRANS_A=0",
+           concat_strings("-DNVTE_GG_TRANS_B=", static_cast<int>(transpose)),
+           "-DNVTE_GG_COMMON_K=1", "-DNVTE_GG_N_EXPAND=1", concat_strings("-DTRAIN_KERNEL=", name),
+           concat_strings("-DTRAIN_PULL=", static_cast<int>(pull)),
+           concat_strings("-DTRAIN_K=", p.k), concat_strings("-DTRAIN_N=", p.n)});
+      manager.compile(label, name, string_code_mega_moe_train_cuh, "mega_moe_train.cu", opts,
+                      headers());
+      manager.set_function_attribute(label, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                     196608);
+      configured.insert({cuda::current_device(), label});
+    }
+  }
+  manager.launch_cooperative(label, cuda::sm_count(), 512, 196608, stream, p);
 }
 }  // namespace transformer_engine::rtc

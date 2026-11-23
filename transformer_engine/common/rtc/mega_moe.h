@@ -45,6 +45,9 @@ void mega_moe_activation_backward(const MegaMoEProblem &p, const void *projectio
                                   float *dp, cudaStream_t stream);
 
 struct MegaMoEFusedArgs;
+struct MegaMoETrainArgs;
+void mega_moe_train_linear(const MegaMoETrainArgs &p, bool pull, bool transpose,
+                           cudaStream_t stream);
 void mega_moe_fused_pre_dispatch(const MegaMoEFusedArgs &p, cudaStream_t stream);
 void mega_moe_fused_layers(const MegaMoEFusedArgs &p, cudaStream_t stream);
 

@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""EP8/top-8 forward regressions for public MegaMoE; run with eight torchrun ranks.
+"""EP8/top-8 forward and saved-activation backward regressions for public MegaMoE; run with eight torchrun ranks.
 
 Includes empty/ragged source ranks, skipped/duplicate/zero-weight slots, empty
 expert owners, and workspace growth/reuse across independently scheduled streams.
@@ -83,10 +83,79 @@ def check_collectively(label, actual, expected, device):
     return record
 
 
+@torch.no_grad()
+def training_reference(x, ids, probs, dy, all1, all2):
+    # Compute each route on its source, independently of MegaMoE's owner layout.
+    out = torch.zeros_like(x, dtype=torch.float32)
+    dx = torch.zeros_like(out)
+    dp = torch.zeros_like(probs)
+    dw1 = torch.empty((len(all1), *all1[0].shape), dtype=torch.float32, device=x.device)
+    dw2 = torch.empty((len(all2), *all2[0].shape), dtype=torch.float32, device=x.device)
+    for expert, (w1, w2) in enumerate(zip(all1, all2)):
+        row, slot = (ids == expert).nonzero(as_tuple=True)
+        inp, grad = x[row], dy[row]
+        gate, up = (inp @ w1.T).float().chunk(2, dim=1)
+        sigmoid = torch.sigmoid(gate)
+        raw = gate * sigmoid * up
+        prob = probs[row, slot, None]
+        y = (raw * prob).to(x.dtype)
+        out.index_add_(0, row, (y @ w2.T).float())
+        dh = (grad @ w2).float()
+        dp[row, slot] = (dh * raw).sum(dim=1)
+        scaled = dh * prob
+        dz = torch.cat(
+            (scaled * up * sigmoid * (1 + gate * (1 - sigmoid)), scaled * (gate * sigmoid)), dim=1
+        ).to(x.dtype)
+        dx.index_add_(0, row, (dz @ w1).float())
+        dw1[expert] = dz.float().T @ inp.float()
+        dw2[expert] = grad.float().T @ y.float()
+    dist.all_reduce(dw1)
+    dist.all_reduce(dw2)
+    owner = slice(2 * dist.get_rank(), 2 * dist.get_rank() + 2)
+    return (out.to(x.dtype), dx.to(x.dtype), dp, *dw1[owner].to(x.dtype), *dw2[owner].to(x.dtype))
+
+
+@torch.enable_grad()
+def check_training(rank, device):
+    import transformer_engine.pytorch as te
+
+    group = dist.group.WORLD
+    all1, all2 = make_weights(512, 256, 16, device, 87001)
+    w1 = [w.requires_grad_() for w in all1[2 * rank : 2 * rank + 2]]
+    w2 = [w.requires_grad_() for w in all2[2 * rank : 2 * rank + 2]]
+    cases = []
+    for step, tokens in enumerate((2048, 0 if rank == 0 else 2051 + rank)):
+        x, ids, p = make_case(
+            tokens, rank, 87035 + step, device, special=True, empty_owners=bool(step)
+        )
+        x.requires_grad_()
+        p.requires_grad_()
+        dy = torch.randn((x.size(1), tokens), device=device, dtype=x.dtype).T
+        expected = training_reference(x, ids, p, dy, all1, all2)
+        out = te.bf16_mega_moe(x, ids, p, w1, w2, ep_group=group)
+        assert "TrainBackward" in type(out.grad_fn).__name__
+        cases.append((x, p, dy, out, expected))
+    for x, p, dy, out, expected in reversed(cases):
+        actual = torch.autograd.grad(out, (x, p, *w1, *w2), dy)
+        drift = torch.stack(
+            [
+                (a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-10)
+                for a, b in zip((out, *actual), expected)
+            ]
+        )
+        dist.all_reduce(drift, op=dist.ReduceOp.MAX)
+        if not rank:
+            print("EP8 training relative L2", drift.tolist(), flush=True)
+        assert drift.max().item() < 0.01, drift
+    if not rank:
+        print("EP8 saved-activation gradient checks passed", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--require-fused", action="store_true")
+    parser.add_argument("--training", action="store_true")
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", rank)
@@ -95,6 +164,10 @@ def main():
     torch.set_float32_matmul_precision("highest")
     dist.init_process_group("nccl", device_id=device)
     assert dist.get_world_size() == 8
+    if args.training:
+        check_training(rank, device)
+        dist.destroy_process_group()
+        return
     import transformer_engine.pytorch as te
     from transformer_engine.pytorch._mega_moe_peer import _workspace
 
@@ -182,8 +255,9 @@ def main():
         print("EP8 fused edge checks passed (7 cases)", flush=True)
 
 
-def test_fused_ep8_top8_forward():
-    """Cover source boundaries and batched top-8 combine on eight peer PPUs."""
+def run_eight_ranks(training):
+    if training:
+        pytest.importorskip("triton")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
         pytest.skip("Eight PPUs required")
     if any(torch.cuda.get_device_capability(rank) != (8, 9) for rank in range(8)):
@@ -220,15 +294,29 @@ def test_fused_ep8_top8_forward():
             "--nproc-per-node=8",
             str(Path(__file__).resolve()),
             "--require-fused",
+            *(["--training"] if training else []),
         ],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        timeout=420,
+        timeout=650 if training else 420,
     )
     assert result.returncode == 0, result.stdout
-    assert "EP8 fused edge checks passed (7 cases)" in result.stdout, result.stdout
+    message = (
+        "EP8 saved-activation gradient checks passed"
+        if training
+        else "EP8 fused edge checks passed (7 cases)"
+    )
+    assert message in result.stdout, result.stdout
+
+
+def test_fused_ep8_top8_forward():
+    run_eight_ranks(training=False)
+
+
+def test_fused_ep8_top8_training():
+    run_eight_ranks(training=True)
 
 
 if __name__ == "__main__":

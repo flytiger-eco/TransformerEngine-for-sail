@@ -134,6 +134,25 @@ def _mega_moe(x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group
             raise ValueError("FC1 and FC2 weights must have shapes [2I,H] and [H,I]")
         if any(w.dtype != dtype or w.device != x.device for w in (w1, w2)):
             raise ValueError("expert weights must have the same dtype and device as x")
+    if (
+        not torch.compiler.is_compiling()
+        and torch.is_grad_enabled()
+        and dtype == torch.bfloat16
+        and ep_group is not None
+        and ep_group.size() == 8
+        and x.is_cuda
+    ):
+        from ._mega_moe_peer import _peer_supported, _workspace
+
+        with torch.cuda.device(x.device):
+            if _peer_supported(ep_group, x.device) and _workspace(ep_group).training_supported:
+                from ._mega_moe_train import training_forward
+
+                output = training_forward(
+                    x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group
+                )
+                if output is not None:
+                    return output
     return forward(
         x,
         expert_ids,
@@ -163,7 +182,7 @@ def bf16_mega_moe(
 
     The PPU runtime compiles the expert kernels for the input precision. On
     peer-accessible EP groups, tokens and results travel through symmetric buffers.
-    Batches with K <= 8 on two or eight SM89 PPUs use three kernels after workspace
+    Inference batches with K <= 8 on two or eight SM89 PPUs use three kernels after workspace
     setup when H and I are multiples of 256, the BF16 weights are contiguous and
     aligned, each rank has at most 16 experts, and at least one rank has 2048 or
     more input tokens. Pre-dispatch builds expert route lists. FC1
@@ -172,7 +191,14 @@ def bf16_mega_moe(
     Other peer shapes use the bulk or generic peer implementation. Groups without
     peer access use variable-split all-to-all.
 
-    First-order backward recomputes FC1 and returns gradients for x, routing
+    Eager BF16 training on eight peer-accessible SM89 PPUs with Triton, K=8,
+    the same tile and batch requirements, and I <= 16384 saves expert-local
+    inputs, gate/up and SwiGLU outputs for backward. FC2 dgrad gathers source
+    output gradients, FC1 dgrad scatters per-route input gradients, and both
+    expert weight gradients are local grouped GEMMs. Backward returns gradients
+    for x, routing weights, and both expert weight lists.
+
+    The fallback first-order backward recomputes FC1 and returns gradients for x, routing
     weights and both local expert weight lists. Two peer-accessible SM89 PPUs
     with Triton use symmetric backward dispatch when H >= 256 and I >= 128
     are multiples of eight, each rank has at most 64 experts and K <= 8, and

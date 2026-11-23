@@ -28,6 +28,7 @@ class _Workspace:
         self.supported = None
         self.bulk_supported = False
         self.fused_supported = False
+        self.training_supported = False
         self.fused = None
         self.grad_stream = None
         self.grad_ready = None
@@ -134,6 +135,7 @@ def _peer_supported(group, device):
                 and (group.size() == 2 or os.getenv("NVTE_MOE_EP8_FUSED", "1") == "1")
                 and all(item[4] for item in peers)
             )
+            state.training_supported = state.fused_supported and all(item[3] for item in peers)
             state.device = device
         return state.supported
 

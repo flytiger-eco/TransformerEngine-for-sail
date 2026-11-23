@@ -204,7 +204,57 @@ std::tuple<Tensor, int, int> fused_forward(const Tensor &x, const Tensor &ids, c
 }
 }  // namespace
 
+// Internal entry point. route/expert come from the collectively validated router.
+static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &route,
+                           const Tensor &expert, const Weights &peers, int rank, int capacity,
+                           bool pull, bool transpose) {
+  TORCH_CHECK(a.is_cuda() && a.is_contiguous() && a.dim() == 2 &&
+                  a.scalar_type() == at::kBFloat16 && !w.empty() && w.size() <= 16 && rank >= 0 &&
+                  rank < 8 && peers.size() == 8 && capacity > 0 && a.size(0) <= INT_MAX &&
+                  a.size(1) > 0 && a.size(1) <= INT_MAX,
+              "Invalid MegaMoE training operands");
+  c10::cuda::CUDAGuard guard(a.device());
+  TORCH_CHECK(route.device() == a.device() && route.is_contiguous() &&
+                  route.scalar_type() == at::kLong && expert.device() == a.device() &&
+                  expert.is_contiguous() && expert.scalar_type() == at::kInt &&
+                  expert.numel() * 256 == a.size(0) && route.numel() == a.size(0),
+              "Invalid owner tile plan");
+  rtc::MegaMoETrainArgs p{};
+  p.rank = rank;
+  p.capacity = capacity;
+  p.tiles = expert.numel();
+  p.k = a.size(1);
+  TORCH_CHECK(w.front().dim() == 2 && w.front().size(transpose ? 0 : 1) <= INT_MAX);
+  p.n = w.front().size(transpose ? 0 : 1);
+  TORCH_CHECK(
+      p.n > 0 && p.n % 256 == 0 && p.k % 256 == 0 && int64_t(p.tiles) * (p.n / 256) < INT_MAX,
+      "Unsupported training tile shape");
+  for (size_t i = 0; i < w.size(); ++i) {
+    TORCH_CHECK(w[i].device() == a.device() && w[i].is_contiguous() &&
+                w[i].scalar_type() == a.scalar_type() && w[i].sizes() == w.front().sizes() &&
+                w[i].size(transpose ? 1 : 0) == p.k);
+    p.weight[i] = w[i].data_ptr();
+  }
+  for (int r = 0; r < 8; ++r) {
+    TORCH_CHECK(peers[r].device() == a.device() && peers[r].is_contiguous() &&
+                peers[r].scalar_type() == a.scalar_type() && peers[r].dim() == 2 &&
+                peers[r].size(0) == 9LL * capacity && peers[r].size(1) == (pull ? p.k : p.n));
+    p.peer[r] = peers[r].data_ptr();
+  }
+  auto d = at::empty({a.size(0), p.n}, a.options());
+  auto flags = at::zeros({pull ? p.tiles : 0}, expert.options());
+  p.a = a.data_ptr();
+  p.d = d.data_ptr();
+  p.route = route.data_ptr<int64_t>();
+  p.expert = expert.data_ptr<int>();
+  p.ready = flags.data_ptr<int>();
+  rtc::mega_moe_train_linear(p, pull, transpose, at::cuda::getCurrentCUDAStream());
+  return d;
+}
+
 void init_mega_moe_fused_bindings(pybind11::module &m) {
+  m.def("_mega_moe_train_linear", &train_linear,
+        pybind11::call_guard<pybind11::gil_scoped_release>());
   pybind11::class_<FusedStatus>(m, "MegaMoEFusedStatus").def(pybind11::init<const Tensor &>());
   m.def("mega_moe_fused_available", &fused_available);
   m.def("mega_moe_fused_workspace_sizes", &workspace_sizes, pybind11::arg("capacity"),
