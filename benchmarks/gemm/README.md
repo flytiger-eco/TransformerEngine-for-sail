@@ -346,3 +346,26 @@ All 72 rank/map/seed checks passed the independent FP32 reference with BF16 stor
 Seven EP8 checks also passed under both default and tuned settings: unbalanced source/expert counts, empty sources, skipped/duplicate/zero-weight routes, owners with no expert rows, capacity growth and cross-stream reuse. Their maximum relative L2 was 0.000388306 and maximum absolute error was 0.0078125. The existing EP2 fused-forward and bulk-transport tests both passed, including backward, fallback, and workspace transitions.
 
 The fused public path admits EP2/EP8, BF16, top-k one through eight, H and I divisible by 256, at most sixteen local experts, and aligned contiguous expert weights. At least one rank must supply 2,048 tokens; other sources may be empty. All peers must pass the IPC, cooperative-launch and device capability checks. Other inputs retain their existing fallback behavior. The selected case reserves about 1.6724 GiB of workspace per rank for the worst route imbalance; that reservation is larger than the balanced case's actual owner row count.
+
+## 11. EP8 training with saved SwiGLU activations
+
+The balanced BF16 case in section 10 has 2,048 source tokens per rank and 2,048 rows per expert. The training replay uses 64 experts, top-k eight, FC1 [6144,3584] and FC2 [3584,3072]. It checks the output, input gradient, routing-weight gradient and both lists of expert weight gradients before timing. The DeepEP training baseline uses non-expanded dispatch, local grouping and the cached handle for backward dispatch and gradient return. Both saved-activation implementations use the same activation derivative and local weight-gradient kernels.
+
+On eight ICN64-connected SM89 PPUs, three warmups and eight timed iterations gave the following median latencies in ms. Each sample takes the maximum across ranks for its interval. The total measures forward plus backward in one iteration.
+
+| Training path | Forward | Backward | Total |
+| --- | ---: | ---: | ---: |
+| MegaMoE, saved activations | 8.615 | 11.905 | 20.522 |
+| MegaMoE, FC1 recompute | 4.834 | 14.183 | 19.005 |
+| DeepEP + grouped GEMM | 5.036 | 8.241 | 13.267 |
+
+Saving the activations reduced backward by 2.278 ms. Forward took 3.781 ms longer, increasing the total by 1.518 ms. The saved path retained 592 MiB per owner for packed input, gate/up, weighted BF16 activation and unweighted FP32 activation, excluding route metadata, workspace and temporaries. The backward profile contained one pull dgrad, one activation derivative, one scatter dgrad and two local weight-gradient GEMMs.
+
+With the dependencies from section 8, run from the repository root.
+
+```bash
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" OMP_NUM_THREADS=1 \
+  NVTE_MOE_FUSED_COPY_SMS=8 NVTE_MOE_FUSED_COMBINE_SMS=4 NVTE_MOE_FUSED_ROUTE_BATCH=4 \
+  python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  benchmarks/gemm/benchmark_mega_moe_ep8_training.py --include-recompute --profile
+```
