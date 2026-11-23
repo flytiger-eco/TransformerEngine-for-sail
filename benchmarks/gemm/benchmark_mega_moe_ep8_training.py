@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 import transformer_engine.pytorch as te
 import transformer_engine_torch as tex
-from transformer_engine.pytorch._mega_moe_train import _activation, _activation_grad
+from transformer_engine.pytorch._mega_moe_train import _activation_grad, _save_activation
 from transformer_engine.pytorch.mega_moe import _bf16_forward
 from deep_ep import topk_idx_t
 
@@ -69,7 +69,7 @@ class DeepTraining(torch.autograd.Function):
         z = base.linear(owner_x, w1, counts)
         y = x.new_empty((len(rows), 3072))
         raw = p.new_empty(y.shape)
-        _activation[(len(rows), 12)](z, p, raw, y, 3072, 256)
+        _save_activation(z, p, raw, y)
         partial = base.linear(y, w2, counts)
         reduced = torch.empty_like(rx)
         _merge[(len(rx), 14)](partial, reverse, reduced, 3584, 256)
@@ -102,6 +102,119 @@ class DeepTraining(torch.autograd.Function):
         return dx, None, dp_src, None, *dw1, *dw2
 
 
+@triton.jit
+def _locate_dy(metadata, source_to_recv, rows, STRIDE: tl.constexpr, B: tl.constexpr):
+    recv = tl.program_id(0) * B + tl.arange(0, B)
+    source = tl.load(metadata + recv * STRIDE, recv < rows, 0)
+    tl.store(source_to_recv + source, recv, recv < rows)
+
+
+@triton.jit
+def _map_slots(meta, source_to_recv, reverse, gather, rows, K: tl.constexpr, B: tl.constexpr):
+    idx = tl.program_id(0) * B + tl.arange(0, B)
+    recv_forward, k = idx // K, idx % K
+    valid = recv_forward < rows
+    source = tl.load(meta + recv_forward * (2 + K), valid, 0)
+    owner = tl.load(meta + recv_forward * (2 + K) + 2 + k, valid, -1)
+    recv_backward = tl.load(source_to_recv + source, valid, 0)
+    tl.store(reverse + recv_backward * K + k, owner, valid)
+    tl.store(gather + owner, recv_backward, valid & (owner >= 0))
+
+
+@triton.jit
+def _pack_dp(dp, reverse, rdp, size, B: tl.constexpr):
+    idx = tl.program_id(0) * B + tl.arange(0, B)
+    owner = tl.load(reverse + idx, idx < size, -1)
+    value = tl.load(dp + owner, (idx < size) & (owner >= 0), 0)
+    tl.store(rdp + idx, value, idx < size)
+
+
+class DeepExpandedTraining(torch.autograd.Function):
+    """Direct expert-major dispatch and combine with saved activations for backward."""
+
+    @staticmethod
+    def forward(ctx, x, ids, probs, base, *weights):
+        e = base.experts
+        w1, w2 = weights[:e], weights[e:]
+        owner_x, _, p, handle, _ = base.buffer.dispatch(
+            x,
+            topk_idx=ids.to(topk_idx_t),
+            topk_weights=probs,
+            num_experts=base.buffer.num_ranks * e,
+            num_sms=base.num_sms,
+            expert_alignment=1,
+            do_cpu_sync=True,
+            do_expand=True,
+            do_handle_copy=False,
+        )
+        counts = handle.num_recv_tokens_per_expert_list
+        z = base.linear(owner_x, w1, counts)
+        rows, width = owner_x.size(0), w2[0].size(1)
+        y = x.new_empty((rows, width))
+        raw = p.new_empty(y.shape)
+        _save_activation(z, p, raw, y)
+        partial = base.linear(y, w2, counts)
+        out, _, _ = base.buffer.combine(partial, handle)
+        ctx.save_for_backward(owner_x, z, raw, y, p, *weights)
+        ctx.base, ctx.handle = base, handle
+        return out
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, z, raw, y, p, *weights = ctx.saved_tensors
+        base, forward = ctx.base, ctx.handle
+        e = base.experts
+        w1, w2 = weights[:e], weights[e:]
+        # Expanded combine accepts BF16 expert outputs only. A fresh deduplicated
+        # handle can return dx and the separate FP32 gradient for every top-k slot.
+        meta = forward.recv_src_metadata
+        k = forward.topk_idx.size(1)
+        gather = meta.new_empty(x.size(0))
+        recv, _, _, handle, _ = base.buffer.dispatch(
+            dy.contiguous(),
+            topk_idx=forward.topk_idx,
+            num_experts=forward.num_experts,
+            num_sms=base.num_sms,
+            expert_alignment=1,
+            do_cpu_sync=True,
+            do_expand=False,
+            do_handle_copy=False,
+        )
+        recv_count = recv.size(0)
+        source_to_recv = meta.new_empty(base.buffer.num_ranks * handle.num_max_tokens_per_rank)
+        reverse = meta.new_empty((recv_count, k))
+        if recv_count:
+            _locate_dy[(triton.cdiv(recv_count, 256),)](
+                handle.recv_src_metadata, source_to_recv, recv_count, 2 + k, 256
+            )
+            _map_slots[(triton.cdiv(meta.size(0) * k, 256),)](
+                meta, source_to_recv, reverse, gather, meta.size(0), k, 256
+            )
+        owner_dy = torch.index_select(recv, 0, gather)
+        offsets = torch.nn.functional.pad(forward.psum_num_recv_tokens_per_expert, (1, 0)).int()
+        dh = tex.mega_moe_dgrad(owner_dy, offsets, w2)
+        dz, dp = torch.empty_like(z), torch.empty_like(p)
+        if x.size(0):
+            width = y.size(1)
+            _activation_grad[(x.size(0),)](
+                dh, z, p, raw, dz, dp, width, triton.next_power_of_2(width)
+            )
+        partial = tex.mega_moe_dgrad(dz, offsets, w1)
+        reduced = torch.empty_like(recv)
+        rdp = dp.new_empty((recv_count, k))
+        if recv_count:
+            _merge[(recv_count, triton.cdiv(dy.size(1), 256))](
+                partial, reverse, reduced, dy.size(1), 256
+            )
+            _pack_dp[(triton.cdiv(reverse.numel(), 256),)](dp, reverse, rdp, reverse.numel(), 256)
+        dx, dp_src, _ = base.buffer.combine(reduced, handle, topk_weights=rdp)
+        dw1 = [torch.empty_like(w) for w in w1]
+        dw2 = [torch.empty_like(w) for w in w2]
+        tex.mega_moe_wgrad(owner_dy, y, offsets, dw2, False)
+        tex.mega_moe_wgrad(dz, x, offsets, dw1, False)
+        return dx, None, dp_src, None, *dw1, *dw2
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -116,6 +229,13 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=8)
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=[1073],
+        help="Cycle these balanced routes between rounds",
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.iters < 1:
         parser.error("expected nonnegative warmup and positive iteration count")
@@ -133,8 +253,10 @@ def main():
     w2 = [(torch.randn(h, i, device=dev) / i**0.5).bfloat16().requires_grad_() for _ in range(8)]
     x = torch.randn(t, h, device=dev).bfloat16().requires_grad_()
     dy = torch.randn_like(x)
-    ids, p = routes(t, 64, 8, 1073, rank, dev)
-    p.requires_grad_()
+    batches = [routes(t, 64, 8, seed, rank, dev) for seed in args.seeds]
+    for _, p in batches:
+        p.requires_grad_()
+    ids, p = batches[0]
     params = (x, p, *w1, *w2)
 
     def saved():
@@ -146,6 +268,7 @@ def main():
     methods = {
         "saved": saved,
         "deepep": lambda: DeepTraining.apply(x, ids, p, base, *w1, *w2),
+        "deepep_expanded": lambda: DeepExpandedTraining.apply(x, ids, p, base, *w1, *w2),
     }
     if args.include_recompute:
         methods["recompute"] = lambda: _bf16_forward(x, ids, p, w1, w2, group.group_name)
@@ -182,13 +305,15 @@ def main():
         if not rank:
             print("BWD_KERNELS", json.dumps(dict(kernels)), flush=True)
     data = {name: [] for name in methods}
+    a, b, c = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
     for round_idx in range(args.warmup + args.iters):
+        ids, p = batches[round_idx % len(batches)]
+        params = (x, p, *w1, *w2)
         order = list(methods)
         order = order[round_idx % len(methods) :] + order[: round_idx % len(methods)]
         for name in order:
             dist.barrier()
             torch.cuda.synchronize()
-            a, b, c = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
             a.record()
             out = methods[name]()
             b.record()

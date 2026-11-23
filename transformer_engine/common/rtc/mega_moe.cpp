@@ -65,7 +65,11 @@ void mega_moe_bulk_transport(const MegaMoEBulkTransport &p, void *local, bool pu
 
 void mega_moe_combine(const void *slots, void *output, int64_t tokens, int topk, int hidden,
                       bool fp16, cudaStream_t stream) {
-  const int64_t blocks = (tokens * hidden - 1) / 128 + 1;
+  // combine_slots processes four adjacent BF16/FP16 elements per lane when
+  // its row stride and both buffers satisfy the vector alignment.
+  const auto addresses = reinterpret_cast<uintptr_t>(slots) | reinterpret_cast<uintptr_t>(output);
+  const int width = hidden % 4 == 0 && addresses % 8 == 0 ? 4 : 1;
+  const int64_t blocks = (tokens * (hidden / width) - 1) / 128 + 1;
   launch(fp16, "nvte_mega_moe_combine", false, blocks, stream, slots, output, tokens, topk, hidden);
 }
 

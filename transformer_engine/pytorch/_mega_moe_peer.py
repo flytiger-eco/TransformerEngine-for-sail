@@ -34,6 +34,7 @@ class _Workspace:
         self.grad_ready = None
         self.device = None
         self.storage = None
+        self.peer_views = None
         self.handle = None
         self.done = None
 
@@ -53,10 +54,15 @@ class _Workspace:
             storage = symm.empty(nbytes, device=x.device, dtype=torch.uint8)
             handle = symm.rendezvous(storage, group)
             self.storage, self.handle = storage, handle
+            self.peer_views = None
             self.done = torch.cuda.Event()
         else:
             torch.cuda.current_stream(x.device).wait_event(self.done)
-        return [self.handle.get_buffer(rank, shape, x.dtype) for rank in range(group.size())]
+        key = (shape, x.dtype)
+        if self.peer_views is None or self.peer_views[0] != key:
+            views = [self.handle.get_buffer(rank, shape, x.dtype) for rank in range(group.size())]
+            self.peer_views = key, views
+        return self.peer_views[1]
 
 
 _workspaces = WeakKeyDictionary()

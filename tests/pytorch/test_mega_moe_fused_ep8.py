@@ -151,6 +151,46 @@ def check_training(rank, device):
         print("EP8 saved-activation gradient checks passed", flush=True)
 
 
+@torch.enable_grad()
+def check_training_tile_tails(rank, device):
+    """Exercise the tuned widths with uneven owner tile counts and skipped source slots."""
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch.mega_moe import _bf16_forward
+
+    group = dist.group.WORLD
+    gen = torch.Generator(device=device).manual_seed(87063 + rank)
+    h, i = 3584, 3072
+    tokens = 0 if rank == 2 else 2048 + rank
+    x = torch.randn((tokens, h), device=device, generator=gen, dtype=torch.bfloat16)
+    ids = torch.randint(14, (tokens, 8), device=device, generator=gen, dtype=torch.int32)
+    ids[::3, 1:] = -1
+    probs = torch.rand((tokens, 8), device=device, generator=gen)
+    probs[::5, 0] = 0
+    w1 = [
+        (torch.randn(2 * i, h, device=device, generator=gen) / h**0.5).bfloat16() for _ in range(2)
+    ]
+    w2 = [(torch.randn(h, i, device=device, generator=gen) / i**0.5).bfloat16() for _ in range(2)]
+    params = (x, probs, *w1, *w2)
+    for param in params:
+        param.requires_grad_()
+    dy = torch.randn(x.shape, device=device, generator=gen, dtype=x.dtype)
+    reference = _bf16_forward(x, ids, probs, w1, w2, group.group_name)
+    expected = (reference.detach(), *torch.autograd.grad(reference, params, dy))
+    output = te.bf16_mega_moe(x, ids, probs, w1, w2, ep_group=group)
+    assert "TrainBackward" in type(output.grad_fn).__name__
+    result = (output.detach(), *torch.autograd.grad(output, params, dy))
+    drift = torch.stack(
+        [
+            (a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-10)
+            for a, b in zip(result, expected)
+        ]
+    )
+    dist.all_reduce(drift, op=dist.ReduceOp.MAX)
+    assert drift.max().item() < 0.012, drift
+    if rank == 0:
+        print("EP8 tuned-width tile tails relative L2", drift.tolist(), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
@@ -166,6 +206,7 @@ def main():
     assert dist.get_world_size() == 8
     if args.training:
         check_training(rank, device)
+        check_training_tile_tails(rank, device)
         dist.destroy_process_group()
         return
     import transformer_engine.pytorch as te
