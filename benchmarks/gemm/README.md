@@ -369,3 +369,50 @@ PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" OMP_NUM_THREADS=1 \
   python -m torch.distributed.run --standalone --nproc-per-node=8 \
   benchmarks/gemm/benchmark_mega_moe_ep8_training.py --include-recompute --profile
 ```
+
+## Capturing and replaying a distributed MegaMoE call
+
+Set `NVTE_MOE_CAPTURE_DIR` to the **same shared directory on every participating
+EP rank** before starting an eager BF16 or FP16 run. Each call to the public
+MegaMoE API emits one forward NVTX range named `te_mega_moe:v1:<id>` per rank.
+All ranks in that invocation share the ID. Capture synchronizes devices and
+writes files, so collect routes separately from performance measurements.
+Compiled and fake-tensor execution bypass collection.
+
+Under `<capture-dir>/<id>/`, `manifest.json` lists global ranks in EP order.
+Each `rank-<ep-rank>.pt` stores the original int32 expert IDs and FP32 routing
+weights as **[source token, top-k slot]**, including duplicate experts, skipped
+slots (-1), legitimate zero probabilities and empty source ranks. Keep the
+whole directory with the profiler trace. The manifest is published after all
+shards have been written. A manifest path also works without a profiler.
+
+Run from an environment containing the TE build to benchmark, using one
+process per captured EP rank (use one process for a local call):
+
+```bash
+torchrun --standalone --nproc-per-node=8 benchmarks/gemm/replay_mega_moe.py \
+  "te_mega_moe:v1:<id>" --directory /shared/moe-captures --output step.json
+```
+
+Replace the entire tag argument with the range name from the trace. Replay
+maps EP rank order onto the new workers, restores route values, tensor strides,
+base alignment, dtype and gradient requirements, and generates deterministic
+synthetic hidden states, expert parameters and upstream gradients. It measures
+the routed layer, excluding the router and optimizer. The default seed is 73.
+The correctness check compares the output and requested first-order gradients
+with TE's all-to-all transport before timing. The JSON contains forward,
+backward and whole-call CUDA-event samples, each reduced by MAX across ranks,
+and their medians. An inference capture only executes forward.
+
+The 890P replay workflow builds merge-base and head with the grouped-GEMM CI
+wheel harness. It captures EP2 and EP8 fixtures once on head, checks each rank's
+stored route against its input, and replays the same shards in base/head then
+head/base order. The artifact includes the captures, timing JSON and build logs.
+Correctness failures fail the job. The paired whole-call latency threshold is
+5% for manual runs and perf/refactor changes, using the grouped-GEMM policy.
+
+To include a collected model tag in CI, put its complete ID directory under
+`/mnt/wl_nas/te-ci/mega-moe/captures` (locally override with
+`MEGA_MOE_CI_CAPTURES`) and append its EP size and tag on one line in
+`qa/L0_pytorch_mega_moe_rtc/cases.txt`. Both wheel versions consume the same
+captured slots. Missing shards fail the run.

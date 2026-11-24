@@ -1,0 +1,90 @@
+name: ppu-890-mega-moe-replay
+on:
+  pull_request:
+    branches: [v2.18-SAIL]
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
+    paths:
+      - 'transformer_engine/**/mega_moe*'
+      - 'transformer_engine/**/_mega_moe*'
+      - 'transformer_engine/common/gemm/rtc/**'
+      - 'benchmarks/gemm/replay_mega_moe.py'
+      - 'qa/L0_pytorch_mega_moe_rtc/**'
+      - 'qa/L0_pytorch_grouped_gemm_rtc/test.sh'
+      - '.github/scripts/rtc_grouped_gemm_gate.py'
+      - '.github/workflows/ppu-890-mega-moe-replay.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: mega-moe-replay-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  replay:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: k8s-runner-group-cpu-flytiger
+    timeout-minutes: 300
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      BASE: ${{ github.event.pull_request.base.sha || 'v2.18-SAIL' }}
+      RUN_DIR: te-ci/mega-moe/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select regression policy
+        id: policy
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, runpy, subprocess
+          choose = runpy.run_path(".github/scripts/rtc_grouped_gemm_gate.py")["policy_for"]
+          base = os.environ["BASE"]
+          if base == "v2.18-SAIL":
+              base = "origin/" + base
+          subjects = subprocess.check_output(["git", "log", "--format=%s", base + "..HEAD"], text=True)
+          value = choose(subjects + "\n" + os.environ["PR_TITLE"], json.loads(os.environ["PR_LABELS"] or "[]") or [],
+                         os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              print("value=" + value, file=out)
+          PYTHON
+      - uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001
+          namespace: ppu-sched
+          node_selector: board-type=ZW-M890P
+          host_volumes: /nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas
+          nnodes: 0
+          nproc_per_node: 8
+          timeout_minutes: 270
+          command: |
+            set -euo pipefail
+            set +u; source /usr/local/PPU_SDK/envsetup.sh; set -u
+            curl -fsSL https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz -o /tmp/pccl.tar.gz
+            tar xzf /tmp/pccl.tar.gz -C /usr/local
+            set +u; source /usr/local/pccl/envsetup.sh; set -u
+            export CPATH="${NCCL_HOME}/include${CPATH:+:$CPATH}"
+            src=$(mktemp -d)
+            git -C "$src" init -q
+            git -C "$src" remote add origin 'https://github.com/${{ github.repository }}.git'
+            git -C "$src" fetch origin '${{ env.BASE }}'
+            base=$(git -C "$src" rev-parse FETCH_HEAD)
+            git -C "$src" fetch origin '${{ env.HEAD_SHA }}'
+            git -C "$src" checkout --detach FETCH_HEAD
+            base=$(git -C "$src" merge-base HEAD "$base")
+            out='/mnt/wl_nas/${{ env.RUN_DIR }}'
+            mkdir -p "$out"
+            export MEGA_MOE_CI_POLICY='${{ steps.policy.outputs.value }}'
+            bash "$src/qa/L0_pytorch_grouped_gemm_rtc/test.sh" "$src" "$base" "$out" \
+                /mnt/wl_nas/te-ci/rtc-grouped-gemm/wheels mega-moe 2>&1 | tee "$out/campaign.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mega-moe-replay-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /wl_nas/${{ env.RUN_DIR }}/
+          if-no-files-found: error

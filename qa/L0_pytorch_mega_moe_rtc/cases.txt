@@ -1,0 +1,3 @@
+# Additional captures stored under MEGA_MOE_CI_CAPTURES; one case per line:
+# <EP world size> te_mega_moe:v1:<32 hex digits>
+# The self-contained EP2 and EP8 capture/round-trip cases always run.

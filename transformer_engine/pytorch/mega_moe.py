@@ -4,6 +4,7 @@
 
 """Routed BF16 and FP16 SwiGLU training on the PPU RTC backend."""
 
+import os
 from typing import Optional, Sequence
 
 import torch
@@ -111,6 +112,27 @@ _fp16_forward = _register_ops("fp16")
 
 
 def _mega_moe(x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group, dtype, forward):
+    if (
+        not torch.compiler.is_compiling()
+        and (directory := os.getenv("NVTE_MOE_CAPTURE_DIR"))
+        and x.is_cuda
+        and not is_fake(x)
+    ):
+        from ._mega_moe_capture import capture
+
+        tag = capture(directory, x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group)
+        with torch.cuda.nvtx.range(tag):
+            return _run_mega_moe(
+                x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group, dtype, forward
+            )
+    return _run_mega_moe(
+        x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group, dtype, forward
+    )
+
+
+def _run_mega_moe(
+    x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group, dtype, forward
+):
     if x.ndim != 2 or x.dtype != dtype:
         raise ValueError(f"x must have dtype {dtype} and shape [T,H]")
     if expert_ids.dtype != torch.int32 or routing_weights.dtype != torch.float32:
