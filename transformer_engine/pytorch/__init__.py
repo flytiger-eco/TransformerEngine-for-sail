@@ -24,6 +24,7 @@ from transformer_engine.pytorch.module import LayerNormMLP
 from transformer_engine.pytorch.module import LayerNorm
 from transformer_engine.pytorch.module import RMSNorm
 from transformer_engine.pytorch.module import GroupedLinear
+from transformer_engine.pytorch.mega_moe import bf16_mega_moe, fp16_mega_moe
 from transformer_engine.pytorch.module import Fp8Padding, Fp8Unpadding
 from transformer_engine.pytorch.module import initialize_ub
 from transformer_engine.pytorch.module import destroy_ub

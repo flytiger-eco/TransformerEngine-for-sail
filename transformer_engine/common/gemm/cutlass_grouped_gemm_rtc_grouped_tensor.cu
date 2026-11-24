@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "../rtc/mega_moe.h"
 #include "config.h"
 #include "cutlass/gemm/kernel/nvte_grouped_gemm_traits.hpp"
 #include "cutlass/gemm/kernel/nvte_grouped_tensor.hpp"
@@ -272,7 +273,8 @@ void launch_native(NativeSetup setup, TileConfig cfg, int64_t sum_m, cudaStream_
   };
   KernelConfig config{89, TA, TB, DType::kBFloat16, FP32 ? DType::kFloat32 : DType::kBFloat16,
                       true};
-  if (!FP32 && setup.b.base && !setup.b.first && !setup.b.last) {
+  if (!FP32 && (setup.b.base || setup.b_list) && !setup.b.first && !setup.b.last &&
+      setup.b.common_first > 0 && setup.b.common_last > 0) {
     const int n = TB ? setup.b.common_first : setup.b.common_last;
     const int k = TB ? setup.b.common_last : setup.b.common_first;
     if (select_common_shape(cfg, TB, sum_m, n, k, setup.sms)) {
@@ -365,6 +367,15 @@ void launch_native(NativeSetup setup, TileConfig cfg, int64_t sum_m, cudaStream_
 }  // namespace grouped_gemm_rtc
 
 bool native_grouped_gemm_supported_device() { return cuda::sm_arch() == 89; }
+
+bool rtc::mega_moe_grouped_forward_supported() {
+#ifdef __HGGCCC__
+  return native_grouped_gemm_supported_device() &&
+         grouped_gemm_rtc::grouped_tensor_headers_available();
+#else
+  return false;
+#endif
+}
 
 size_t native_grouped_gemm_workspace_size(size_t groups) {
   using namespace grouped_gemm_rtc;
@@ -511,6 +522,16 @@ bool try_native_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGr
     return result;
   };
   setup.b_list = describe_discrete(A_list, DType::kBFloat16);
+  if (A_list) {
+    // Independently allocated weights can still prove a shared N/K on the host.
+    const auto& first = lists.host.front();
+    if (std::all_of(lists.host.begin(), lists.host.end(), [&](const auto& s) {
+          return s.common_first == first.common_first && s.common_last == first.common_last;
+        })) {
+      setup.b.common_first = first.common_first;
+      setup.b.common_last = first.common_last;
+    }
+  }
   setup.c_list = describe_discrete(C_list, output_dtype);
   setup.d_list = describe_discrete(D_list, output_dtype);
   // All tuning inputs are host-visible. In particular, do not read per-expert

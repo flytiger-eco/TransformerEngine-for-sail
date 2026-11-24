@@ -42,7 +42,7 @@ std::string kernel_symbol(const KernelConfig& kernel, const TileConfig& tile) {
       kernel.common_k ? concat_strings("_n", kernel.common_n, "k", kernel.common_k) : "");
 }
 
-std::string resolve_cutlass_include_dir() {
+std::string resolve_cutlass_include_dir(bool required = true) {
   namespace fs = std::filesystem;
   auto check = [](const fs::path& p) {
     return !p.empty() && fs::exists(p / "ppu_include.hpp") &&
@@ -99,6 +99,7 @@ std::string resolve_cutlass_include_dir() {
   fs::path fallback = repo_root / "3rdparty" / "cutlass3" / "include";
   if (check(fallback)) return fallback.string();
 
+  if (!required) return {};
   NVTE_ERROR(
       "Could not locate CUTLASS 3.x + PPU include directory. "
       "Searched: NVTE_CUTLASS3_INCLUDE_DIR, baked=",
@@ -214,39 +215,26 @@ std::string read_cubin(const std::filesystem::path& path) {
 
 std::vector<std::string> compiler_options(const KernelConfig& kernel, const TileConfig& tile,
                                           bool line_info) {
-  const auto cuda_include = cuda::include_directory(true);
-  std::vector<std::string> opts{
-      // hgrtc's disk cache does not account for edits to included headers.
-      "--no-cache",
-      "--std=c++17",
-      "-DNDEBUG",
-      "-DUSE_SAIL=1",
-      kernel.sm_arch == 80 ? "--gpu-architecture=sm_80a" : "--gpu-architecture=sm_89",
-      "-I" + cuda_include,
-      "-I" + cuda_include + "/cccl",
-      "-I" + get_cutlass_include_dir(),
-      "-I/usr/local/PPU_SDK/targets/x86_64-linux/include",
-      concat_strings("-DNVTE_GG_TRANS_A=", int(kernel.trans_a)),
-      concat_strings("-DNVTE_GG_TRANS_B=", int(kernel.trans_b)),
-      concat_strings("-DNVTE_GG_ARCH=", kernel.sm_arch),
-      concat_strings("-DNVTE_GG_DTYPE=", int(kernel.input_dtype == DType::kFloat16)),
-      concat_strings("-DNVTE_GG_OUT_FP32=", int(kernel.output_dtype == DType::kFloat32)),
-      concat_strings("-DNVTE_GG_GROUPED_TENSOR=", int(kernel.grouped_tensor)),
-      concat_strings("-DNVTE_GG_N_EXPAND=", tile.n_expand ? 4 : 1),
-      concat_strings("-DNVTE_GG_COMMON_N=", kernel.common_n),
-      concat_strings("-DNVTE_GG_COMMON_K=", kernel.common_k),
-      concat_strings("-DNVTE_GG_TILE_M=", tile.tile_m),
-      concat_strings("-DNVTE_GG_TILE_N=", tile.tile_n),
-      concat_strings("-DNVTE_GG_TILE_K=", tile.tile_k),
-      concat_strings("-DNVTE_GG_STAGES=", tile.stages),
-      "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
-      "-D__HGGC_FP16_H__=1",
-      "-D_HGGC_FP16_H_=1",
-      "-DHGGC_FP16_H=1",
-      "-D__HGGC_BF16_H__=1",
-      "-D__HGGC_BF16_HPP__=1",
-      "-D__BF16_DEFINED__=1",
-  };
+  auto opts = actlize_compiler_options();
+  opts.insert(
+      opts.end(),
+      {
+          "--std=c++17",
+          kernel.sm_arch == 80 ? "--gpu-architecture=sm_80a" : "--gpu-architecture=sm_89",
+          concat_strings("-DNVTE_GG_TRANS_A=", int(kernel.trans_a)),
+          concat_strings("-DNVTE_GG_TRANS_B=", int(kernel.trans_b)),
+          concat_strings("-DNVTE_GG_ARCH=", kernel.sm_arch),
+          concat_strings("-DNVTE_GG_DTYPE=", int(kernel.input_dtype == DType::kFloat16)),
+          concat_strings("-DNVTE_GG_OUT_FP32=", int(kernel.output_dtype == DType::kFloat32)),
+          concat_strings("-DNVTE_GG_GROUPED_TENSOR=", int(kernel.grouped_tensor)),
+          concat_strings("-DNVTE_GG_N_EXPAND=", tile.n_expand ? 4 : 1),
+          concat_strings("-DNVTE_GG_COMMON_N=", kernel.common_n),
+          concat_strings("-DNVTE_GG_COMMON_K=", kernel.common_k),
+          concat_strings("-DNVTE_GG_TILE_M=", tile.tile_m),
+          concat_strings("-DNVTE_GG_TILE_N=", tile.tile_n),
+          concat_strings("-DNVTE_GG_TILE_K=", tile.tile_k),
+          concat_strings("-DNVTE_GG_STAGES=", tile.stages),
+      });
   if (line_info) opts.emplace_back("-lineinfo");
   return opts;
 }
@@ -276,6 +264,36 @@ std::string compile_cubin(const std::string& symbol, const std::vector<std::stri
   return cubin;
 }
 }  // namespace
+
+std::vector<std::string> actlize_compiler_options() {
+  const auto cuda_include = cuda::include_directory(true);
+  // HGRTC's disk cache does not track changes to included ACTLIZE headers.
+  return {"--no-cache",
+          "-DNDEBUG",
+          "-DUSE_SAIL=1",
+          "-I" + cuda_include,
+          "-I" + cuda_include + "/cccl",
+          "-I" + get_cutlass_include_dir(),
+          "-I/usr/local/PPU_SDK/targets/x86_64-linux/include",
+          "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+          "-D__HGGC_FP16_H__=1",
+          "-D_HGGC_FP16_H_=1",
+          "-DHGGC_FP16_H=1",
+          "-D__HGGC_BF16_H__=1",
+          "-D__HGGC_BF16_HPP__=1",
+          "-D__BF16_DEFINED__=1"};
+}
+
+bool grouped_tensor_headers_available() {
+  // Resolve the installed wheel or source-build headers once. A forced RTC
+  // launch still enters the compiler so it can report a missing dependency.
+  static const bool available = [] {
+    const std::filesystem::path root = resolve_cutlass_include_dir(false);
+    return !root.empty() && std::filesystem::is_regular_file(root / "cute/tensor.hpp") &&
+           std::filesystem::is_regular_file(root / "cutlass/gemm/kernel/nvte_grouped_tensor.hpp");
+  }();
+  return available || getenv<bool>("NVTE_FORCE_RTC_NO_FALLBACK", false);
+}
 
 CompiledKernel::CompiledKernel(int device, const std::string& symbol, std::string cubin,
                                int host_smem)
