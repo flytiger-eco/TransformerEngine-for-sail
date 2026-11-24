@@ -8,6 +8,8 @@
 #define TRANSFORMER_ENGINE_FUSED_ROUTER_UTILS_H_
 
 #include <cassert>
+#include <type_traits>
+#include <vector>
 
 #include "../util/logging.h"
 #include "../util/system.h"
@@ -23,6 +25,19 @@ inline void check_routing_map_format(NVTERoutingMapFormat routing_map_format) {
                  routing_map_format == NVTE_ROUTING_MAP_FORMAT_BITMAP_U8,
              "routing_map_format must be BYTEMAP (0) or BITMAP_U8 (1), got ",
              static_cast<int>(routing_map_format));
+}
+
+// Build the expected routing_map shape for a given NVTERoutingMapFormat.
+//   BYTEMAP   -> [num_tokens, num_experts]
+//   BITMAP_U8 -> [num_tokens, ceil(num_experts/8)]
+inline std::vector<size_t> expected_routing_map_shape(int num_tokens, int num_experts,
+                                                     NVTERoutingMapFormat format) {
+  const size_t tokens = static_cast<size_t>(num_tokens);
+  const size_t experts = static_cast<size_t>(num_experts);
+  if (format == NVTE_ROUTING_MAP_FORMAT_BITMAP_U8) {
+    return {tokens, (experts + 7) / 8};
+  }
+  return {tokens, experts};
 }
 
 // Topk values below this threshold use naive O(K*E) selection;
@@ -62,6 +77,16 @@ constexpr size_t kThreadsPerWarp = 32;
 constexpr int kThreadsPerBlock =
     128;  // Using 4 warps in 1 CTA, Each warp is responsible for 1 token.
 constexpr float epsilon = 1e-20;
+
+template <typename Launch>
+inline void dispatch_router_tiles(int experts, Launch launch) {
+  if (experts == 2 * kThreadsPerWarp) return launch(std::integral_constant<int, 2>{}, std::true_type{});
+  if (experts == 4 * kThreadsPerWarp) return launch(std::integral_constant<int, 4>{}, std::true_type{});
+  if (experts == 6 * kThreadsPerWarp) return launch(std::integral_constant<int, 6>{}, std::true_type{});
+  if (experts == 8 * kThreadsPerWarp) return launch(std::integral_constant<int, 8>{}, std::true_type{});
+  if (experts <= 4 * kThreadsPerWarp) return launch(std::integral_constant<int, 4>{}, std::false_type{});
+  return launch(std::integral_constant<int, 8>{}, std::false_type{});
+}
 
 enum ReduceFuncType {
   SUM,
@@ -420,6 +445,35 @@ __device__ inline void naive_topk_and_mask_smallk(CompType *scores, int data_siz
                                                   int *topk_indices, CompType *topk_scores,
                                                   int lane_id) {
   static_assert(K > 0 && K <= 8, "K must be in [1, 8]");
+  if (data_size <= kThreadsPerWarp) {
+    // 每 lane 至多一个候选：只加载一次，以有效标志代替 selected[K] 逐项检查。
+    // 保留原 strict > 比较、初始索引和 shuffle 顺序，含相等值和 -inf 的行为。
+    bool available = lane_id < data_size;
+    CompType cached = available ? scores[lane_id] : -std::numeric_limits<CompType>::infinity();
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+      CompType val = -std::numeric_limits<CompType>::infinity();
+      int index = (lane_id < data_size) ? lane_id : -1;
+      if (available && cached > val) val = cached;
+      for (int s = kThreadsPerWarp / 2; s > 0; s /= 2) {
+        auto shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
+        auto shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
+        if (shuffled_val > val) {
+          val = shuffled_val;
+          index = shuffled_index;
+        }
+      }
+      CompType chosen_val = __shfl_sync(0xffffffff, val, 0);
+      int chosen_index = __shfl_sync(0xffffffff, index, 0);
+      if (lane_id == 0) {
+        topk_indices[k] = chosen_index;
+        topk_scores[k] = chosen_val;
+      }
+      available = available && lane_id != chosen_index;
+      __syncwarp();
+    }
+    return;
+  }
   int selected[K];
 #pragma unroll
   for (int i = 0; i < K; ++i) {
@@ -543,11 +597,104 @@ __device__ inline void naive_topk_and_mask(CompType *scores, int data_size, int 
   }
 }
 
-template <TopkFuncType TopkFunc>
+template <int Tiles, bool Full>
+__device__ __forceinline__ void radix_topk_cached(const CompType *scores, int size, int topk,
+                                                  int *indices, CompType *values, int lane_id) {
+  constexpr unsigned int full = 0xffffffffu;
+  unsigned int keys[Tiles];
+#pragma unroll
+  for (int tile = 0; tile < Tiles; ++tile) {
+    const int offset = tile * kThreadsPerWarp + lane_id;
+    keys[tile] = Full || offset < size ? float_to_ordered_uint(scores[offset]) : 0u;
+  }
+  unsigned int prefix = 0, mask = 0;
+  int remaining = topk, survivors = Full ? Tiles * kThreadsPerWarp : size;
+#pragma unroll 1
+  for (unsigned int bit = 1u << 31; bit && survivors > 1; bit >>= 1) {
+    mask |= bit;
+    const unsigned int high_prefix = prefix | bit;
+    int high = 0;
+#pragma unroll
+    for (int tile = 0; tile < Tiles; ++tile) {
+      high += (keys[tile] & mask) == high_prefix;
+    }
+    high = warp_allreduce_sum(high);
+    if (remaining <= high) {
+      prefix = high_prefix;
+      survivors = high;
+    } else {
+      remaining -= high;
+      survivors -= high;
+    }
+  }
+  int next_greater = 0, next_equal = topk - remaining;
+  const unsigned int lower = (1u << lane_id) - 1;
+#pragma unroll
+  for (int tile = 0; tile < Tiles; ++tile) {
+    const int index = tile * kThreadsPerWarp + lane_id;
+    const bool valid = Full || index < size;
+    const unsigned int candidate = keys[tile] & mask;
+    const unsigned int greater = __ballot_sync(full, valid && candidate > prefix);
+    const unsigned int equal = __ballot_sync(full, valid && candidate == prefix);
+    const int position = candidate > prefix ? next_greater + __popc(greater & lower)
+                                            : next_equal + __popc(equal & lower);
+    if (valid && candidate >= prefix && position < topk) {
+      indices[position] = index;
+      values[position] = scores[index];
+    }
+    next_greater += __popc(greater);
+    next_equal += __popc(equal);
+  }
+  __syncwarp();
+}
+
+template <int Tiles, bool Full>
+__device__ __forceinline__ void cached_radix_select(CompType *scores, int data_size, int topk,
+                                                    int *indices, CompType *values, int lane_id) {
+  if (data_size > kThreadsPerWarp) {
+    if constexpr (Full) {
+      if (data_size != Tiles * kThreadsPerWarp) {
+        return radix_topk_and_mask(scores, data_size, topk, indices, values, lane_id);
+      }
+    }
+    return radix_topk_cached<Tiles, Full>(scores, data_size, topk, indices, values, lane_id);
+  }
+  constexpr unsigned int full = 0xffffffffu;
+  const bool valid = lane_id < data_size;
+  const CompType value = valid ? scores[lane_id] : 0.0f;
+  const unsigned int key = float_to_ordered_uint(value);
+  unsigned int candidates = __ballot_sync(full, valid);
+  int rank = topk;
+  for (unsigned int bit = 1u << 31; bit && (candidates & (candidates - 1)); bit >>= 1) {
+    const unsigned int ones = candidates & __ballot_sync(full, (key & bit) != 0);
+    const int count = __popc(ones);
+    if (rank <= count) {
+      candidates = ones;
+    } else {
+      candidates ^= ones;
+      rank -= count;
+    }
+  }
+  const unsigned int cutoff = __shfl_sync(full, key, __ffs(candidates) - 1);
+  const unsigned int greater = __ballot_sync(full, valid && key > cutoff);
+  const unsigned int equal = __ballot_sync(full, valid && key == cutoff);
+  const unsigned int lower = (1u << lane_id) - 1;
+  const int position = key > cutoff ? __popc(greater & lower)
+                                    : __popc(greater) + __popc(equal & lower);
+  if (valid && key >= cutoff && position < topk) {
+    indices[position] = lane_id;
+    values[position] = value;
+  }
+  __syncwarp();
+}
+
+template <TopkFuncType TopkFunc, int Tiles = 0, bool Full = false>
 __device__ __forceinline__ void topk_and_mask(CompType *scores, int data_size, int topk,
                                               int *topk_indices, CompType *topk_scores,
                                               int lane_id) {
-  if constexpr (TopkFunc == TopkFuncType::Radix)
+  if constexpr (Tiles != 0)
+    return cached_radix_select<Tiles, Full>(scores, data_size, topk, topk_indices, topk_scores, lane_id);
+  else if constexpr (TopkFunc == TopkFuncType::Radix)
     return radix_topk_and_mask(scores, data_size, topk, topk_indices, topk_scores, lane_id);
   else
     return naive_topk_and_mask(scores, data_size, topk, topk_indices, topk_scores, lane_id);

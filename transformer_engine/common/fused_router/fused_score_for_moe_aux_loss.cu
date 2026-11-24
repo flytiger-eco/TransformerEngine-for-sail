@@ -398,19 +398,6 @@ void fused_score_for_moe_aux_loss_forward_kernel_launcher(
   }
 }
 
-// Build the expected routing_map shape for a given NVTERoutingMapFormat.
-//   BYTEMAP   -> [num_tokens, num_experts]
-//   BITMAP_U8 -> [num_tokens, ceil(num_experts/8)]
-static std::vector<size_t> expected_routing_map_shape(int num_tokens, int num_experts,
-                                                      NVTERoutingMapFormat format) {
-  const size_t t = static_cast<size_t>(num_tokens);
-  const size_t e = static_cast<size_t>(num_experts);
-  if (format == NVTE_ROUTING_MAP_FORMAT_BITMAP_U8) {
-    return {t, (e + 7) / 8};
-  }
-  return {t, e};
-}
-
 void fused_score_for_moe_aux_loss_forward(const Tensor &logits, int num_tokens, int num_experts,
                                           int topk, int score_function, Tensor &scores,
                                           Tensor &routing_map,
