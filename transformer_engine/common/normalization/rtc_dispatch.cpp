@@ -159,23 +159,45 @@ bool try_static_fallback(StaticFallback<ParamsT> static_fallback,
   return true;
 }
 
+struct KernelEntry {
+  std::string label;
+  std::string expression;
+};
+
+struct RowStripKernels {
+  KernelEntry full;
+  KernelEntry tail;
+  int tile_rows = 1;
+
+  const KernelEntry& select(int rows) const {
+    return tile_rows > 1 && rows % tile_rows != 0 ? tail : full;
+  }
+};
+
+RowStripKernels rmsnorm_row_strips(const std::string& label, const std::string& template_prefix,
+                                  int warps_m, int warps_n) {
+  if (warps_m == 1 || warps_n == 1) return {{label, template_prefix + ">"}, {}, 1};
+  return {{label, template_prefix + ">"}, {label + ",tail", template_prefix + ", true>"}, warps_m};
+}
+
 // Common per-launch configure/launch helper. `kernel_expr` is the full
 // templated kernel symbol (used as the nvrtcAddNameExpression argument); the
 // closure captures everything needed.
 template <typename ParamsT>
-void register_launcher(const std::string& label, const std::string& kernel_expr,
+void register_launcher(const RowStripKernels& kernels,
                        const char* rtc_source, const char* filename, TupleKeyType key,
                        int threads_per_cta, int dynamic_smem_bytes, int ctas_per_row,
                        bool needs_cooperative, int barrier_bytes_per_col,
                        int workspace_bytes_per_col, int dgamma_part_bytes_per_col,
-                       StaticFallback<ParamsT> static_fallback) {
-  auto closure = [label, kernel_expr, rtc_source, filename, threads_per_cta, dynamic_smem_bytes,
+                       StaticFallback<ParamsT> static_fallback, size_t required_row_multiple) {
+  auto closure = [kernels, rtc_source, filename, threads_per_cta, dynamic_smem_bytes,
                   ctas_per_row, needs_cooperative, barrier_bytes_per_col, workspace_bytes_per_col,
                   dgamma_part_bytes_per_col, static_fallback](LaunchParams<ParamsT>& launch_params,
                                                               const bool configure_params) {
     if (try_static_fallback(static_fallback, launch_params, configure_params)) {
       return;
     }
+    const auto& [label, kernel_expr] = kernels.select(launch_params.params.rows);
     auto& mgr = rtc::KernelManager::instance();
     if (!mgr.is_compiled(label)) {
       compile_norm_kernel(mgr, label, kernel_expr, rtc_source, filename);
@@ -214,7 +236,7 @@ void register_launcher(const std::string& label, const std::string& kernel_expr,
     }
     (void)needs_cooperative;
   };
-  TeNormalizationRegistry<ParamsT>::registerFunction(key, std::move(closure));
+  TeNormalizationRegistry<ParamsT>::registerFunction(key, std::move(closure), required_row_multiple);
 }
 
 }  // namespace
@@ -243,9 +265,9 @@ void register_ln_fwd_tuned(DType wt, DType it, DType ot, DType ct, int hidden, i
   const int barrier_per_col = 2 * 4;
   const int workspace_per_col = wm * cr * sizeof_stats_t * 2;
   register_launcher<ForwardKernelParams>(
-      label, kernel_expr, string_code_normalization_layernorm_rtc_ln_fwd_kernel_cu,
+      {{label, kernel_expr}, {}, 1}, string_code_normalization_layernorm_rtc_ln_fwd_kernel_cu,
       "ln_fwd_kernel.cu", key, threads_per_cta, smem_bytes, cr, /*needs_cooperative=*/cr > 1,
-      barrier_per_col, workspace_per_col, /*dgamma_part_bytes_per_col=*/0, static_fallback);
+      barrier_per_col, workspace_per_col, /*dgamma_part_bytes_per_col=*/0, static_fallback, 4);
 }
 
 void register_ln_fwd_general(DType wt, DType it, DType ot, DType ct, int hidden, int wm, int wn,
@@ -320,17 +342,17 @@ void register_rmsnorm_fwd_tuned(DType wt, DType it, DType ot, DType ct, int hidd
                      ",o=", static_cast<int>(ot), ",c=", static_cast<int>(ct), ",h=", hidden,
                      ",cr=", cr, ",wm=", wm, ",wn=", wn, ",bl=", bl);
   const std::string traits_expr = kernel_traits_expr(wt, it, ot, ct, hidden, cr, wm, wn, bl);
-  const std::string kernel_expr = concat_strings(
-      "&::transformer_engine::normalization::rmsnorm_fwd_tuned_kernel<", traits_expr, ">");
+  const auto kernels = rmsnorm_row_strips(
+      label, "&::transformer_engine::normalization::rmsnorm_fwd_tuned_kernel<" + traits_expr, wm, wn);
   const int threads_per_cta = wm * wn * 32;
   const int smem_bytes = stats_smem_bytes(ct, wm, wn);
   const int sizeof_stats_t = (ct == DType::kFloat32) ? 8 : 4;
   const int barrier_per_col = 2 * 4;
   const int workspace_per_col = wm * cr * sizeof_stats_t * 2;
   register_launcher<ForwardKernelParams>(
-      label, kernel_expr, string_code_normalization_rmsnorm_rtc_rmsnorm_fwd_kernel_cu,
+      kernels, string_code_normalization_rmsnorm_rtc_rmsnorm_fwd_kernel_cu,
       "rmsnorm_fwd_kernel.cu", key, threads_per_cta, smem_bytes, cr, /*needs_cooperative=*/cr > 1,
-      barrier_per_col, workspace_per_col, 0, static_fallback);
+      barrier_per_col, workspace_per_col, 0, static_fallback, 1);
 }
 
 void register_rmsnorm_fwd_pipe(DType wt, DType it, DType ot, DType ct, int hidden, int cr, int wm,
@@ -391,7 +413,7 @@ void register_rmsnorm_fwd_pipe(DType wt, DType it, DType ot, DType ct, int hidde
     mgr.launch(selected_label, dim3(p.params.ctas_per_col), dim3(threads_per_cta),
                selected_smem, p.stream, p.params);
   };
-  TeNormalizationRegistry<ForwardKernelParams>::registerFunction(key, std::move(closure));
+  TeNormalizationRegistry<ForwardKernelParams>::registerFunction(key, std::move(closure), wm);
 }
 
 void register_rmsnorm_fwd_general(DType wt, DType it, DType ot, DType ct, int hidden, int wm,
@@ -641,13 +663,13 @@ void register_rmsnorm_bwd_tuned(DType wt, DType it, DType ot, DType ct, int hidd
       "rmsnorm_bwd_tuned", add_tag, ",w=", static_cast<int>(wt), ",i=", static_cast<int>(it),
       ",o=", static_cast<int>(ot), ",c=", static_cast<int>(ct), ",h=", hidden, ",cr=", cr,
       ",wm=", wm, ",wn=", wn, ",bl=", bl_main, ",blf=", bl_final);
-  const std::string main_label = concat_strings(label, ",main");
   const std::string finalize_label = concat_strings(label, ",finalize");
   const std::string traits = kernel_traits_expr(wt, it, ot, ct, hidden, cr, wm, wn, bl_main);
   const char* add_flag = with_add ? "true" : "false";
-  const std::string main_kexpr =
-      concat_strings("&::transformer_engine::normalization::rmsnorm_bwd_tuned_kernel<", traits,
-                     ", ", add_flag, ">");
+  const auto main_kernels = rmsnorm_row_strips(
+      label + ",main",
+      "&::transformer_engine::normalization::rmsnorm_bwd_tuned_kernel<" + traits + ", " + add_flag,
+      wm, wn);
   const std::string finalize_traits =
       concat_strings("::transformer_engine::normalization::Kernel_traits_finalize<", hidden, ", ",
                      cpp_name_for(wt), ", ", cpp_name_for(it), ", ", cpp_name_for(ot), ", ",
@@ -665,7 +687,7 @@ void register_rmsnorm_bwd_tuned(DType wt, DType it, DType ot, DType ct, int hidd
   const int finalize_ctas = colspass / 32;
   const int finalize_threads_per_cta = 1024;
 
-  auto closure = [main_label, main_kexpr, finalize_label, finalize_kexpr, threads_per_cta,
+  auto closure = [main_kernels, finalize_label, finalize_kexpr, threads_per_cta,
                   smem_bytes, cr, wm, barrier_per_col, workspace_per_col, dgamma_part_per_col,
                   finalize_ctas, finalize_threads_per_cta,
                   static_fallback](LaunchParams<BackwardKernelParams>& launch_params,
@@ -673,6 +695,7 @@ void register_rmsnorm_bwd_tuned(DType wt, DType it, DType ot, DType ct, int hidd
     if (try_static_fallback(static_fallback, launch_params, configure_params)) {
       return;
     }
+    const auto& [main_label, main_kexpr] = main_kernels.select(launch_params.params.rows);
     auto& mgr = rtc::KernelManager::instance();
     if (!mgr.is_compiled(main_label)) {
       compile_norm_kernel(mgr, main_label, main_kexpr,
@@ -724,7 +747,7 @@ void register_rmsnorm_bwd_tuned(DType wt, DType it, DType ot, DType ct, int hidd
     mgr.launch(finalize_label, dim3(finalize_ctas), dim3(finalize_threads_per_cta), 0, stream,
                launch_params.params);
   };
-  TeNormalizationRegistry<BackwardKernelParams>::registerFunction(key, std::move(closure));
+  TeNormalizationRegistry<BackwardKernelParams>::registerFunction(key, std::move(closure), 1);
 }
 
 void register_rmsnorm_bwd_general(DType wt, DType it, DType ot, DType ct, int hidden, int wm,

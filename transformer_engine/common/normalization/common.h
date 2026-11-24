@@ -80,7 +80,11 @@ template <typename KernelParamsType>
 class TeNormalizationRegistry {
  private:
   using Function = std::function<void(LaunchParams<KernelParamsType>&, const bool)>;
-  std::unordered_map<TupleKeyType, Function, TupleHash> tuned_function_map;
+  struct TunedLauncher {
+    Function launch;
+    size_t required_row_multiple;
+  };
+  std::unordered_map<TupleKeyType, TunedLauncher, TupleHash> tuned_function_map;
   std::unordered_map<uint64_t, std::map<uint64_t, Function>> general_function_map;
 
   TeNormalizationRegistry() = default;
@@ -93,30 +97,29 @@ class TeNormalizationRegistry {
  public:
   static int registerFunction(TupleKeyType key,
                               void (*func)(LaunchParams<KernelParamsType>&, const bool)) {
-    auto [general_key, batch_size, hidden_size, is_tuned] = key;
-    if (is_tuned)
-      getInstance().tuned_function_map.emplace(key, Function(func));
-    else
-      getInstance().general_function_map[general_key].emplace(hidden_size, Function(func));
-    return 0;
+    return registerFunction(key, Function(func));
   }
 
-  // Overload for capturing-callable dispatchers (e.g. NVRTC closures).
-  static int registerFunction(TupleKeyType key, Function func) {
+  static int registerFunction(TupleKeyType key, Function func, size_t required_row_multiple = 4) {
     auto [general_key, batch_size, hidden_size, is_tuned] = key;
-    if (is_tuned)
-      getInstance().tuned_function_map.emplace(key, std::move(func));
-    else
+    if (is_tuned) {
+      NVTE_CHECK(required_row_multiple > 0, "Invalid tuned normalization row multiple.");
+      getInstance().tuned_function_map.emplace(
+          key, TunedLauncher{std::move(func), required_row_multiple});
+    } else {
       getInstance().general_function_map[general_key].emplace(hidden_size, std::move(func));
+    }
     return 0;
   }
 
-  static Function getKernel(TupleKeyType key) {
+  static Function getKernel(TupleKeyType key, size_t rows) {
     auto& instance = getInstance();
     auto [general_key, batch_size, hidden_size, is_tuned] = key;
     if (is_tuned) {
       auto it = instance.tuned_function_map.find(key);
-      if (it != instance.tuned_function_map.end()) return it->second;
+      if (it != instance.tuned_function_map.end() && rows % it->second.required_row_multiple == 0) {
+        return it->second.launch;
+      }
     }
     if (instance.general_function_map.count(general_key) == 0) {
       NVTE_ERROR("Unavailable kernel for this normalization config.");
@@ -158,7 +161,7 @@ class TeNormalizationPlan : public NormalizationPlanBase {
  public:
   TeNormalizationPlan(NVTE_Norm_Type NormType, NVTE_Norm_Stage NormStage, DType wtype, DType itype,
                       DType otype, DType ctype, const size_t batch_size, const size_t hidden_size,
-                      const size_t sm_count, const bool zero_centered_gamma, const bool is_tuned);
+                      const size_t sm_count, const bool zero_centered_gamma, const bool is_aligned);
   Shape getWorkspaceShape() const override;
 
   void execute(Tensor* z, void* x_dptr, void* gamma_dptr, void* beta_dptr, void* mean_dptr,

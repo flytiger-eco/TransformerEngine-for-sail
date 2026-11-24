@@ -36,7 +36,7 @@ __device__ __forceinline__ void cp_async_wait_group() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
-template <typename Ktraits>
+template <typename Ktraits, bool MaskPartialStrip = false>
 __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_kernel(
     ForwardKernelParams params) {
   enum { ROWS_PER_CTA = Ktraits::ROWS_PER_CTA };
@@ -93,12 +93,16 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_ke
   compute_t amax = 0;
   const bool requires_amax = params.amax != nullptr;
 
-  for (int row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA) {
+  auto visit_row = [&](auto row, bool row_valid) {
     Ivec x[LDGS];
     index_t idx = row * Ktraits::VEC_COLS + c;
 #pragma unroll
     for (int it = 0; it < LDGS; it++) {
-      x[it].load_from(params.x, idx);
+      if (row_valid) {
+        x[it].load_from(params.x, idx);
+      } else {
+        x[it].clear();
+      }
       idx += VEC_COLS_PER_LDG;
     }
 
@@ -112,6 +116,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_ke
           }
         },
         rn);
+    if (!row_valid) return;
 
     compute_t mu = Get<0>::of<stats_t, compute_t>(s);
     compute_t m2 = Get<1>::of<stats_t, compute_t>(s);
@@ -153,6 +158,19 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_ke
       }
       z[it].store_to(params.z, idx);
       idx += VEC_COLS_PER_LDG;
+    }
+  };
+  if constexpr (MaskPartialStrip) {
+    const index_t rows = params.rows;
+    const index_t full_rows = rows - rows % ROWS_PER_CTA;
+    index_t strip = bidm * ROWS_PER_CTA;
+    for (; strip < full_rows; strip += params.ctas_per_col * ROWS_PER_CTA) {
+      visit_row(strip + warp_m, true);
+    }
+    if (strip < rows) visit_row(strip + warp_m, strip + warp_m < rows);
+  } else {
+    for (int row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA) {
+      visit_row(row, true);
     }
   }
 
