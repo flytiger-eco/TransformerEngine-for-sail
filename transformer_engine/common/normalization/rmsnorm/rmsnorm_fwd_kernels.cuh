@@ -86,8 +86,10 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_ke
 
   constexpr compute_t rn = 1.f / compute_t(Ktraits::COLS);
 
+  constexpr bool fp8_out =
+      detail::is_same_v<output_t, fp8e4m3> || detail::is_same_v<output_t, fp8e5m2>;
   compute_t scale;
-  if (params.fp8_out) {
+  if constexpr (fp8_out) {
     scale = *reinterpret_cast<compute_t *>(params.scale);
   }
   compute_t amax = 0;
@@ -141,7 +143,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_ke
 
         if (requires_amax) {
           __builtin_assume(amax >= 0);
-          if (params.fp8_out) {
+          if constexpr (fp8_out) {
             // For fp8_out, keep amax on pre-scale compute_t
             amax = fmaxf(amax, fabsf(temp_output));
           } else {
@@ -150,7 +152,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_ke
             amax = fmaxf(amax, fabsf(compute_t(out_t_val)));
           }
         }
-        if (params.fp8_out) {
+        if constexpr (fp8_out) {
           temp_output = temp_output * scale;
         }
 
@@ -183,7 +185,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_fwd_tuned_ke
     }
   }
 
-  if (params.fp8_out) {
+  if constexpr (fp8_out) {
     // Update scale-inverse
     if (blockIdx.x == 0 && threadIdx.x == 0 && params.scale_inv != nullptr) {
       reciprocal<compute_t>(reinterpret_cast<compute_t *>(params.scale_inv), scale);

@@ -314,6 +314,18 @@ INSTANTIATE_TEST_SUITE_P(
     return name;
   });
 
+INSTANTIATE_TEST_SUITE_P(
+  OperatorTunedOutputTest, NormTestSuite,
+  ::testing::Values(
+    NormTestSuite::ParamType{false, RMSNorm, DType::kFloat32, DType::kFloat32,
+                             {2048, 512}, false, false, false},
+    NormTestSuite::ParamType{false, RMSNorm, DType::kFloat32, DType::kFloat8E4M3,
+                             {2048, 512}, false, false, false},
+    NormTestSuite::ParamType{false, RMSNorm, DType::kBFloat16, DType::kBFloat16,
+                             {2048, 768}, true, false, false},
+    NormTestSuite::ParamType{false, RMSNorm, DType::kBFloat16, DType::kFloat8E4M3,
+                             {2048, 768}, true, false, false}));
+
 // Tuned-bucket suite: Te backend, RMSNorm, matched in/out dtypes only (the tuned
 // table registers matched WTYPE/ITYPE/OTYPE triples; mixed dtypes stay on the
 // general path and are already covered above). Both plain Backward and fused
