@@ -6,6 +6,12 @@
 
 namespace transformer_engine::rtc::fused_moe {
 
+// A warp-bulk read consumes one aligned 512-byte segment across all lanes.
+__device__ __forceinline__ bool can_read_local_input(const MegaMoEFusedArgs &p) {
+  return p.x_stride0 == p.hidden && p.x_stride1 == 1 &&
+         reinterpret_cast<unsigned long long>(p.x) % 512 == 0;
+}
+
 // Poll a local mapping. Its sole producer can be a CTA on the peer PPU.
 __device__ __forceinline__ void wait_epoch(const int *signal, int epoch) {
   int value;

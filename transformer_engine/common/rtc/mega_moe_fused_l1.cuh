@@ -135,10 +135,7 @@ __device__ __forceinline__ void copy_tile(const MegaMoEFusedArgs& p, int tile, T
   for (int row = warp; row < t.valid_rows; row += Gemm::MaxThreadsPerBlock / 32) {
     int src = source_by_row[row];
     int token = slot_by_row[row] / p.topk;
-    const void* input = src == p.rank && p.x_stride0 == kHidden && p.x_stride1 == 1 &&
-                                !(reinterpret_cast<unsigned long long>(p.x) % 16)
-                            ? p.x
-                            : p.source_x[src];
+    const void* input = src == p.rank && can_read_local_input(p) ? p.x : p.source_x[src];
     const Bf16* x = static_cast<const Bf16*>(input) + int64_t(token) * kHidden;
     Bf16* dst = pool + int64_t(row) * kHidden;
     // One warp issues up to eight independent 512-byte segments before waiting

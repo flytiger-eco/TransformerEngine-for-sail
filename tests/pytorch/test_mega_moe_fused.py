@@ -171,6 +171,11 @@ def _worker():
         assert torch.count_nonzero(grads[1][ids < 0]) == 0
 
         with torch.no_grad():
+            # A contiguous BF16 view may be 16-byte aligned without being bulk-load aligned.
+            storage = x.new_empty(x.numel() + 8)
+            shifted = storage[8:].view_as(x).copy_(x)
+            assert shifted.data_ptr() % 512 != 0
+            _check((shifted, ids, probs), weights)
             _check(tuple(t.T.contiguous().T for t in args), weights)
             # One rank's weight strides alone force the entire group to use
             # the generic peer path. The next call can use fused storage again.
@@ -220,6 +225,13 @@ def _worker():
                 _forward(large, weights)
             _check(args, weights)  # The failed resize retained the smaller mapping.
             _check(large, weights)
+            # Rank zero owns all expert work but has no local tokens to combine.
+            # Drop a fresh subgroup while the other device may still be reading it.
+            subgroup = dist.new_group()
+            out = te.bf16_mega_moe(*large, *weights, ep_group=subgroup)
+            dist.destroy_process_group(subgroup)
+            del subgroup
+            _check_output(out, *large)
             large[1].fill_(-1)
             _check(large, weights)
             _check(args, weights)

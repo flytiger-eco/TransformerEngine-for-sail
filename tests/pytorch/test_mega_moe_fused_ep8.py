@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -116,6 +117,59 @@ def training_reference(x, ids, probs, dy, all1, all2):
 
 
 @torch.enable_grad()
+def check_admission(rank, device):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch import _mega_moe_peer as peer
+
+    group = dist.group.WORLD
+    x, ids, probs = make_case(8, rank, 71, device)
+    w1, w2 = make_weights(512, 256, 2, device, 73)
+    fp16 = rank == 0
+    dtype = torch.float16 if fp16 else torch.bfloat16
+    fn = te.fp16_mega_moe if fp16 else te.bf16_mega_moe
+    with pytest.raises(ValueError, match="dtype must match"):
+        fn(
+            x.to(dtype),
+            ids,
+            probs,
+            [w.to(dtype) for w in w1],
+            [w.to(dtype) for w in w2],
+            ep_group=group,
+        )
+    with torch.set_grad_enabled(rank != 0), pytest.raises(ValueError, match="grad mode"):
+        te.bf16_mega_moe(x, ids, probs, w1, w2, ep_group=group)
+    with FakeTensorMode() as mode:
+        out = te.bf16_mega_moe(
+            mode.from_tensor(x),
+            mode.from_tensor(ids),
+            mode.from_tensor(probs),
+            [mode.from_tensor(w) for w in w1],
+            [mode.from_tensor(w) for w in w2],
+            ep_group=group,
+        )
+        assert out.shape == x.shape and out.fake_mode is mode
+
+    subgroup = dist.new_group()
+    with patch.dict(os.environ, NVTE_MOE_EP8_FUSED="0" if rank == 0 else "1"):
+        assert peer._peer_supported(subgroup, device)
+        state = peer._workspace(subgroup)
+        assert not state.fused_supported and not state.training_supported
+        for size in (8, 16):
+            with patch.object(
+                peer.symm,
+                "empty",
+                wraps=peer.symm.empty,
+                side_effect=torch.OutOfMemoryError("injected") if rank == 1 else None,
+            ):
+                with pytest.raises(torch.OutOfMemoryError):
+                    state.buffers(subgroup, (size, 512), x)
+            state.buffers(subgroup, (size, 512), x)
+            state.done.record()
+    dist.destroy_process_group(subgroup)
+
+
+@torch.enable_grad()
 def check_training(rank, device):
     import transformer_engine.pytorch as te
 
@@ -205,6 +259,7 @@ def main():
     dist.init_process_group("nccl", device_id=device)
     assert dist.get_world_size() == 8
     if args.training:
+        check_admission(rank, device)
         check_training(rank, device)
         check_training_tile_tails(rank, device)
         dist.destroy_process_group()
@@ -350,6 +405,15 @@ def run_eight_ranks(training):
         else "EP8 fused edge checks passed (7 cases)"
     )
     assert message in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize("tokens,experts,topk", [(3, 8, 8), (5, 10, 6), (128, 64, 8)])
+def test_balanced_routes(tokens, experts, topk):
+    from benchmark_mega_moe_ep8 import routes
+
+    ids, _ = routes(tokens, experts, topk, 73, 0, "cpu")
+    assert (ids.sort(dim=1).values.diff(dim=1) > 0).all()
+    assert torch.bincount(ids.flatten().long()).eq(tokens * topk // experts).all()
 
 
 def test_fused_ep8_top8_forward():

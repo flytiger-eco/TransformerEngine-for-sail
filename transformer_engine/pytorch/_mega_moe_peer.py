@@ -7,6 +7,7 @@
 import socket
 import os
 import threading
+from contextlib import contextmanager
 from importlib.util import find_spec
 from weakref import WeakKeyDictionary, finalize
 
@@ -22,6 +23,27 @@ except ImportError:
     symm = None
 
 
+@contextmanager
+def _collective_allocation(group, status):
+    """Report allocation failures before any peer enters the next rendezvous."""
+    error = None
+    try:
+        yield
+    except RuntimeError as exc:
+        error = exc
+    status.fill_(2 if isinstance(error, torch.OutOfMemoryError) else int(error is not None))
+    dist.all_reduce(status, op=dist.ReduceOp.MAX, group=group)
+    failure = status.item()
+    if failure:
+        if error is not None:
+            raise error
+        if failure == 2:
+            raise torch.OutOfMemoryError(
+                "A peer ran out of memory allocating the MegaMoE workspace"
+            )
+        raise RuntimeError("A peer could not allocate its MegaMoE workspace")
+
+
 class _Workspace:
     def __init__(self):
         self.lock = threading.RLock()
@@ -33,6 +55,7 @@ class _Workspace:
         self.grad_stream = None
         self.grad_ready = None
         self.device = None
+        self.allocation_status = None
         self.storage = None
         self.peer_views = None
         self.handle = None
@@ -51,7 +74,10 @@ class _Workspace:
             # finishes its local stream before the collective new rendezvous.
             # Keep both old storage and handle alive until all peers arrive.
             self.wait_for_completion()
-            storage = symm.empty(nbytes, device=x.device, dtype=torch.uint8)
+            if self.allocation_status is None:
+                self.allocation_status = torch.empty(1, device=x.device, dtype=torch.int32)
+            with _collective_allocation(group, self.allocation_status):
+                storage = symm.empty(nbytes, device=x.device, dtype=torch.uint8)
             handle = symm.rendezvous(storage, group)
             self.storage, self.handle = storage, handle
             self.peer_views = None
@@ -124,7 +150,9 @@ def _peer_supported(group, device):
                     uuid,
                     reachable,
                     find_spec("triton") is not None,
-                    supported and tex.mega_moe_fused_available(),
+                    supported
+                    and tex.mega_moe_fused_available()
+                    and (group.size() != 8 or os.getenv("NVTE_MOE_EP8_FUSED", "1") == "1"),
                 ),
                 group,
             )
@@ -136,11 +164,7 @@ def _peer_supported(group, device):
                 and all(devices <= item[2] for item in peers)
             )
             state.bulk_supported = group.size() == 2 and all(item[3] for item in peers)
-            state.fused_supported = (
-                group.size() in (2, 8)
-                and (group.size() == 2 or os.getenv("NVTE_MOE_EP8_FUSED", "1") == "1")
-                and all(item[4] for item in peers)
-            )
+            state.fused_supported = group.size() in (2, 8) and all(item[4] for item in peers)
             state.training_supported = state.fused_supported and all(item[3] for item in peers)
             state.device = device
         return state.supported

@@ -8,6 +8,7 @@ from typing import Optional, Sequence
 
 import torch
 from torch import Tensor
+from torch._subclasses.fake_tensor import is_fake
 import transformer_engine_torch as tex
 
 from ._mega_moe_routing import dispatch, redispatch, return_routes
@@ -136,8 +137,7 @@ def _mega_moe(x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group
             raise ValueError("expert weights must have the same dtype and device as x")
     if (
         not torch.compiler.is_compiling()
-        and torch.is_grad_enabled()
-        and dtype == torch.bfloat16
+        and not is_fake(x)
         and ep_group is not None
         and ep_group.size() == 8
         and x.is_cuda
@@ -146,13 +146,25 @@ def _mega_moe(x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group
 
         with torch.cuda.device(x.device):
             if _peer_supported(ep_group, x.device) and _workspace(ep_group).training_supported:
-                from ._mega_moe_train import training_forward
-
-                output = training_forward(
-                    x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group
+                # All eager EP8 peers must agree before entering different transports.
+                # Sum two binary flags to distinguish mixed precision and mixed grad mode.
+                mode = x.new_tensor(
+                    [dtype == torch.bfloat16, torch.is_grad_enabled()], dtype=torch.int32
                 )
-                if output is not None:
-                    return output
+                torch.distributed.all_reduce(mode, group=ep_group)
+                bf16, grad = mode.tolist()
+                if bf16 not in (0, 8):
+                    raise ValueError("Expert-parallel input dtype must match on every rank")
+                if grad not in (0, 8):
+                    raise ValueError("Expert-parallel grad mode must match on every rank")
+                if bf16 and grad:
+                    from ._mega_moe_train import training_forward
+
+                    output = training_forward(
+                        x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group
+                    )
+                    if output is not None:
+                        return output
     return forward(
         x,
         expert_ids,
@@ -183,8 +195,8 @@ def bf16_mega_moe(
     The PPU runtime compiles the expert kernels for the input precision. On
     peer-accessible EP groups, tokens and results travel through symmetric buffers.
     Inference batches with K <= 8 on two or eight SM89 PPUs use three kernels after workspace
-    setup when H and I are multiples of 256, the BF16 weights are contiguous and
-    aligned, each rank has at most 16 experts, and at least one rank has 2048 or
+    setup and collective admission when H and I are multiples of 256, the BF16 weights are
+    contiguous and aligned, each rank has at most 16 experts, and at least one rank has 2048 or
     more input tokens. Pre-dispatch builds expert route lists. FC1
     overlaps fetching expert input tiles with the gate/up projection and weighted
     SwiGLU. FC2 makes output columns available for cross-rank FP32 reduction.

@@ -45,23 +45,22 @@ def source_sha(root):
 
 
 def routes(tokens, total_experts, topk, seed, rank, device):
-    """Exact per-source expert histogram; swaps remove duplicate expert slots."""
+    """Shuffle an exactly balanced, duplicate-free routing table."""
     gen = torch.Generator().manual_seed(seed + rank)
     assert tokens * topk % total_experts == 0
-    pool = torch.arange(total_experts).repeat_interleave(tokens * topk // total_experts)
-    rows = pool[torch.randperm(len(pool), generator=gen)].view(tokens, topk).tolist()
+    assert 0 < topk <= total_experts
+    # Consecutive runs in a repeated permutation start balanced and duplicate-free,
+    # including rows crossing a permutation boundary. Random swaps preserve both.
+    pool = torch.randperm(total_experts, generator=gen).repeat(tokens * topk // total_experts)
+    rows = pool.view(tokens, topk).tolist()
     rng = random.Random(seed + rank)
-    for i, row in enumerate(rows):
+    for row in rows:
         for slot in range(topk):
-            old = row[slot]
-            if old not in row[:slot]:
-                continue
-            while True:
-                j, k = rng.randrange(tokens), rng.randrange(topk)
-                other = rows[j][k]
-                if j != i and other not in row and old not in rows[j]:
-                    row[slot], rows[j][k] = other, old
-                    break
+            other = rows[rng.randrange(tokens)]
+            k = rng.randrange(topk)
+            if row[slot] not in other and other[k] not in row:
+                row[slot], other[k] = other[k], row[slot]
+        rng.shuffle(row)
     ids = torch.tensor(rows, dtype=torch.int32)
     assert all(len(set(row)) == topk for row in rows)
     assert torch.bincount(ids.to(torch.int64).flatten()).eq(tokens * topk // total_experts).all()

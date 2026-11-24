@@ -231,6 +231,24 @@ __device__ void run(const MegaMoEFusedArgs& p, char* smem) {
     }
   }
   combine_part(p, starts, blockIdx.x, gridDim.x, kParts - 1);
+  // The last CTA certifies that every local warp has finished reading peer memory.
+  // Reserve control words 50..58 between the part mailboxes and the route headers.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    constexpr int retired = kArrived + 2 * MegaMoEFusedArgs::kMaxRanks;
+    constexpr int finished = retired + 1;
+    int* local = p.control[p.rank];
+    unsigned ticket;
+    asm volatile("ppu.atom.add.acq_rel.gpu.u32 %0, [%1], %2;"
+                 : "=r"(ticket)
+                 : "l"(local + retired), "r"(1u)
+                 : "memory");
+    if (ticket == gridDim.x - 1) {
+      local[retired] = 0;
+      for (int dst = 0; dst < p.world; ++dst) publish(p.control[dst] + finished + p.rank, p.epoch);
+      for (int src = 0; src < p.world; ++src) wait_epoch(local + finished + src, p.epoch);
+    }
+  }
 }
 
 }  // namespace transformer_engine::rtc::fused_moe::l2

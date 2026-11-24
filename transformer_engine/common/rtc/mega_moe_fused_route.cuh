@@ -31,7 +31,7 @@ __device__ inline void stage_inputs(const MegaMoEFusedArgs &p) {
       reinterpret_cast<unsigned long long>(src) % alignof(uint4) == 0) {
     const auto *src_vec = reinterpret_cast<const uint4 *>(src);
     auto *dst_vec = reinterpret_cast<uint4 *>(dst);
-    if (p.x_stride0 == p.hidden) {
+    if (can_read_local_input(p)) {
       // Only stage tokens that the peer needs. Local copy CTAs can read aligned X directly.
       const int warp = int(i) / 32, stride = int(threads) / 32, lane = threadIdx.x % 32;
       int vecs = p.hidden / 8;

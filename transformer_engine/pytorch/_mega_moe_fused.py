@@ -5,9 +5,10 @@
 """Reusable IPC mappings for the SM89 three-kernel BF16 forward (EP <= 8)."""
 
 import torch
-import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm
 import transformer_engine_torch as tex
+
+from ._mega_moe_peer import _collective_allocation
 
 
 def _mapping(group, tensor):
@@ -20,14 +21,13 @@ class FusedWorkspace:
     def __init__(self, group, device):
         # Initialize before rendezvous so a remote rank can safely signal its
         # first epoch as soon as it acquires the mapped addresses.
-        control = symm.empty(1024, dtype=torch.int32, device=device)
+        self.allocation_status = torch.empty(1, dtype=torch.int32, device=device)
+        with _collective_allocation(group, self.allocation_status):
+            control = symm.empty(1024, dtype=torch.int32, device=device)
         control.zero_()
         torch.cuda.current_stream(device).synchronize()
         self.control = _mapping(group, control)
         self.status = tex.MegaMoEFusedStatus(control)
-        # Reserve the last control word so a failed allocation can still
-        # participate in the cold-path collective without allocating a tensor.
-        self.allocation_status = control[-1:]
         self.payload = None
         self.local = None
         self.shape = None
@@ -38,30 +38,13 @@ class FusedWorkspace:
     def _resize(self, group, shape, capacity, device):
         # Keep the old mapping alive until all ranks allocated replacements.
         # A peer that cannot allocate must signal before entering rendezvous.
-        local = payload = error = None
-        try:
+        with _collective_allocation(group, self.allocation_status):
             peer_bytes, local_bytes, flags, flag_bytes = tex.mega_moe_fused_workspace_sizes(
                 capacity, *shape
             )
             local = torch.empty(local_bytes, dtype=torch.uint8, device=device)
             local.narrow(0, flags, flag_bytes).zero_()
             payload = symm.empty(peer_bytes, dtype=torch.uint8, device=device)
-        except RuntimeError as exc:
-            local = payload = None
-            error = exc
-        code = 2 if isinstance(error, torch.OutOfMemoryError) else int(error is not None)
-        self.allocation_status.fill_(code)
-        dist.all_reduce(self.allocation_status, op=dist.ReduceOp.MAX, group=group)
-        failure = self.allocation_status.item()
-        if failure:
-            local = payload = None
-            if error is not None:
-                raise error
-            if failure == 2:
-                raise torch.OutOfMemoryError(
-                    "A peer ran out of memory allocating the MegaMoE workspace"
-                )
-            raise RuntimeError("A peer could not allocate its MegaMoE workspace")
         self.payload = _mapping(group, payload)
         self.capacity, self.local, self.shape = capacity, local, shape
 

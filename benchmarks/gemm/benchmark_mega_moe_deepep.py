@@ -458,7 +458,7 @@ def main():
             route_stats(ids, dist.get_rank(), args.local_experts) for _, ids, _ in cases
         ],
         "local_counts": expected_counts(args.tokens, args.local_experts),
-        "baseline_tile_fc1_fc2": [256, 256, 64, 3],
+        "baseline_tile_fc1_fc2": None if args.automatic_rtc else [256, 256, 64, 3],
         "correctness": [],
     }
     try:
@@ -489,11 +489,12 @@ def main():
                 if name.startswith("nvte_grouped_gemm3_")
             ]
             if len(rtc) != 2 or any(
-                "bf16_bf16_bf16_acc_fp32_LA_RM_LB_CM" not in name or "_tb256x256x64_s3_" not in name
+                "bf16_bf16_bf16_acc_fp32_LA_RM_LB_CM" not in name
+                or (not args.automatic_rtc and "_tb256x256x64_s3_" not in name)
                 for name in rtc
             ):
                 raise AssertionError(
-                    f"expected exactly two NT BF16 RTC GEMMs with forced tile: {rtc}"
+                    f"expected exactly two NT BF16 RTC GEMMs matching the tile policy: {rtc}"
                 )
             fragments = (
                 ("elastic::dispatch_impl", "elastic::combine_impl")
