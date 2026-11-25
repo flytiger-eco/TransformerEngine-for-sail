@@ -113,7 +113,7 @@ def measure(args):
     results, errors = [], []
     env = dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
                NVTE_GG_RTC_CACHE_DIR=str(out.parent / "rtc-cache"))
-    apis = ("ordinary",) if args.arm == "base" else ("ordinary", "grouped_tensor")
+    apis = ("ordinary", "grouped_tensor")
     if args.sweep % 2:
         apis = apis[::-1]
     for index, tag in enumerate(cases, 1):
@@ -145,7 +145,7 @@ def measure(args):
                 print(f"[RTC CI] ERROR: {message}", flush=True)
         results.append(row)
         payload = {
-            "results": results, "errors": errors,
+            "results": results, "errors": errors, "apis": list(apis),
             "case_digest": hashlib.sha256("\n".join(cases).encode()).hexdigest(),
             "settings": {"iters": args.iters, "samples": args.samples, "warmup": args.warmup},
         }
@@ -171,6 +171,7 @@ def compare(cases, measurements, tolerance):
     for index, tag in enumerate(cases):
         sweeps = []
         environment = None
+        base_grouped = []
         for base, head in measurements:
             b, h = base["results"][index], head["results"][index]
             trio = b["ordinary"], h["ordinary"], h["grouped_tensor"]
@@ -181,10 +182,21 @@ def compare(cases, measurements, tolerance):
                 if not all(current) or (environment is not None and environment != current):
                     raise ValueError("base/head/API/sweep 运行环境不一致")
                 environment = current
+            if "grouped_tensor" in b or "grouped_tensor" in base.get("apis", ()):
+                result = b["grouped_tensor"]
+                validate_result(result, "grouped_tensor", tag, settings["samples"])
+                if tuple(result[key] for key in ("device", "device_uuid", "capability", "torch")) != environment:
+                    raise ValueError("基线 GroupedTensor 运行环境不一致")
+                base_grouped.append(result)
             sweeps.append(trio)
+        if base_grouped and len(base_grouped) != len(sweeps):
+            raise ValueError("部分 sweep 缺少基线 GroupedTensor")
 
         row = {"id": index + 1, "tag": tag}
         for metric, suffix in (("median_us", ""), ("e2e_us", "_e2e")):
+            row[f"base_grouped{suffix}_us"] = (
+                statistics.median(result[metric] for result in base_grouped) if base_grouped else None
+            )
             for arm, times in zip(("base", "head", "grouped"), zip(*sweeps)):
                 row[f"{arm}{suffix}_us"] = statistics.median(t[metric] for t in times)
             row[f"ordinary{suffix}_ratio"] = statistics.median(h[metric] / b[metric] for b, h, g in sweeps)
@@ -196,7 +208,7 @@ def compare(cases, measurements, tolerance):
 
 
 def plot_report(gate, output):
-    """绘制三组设备延迟和端到端延迟。"""
+    """绘制两种 API 在 base/head 上的设备延迟和端到端延迟。"""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -218,11 +230,15 @@ def plot_report(gate, output):
         else:
             ids = [row["id"] for row in rows]
             for axis, suffix, label in zip(axes, ("", "_e2e"), ("Device", "End-to-end")):
-                for offset, arm, name in ((-0.26, "base", "Base ordinary"),
-                                          (0, "head", "PR ordinary"),
-                                          (0.26, "grouped", "PR GroupedTensor")):
-                    axis.bar([i + offset for i in ids], [r[f"{arm}{suffix}_us"] for r in rows],
-                             0.26, label=name)
+                series = [("base", "Base ordinary"), ("head", "PR ordinary"),
+                          ("base_grouped", "Base GroupedTensor"), ("grouped", "PR GroupedTensor")]
+                for i, (arm, name) in enumerate(series):
+                    values = [r[f"{arm}{suffix}_us"] for r in rows]
+                    points = [(case + (i - 1.5) * 0.2, value) for case, value in zip(ids, values)
+                              if value is not None]
+                    if points:
+                        x, y = zip(*points)
+                        axis.bar(x, y, 0.2, label=name)
                 axis.set_ylabel(f"{label} latency (μs)")
                 axis.legend()
             for axis in axes:
@@ -273,7 +289,7 @@ def report(args):
         f"比较基线 `{args.base_sha}` 与 PR `{args.head_sha}`，配对轮数为 {args.sweeps}。",
         "",
         "设备时间包含 RTC GEMM 和实际启动的元数据 kernel。端到端时间还包含 Python 提交和批次末尾同步。",
-        "三组使用相同输入和 tile。加速比来自逐轮配对的延迟比，大于 1× 表示加速。",
+        "各组使用相同输入和 tile。加速比来自逐轮配对的延迟比，大于 1× 表示加速。",
         "",
     ]
     if error:
@@ -286,12 +302,14 @@ def report(args):
         ]
         for suffix, title in (("", "设备"), ("_e2e", "端到端")):
             lines += ["", f"**{title}**", "",
-                      "| case | 基线普通 μs | PR 普通 μs | PR GroupedTensor μs | 普通加速比 | 接口额外加速比 |",
-                      "|---|---:|---:|---:|---:|---:|"]
+                      "| case | 基线普通 μs | PR 普通 μs | 基线 GroupedTensor μs | PR GroupedTensor μs | 普通加速比 | 接口额外加速比 |",
+                      "|---|---:|---:|---:|---:|---:|---:|"]
             for row in rows:
+                baseline = row[f"base_grouped{suffix}_us"]
+                baseline_text = "未采集" if baseline is None else f"{baseline:.2f}"
                 lines.append(
                     f"| {row['id']:02d} | {row[f'base{suffix}_us']:.2f} | {row[f'head{suffix}_us']:.2f} | "
-                    f"{row[f'grouped{suffix}_us']:.2f} | {1/row[f'ordinary{suffix}_ratio']:.3f}× | "
+                    f"{baseline_text} | {row[f'grouped{suffix}_us']:.2f} | {1/row[f'ordinary{suffix}_ratio']:.3f}× | "
                     f"{1/row[f'grouped{suffix}_ratio']:.3f}× |"
                 )
         lines += [

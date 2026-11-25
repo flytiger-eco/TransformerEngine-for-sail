@@ -692,6 +692,7 @@ def test_grouped_speedup_compares_apis_within_each_sweep():
         head["results"][0]["grouped_tensor"] = api_payload(CASES[0], grouped_time, "grouped_tensor")
         pairs.append((base, head))
     row = GATE.compare(CASES, pairs, 0.05)[0]
+    assert row["base_grouped_us"] is None  # Historical three-series report
     assert row["head_us"] == 250 and row["grouped_us"] == 300
     assert row["grouped_e2e_ratio"] == 1.5
     assert row["regression"]
@@ -949,6 +950,34 @@ def test_grouped_measurement_required(failure):
     else:
         row["grouped_tensor"]["e2e_samples_us"] = []
     with pytest.raises((ValueError, KeyError)):
+        GATE.compare(CASES, [(base, head)], 0.05)
+
+
+def test_base_grouped_series_uses_base_api_samples(tmp_path, monkeypatch):
+    from matplotlib.figure import Figure
+
+    base, head = [payload([t] * len(CASES)) for t in (100, 95)]
+    base["results"][0]["grouped_tensor"] = api_payload(CASES[0], 123, "grouped_tensor")
+    row = GATE.compare(CASES, [(base, head)], 0.05)[0]
+    assert row["base_grouped_us"] == 123
+    assert row["base_grouped_e2e_us"] == base["results"][0]["grouped_tensor"]["e2e_us"]
+    assert row["grouped_us"] == 95
+
+    def check_bars(figure, *args, **kwargs):
+        for axis, suffix in zip(figure.axes, ("", "_e2e")):
+            bars = {series.get_label(): series[0].get_height() for series in axis.containers}
+            assert bars == {"Base ordinary": row[f"base{suffix}_us"],
+                            "PR ordinary": row[f"head{suffix}_us"],
+                            "Base GroupedTensor": row[f"base_grouped{suffix}_us"],
+                            "PR GroupedTensor": row[f"grouped{suffix}_us"]}
+
+    monkeypatch.setattr(Figure, "savefig", check_bars)
+    GATE.plot_report({"rows": [row], "error": None, "verdict": "PASS", "sweeps": 1,
+                      "base_sha": "base", "head_sha": "head"}, tmp_path / "gate.png")
+
+    base["apis"] = ["ordinary", "grouped_tensor"]
+    del base["results"][0]["grouped_tensor"]
+    with pytest.raises(KeyError):
         GATE.compare(CASES, [(base, head)], 0.05)
 
 
