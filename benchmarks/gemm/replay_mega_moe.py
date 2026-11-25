@@ -54,9 +54,16 @@ def main():
         action="store_true",
         help="require the EP8 saved-activation backend",
     )
+    parser.add_argument("--backend", choices=("megamoe", "deepep"), default="megamoe")
     parser.add_argument("--seed", type=int, default=73)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.backend == "deepep":
+        os.environ.update(
+            NVTE_USE_CUTLASS_GROUPED_GEMM="1",
+            NVTE_USE_CUTLASS_GROUPED_GEMM_RTC="1",
+            NVTE_FORCE_RTC_NO_FALLBACK="1",
+        )
     if args.warmup < 0 or args.iters < 1:
         parser.error("expected warmup >= 0 and iters >= 1")
     match = re.fullmatch(r"te_mega_moe:v1:([a-f0-9]{32})", args.capture)
@@ -124,7 +131,7 @@ def main():
     if len(set(modes)) != 1:
         raise ValueError("only some EP ranks have differentiable inputs for backward")
 
-    def forward():
+    def megamoe_forward():
         with torch.set_grad_enabled(grad_enabled):
             return op(x, ids, probs, weights[:e], weights[e:], ep_group=group)
 
@@ -133,8 +140,40 @@ def main():
 
     # The reference exchanges actual token rows with all-to-all, bypassing peer kernels.
     with patch.object(peer, "_peer_supported", return_value=False):
-        ref = forward()
+        ref = megamoe_forward()
         expected = (ref.detach(), *backward(ref))
+    forward = megamoe_forward
+    baseline = None
+    if args.backend == "deepep":
+        from benchmark_mega_moe_deepep import DeepEPLegacyForward
+        from benchmark_mega_moe_ep8_training import DeepTraining
+
+        if x.dtype != torch.bfloat16 or group is None:
+            raise ValueError("DeepEP replay requires distributed BF16 inputs")
+        baseline = DeepEPLegacyForward(
+            group, x.size(0), x.size(1), e, None, weights[:e], weights[e:], 0
+        )
+
+        def deepep_forward():
+            with torch.set_grad_enabled(grad_enabled):
+                if x.size(0) == 0:
+                    # DeepEP interprets null data pointers as an absent optional input.
+                    # An all-dropped row keeps zero dispatched routes on this source.
+                    pad = torch.nn.functional.pad
+                    result = DeepTraining.apply(
+                        pad(x, (0, 0, 0, 1)),
+                        pad(ids, (0, 0, 0, 1), value=-1),
+                        pad(probs, (0, 0, 0, 1)),
+                        baseline,
+                        *weights,
+                    )
+                    return result[:0]
+                return DeepTraining.apply(
+                    x.contiguous(), ids.contiguous(), probs.contiguous(), baseline, *weights
+                )
+
+        forward = deepep_forward
+
     y = forward()
     backend = type(y.grad_fn).__name__ if y.grad_fn is not None else None
     if args.expect_ep8_training and backend != "_TrainBackward":
@@ -178,6 +217,7 @@ def main():
         result = {
             "tag": tag,
             "world": world,
+            "backend": args.backend,
             "relative_l2": drift,
             "backward": training,
             "autograd_node": backend,
@@ -191,6 +231,8 @@ def main():
         print(json.dumps(result), flush=True)
         if args.output:
             args.output.write_text(json.dumps(result, indent=2) + "\n")
+    if baseline is not None:
+        baseline.buffer.destroy()
     dist.destroy_process_group()
 
 

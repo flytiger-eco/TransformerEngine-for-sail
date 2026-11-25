@@ -420,8 +420,16 @@ and requested gradients against TE's all-to-all transport. Timing JSON reports
 rank-max forward, backward and total CUDA-event samples and medians. The
 reader also accepts previously captured v1 manifests and their original shards.
 
-The 890P gate captures EP2 and EP8 test calls, then runs the same tags against
-merge-base and head wheels in AB/BA order. The checked-in Megatron example has 64 experts, H=3584,
+The 890P gate captures EP2 and EP8 test calls. It runs each BF16 distributed tag
+through merge-base MegaMoE, PR MegaMoE, and DeepEP intranode dispatch/combine with
+the PR wheel's RTC grouped GEMMs. The second sweep reverses the three-way order.
+Use `--backend deepep` on the same replay command to measure DeepEP separately.
+For a source with zero tokens, its DeepEP adapter pads one all-dropped row and
+trims the result. This padding is timed and sends no expert rows.
+The Actions job summary and the artifact's `comparison.md` list forward,
+backward and total latency in milliseconds. The artifact also includes a total-step
+latency chart in `comparison.png`. DeepEP / PR above 1 means PR
+MegaMoE is faster. The 5% regression check compares MegaMoE head with base. The checked-in Megatron example has 64 experts, H=3584,
 I=3072 and eight source tags. To add a model case, place its `.tags` under
 `qa/L0_pytorch_mega_moe_rtc/tags/` or `MEGA_MOE_CI_CAPTURES` (default
 `/mnt/wl_nas/te-ci/mega-moe/captures`) and add a line with EP size, filename

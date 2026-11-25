@@ -9,6 +9,7 @@ on:
       - 'transformer_engine/common/gemm/rtc/**'
       - 'benchmarks/gemm/replay_mega_moe.py'
       - 'benchmarks/gemm/mega_moe_tags.py'
+      - 'benchmarks/gemm/benchmark_mega_moe*.py'
       - 'qa/L0_pytorch_mega_moe_rtc/**'
       - 'qa/L0_pytorch_grouped_gemm_rtc/test.sh'
       - '.github/scripts/rtc_grouped_gemm_gate.py'
@@ -69,6 +70,7 @@ jobs:
             curl -fsSL https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz -o /tmp/pccl.tar.gz
             tar xzf /tmp/pccl.tar.gz -C /usr/local
             set +u; source /usr/local/pccl/envsetup.sh; set -u
+            export EP_PCCL_ROOT_DIR=/usr/local/pccl
             export CPATH="${NCCL_HOME}/include${CPATH:+:$CPATH}"
             src=$(mktemp -d)
             git -C "$src" init -q
@@ -83,6 +85,11 @@ jobs:
             export MEGA_MOE_CI_POLICY='${{ steps.policy.outputs.value }}'
             bash "$src/qa/L0_pytorch_grouped_gemm_rtc/test.sh" "$src" "$base" "$out" \
                 /mnt/wl_nas/te-ci/rtc-grouped-gemm/wheels mega-moe 2>&1 | tee "$out/campaign.log"
+      - name: Summarize replay timings
+        if: always()
+        run: |
+          report="/wl_nas/${{ env.RUN_DIR }}/comparison.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

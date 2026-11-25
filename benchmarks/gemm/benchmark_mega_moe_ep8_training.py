@@ -14,7 +14,7 @@ import os
 import statistics
 
 from benchmark_mega_moe_ep8 import Baseline, routes
-from benchmark_mega_moe_deepep import profile_kernels
+from benchmark_mega_moe_deepep import DeepEPLegacyForward, profile_kernels
 
 import torch
 import torch.distributed as dist
@@ -28,12 +28,12 @@ from deep_ep import topk_idx_t
 
 
 @triton.jit
-def _merge(part, reverse, dst, H: tl.constexpr, B: tl.constexpr):
+def _merge(part, reverse, dst, H: tl.constexpr, B: tl.constexpr, K: tl.constexpr = 8):
     row = tl.program_id(0)
     col = tl.program_id(1) * B + tl.arange(0, B)
     acc = tl.full((B,), 0, tl.float32)
-    for k in tl.static_range(8):
-        src = tl.load(reverse + row * 8 + k)
+    for k in tl.static_range(K):
+        src = tl.load(reverse + row * K + k)
         acc += tl.load(part + src.to(tl.int64) * H + col, (src >= 0) & (col < H), 0).to(tl.float32)
     tl.store(dst + row.to(tl.int64) * H + col, acc, col < H)
 
@@ -43,56 +43,88 @@ class DeepTraining(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, ids, probs, base, *weights):
-        w1, w2 = weights[:8], weights[8:]
-        rx, ri, rp, handle, _ = base.buffer.dispatch(
-            x,
-            topk_idx=ids.to(topk_idx_t),
-            topk_weights=probs,
-            num_experts=64,
-            num_sms=39,
-            expert_alignment=1,
-            do_cpu_sync=True,
-            do_expand=False,
-            do_handle_copy=False,
-        )
-        counts = handle.num_recv_tokens_per_expert_list
+        e, k = base.experts, ids.size(1)
+        w1, w2 = weights[:e], weights[e:]
+        idx = ids.to(topk_idx_t)
+        experts = dist.get_world_size() * e
+        legacy = isinstance(base, DeepEPLegacyForward)
+        if legacy:
+            per_rank, per_rdma, per_expert, in_rank, _ = base.buffer.get_dispatch_layout(
+                idx, experts
+            )
+            rx, ri, rp, counts, handle, _ = base.buffer.dispatch(
+                x,
+                topk_idx=idx,
+                topk_weights=probs,
+                num_tokens_per_rank=per_rank,
+                num_tokens_per_rdma_rank=per_rdma,
+                num_tokens_per_expert=per_expert,
+                is_token_in_rank=in_rank,
+            )
+        else:
+            rx, ri, rp, handle, _ = base.buffer.dispatch(
+                x,
+                topk_idx=idx,
+                topk_weights=probs,
+                num_experts=experts,
+                num_sms=base.num_sms,
+                expert_alignment=1,
+                do_cpu_sync=True,
+                do_expand=False,
+                do_handle_copy=False,
+            )
+            counts = handle.num_recv_tokens_per_expert_list
         # Full training uses the deduplicated receive layout so the cached handle
         # can return both input gradients and FP32 router-weight gradients.
         flat = ri.flatten()
         slot = (flat >= 0).nonzero(as_tuple=True)[0]
         slot = slot[flat[slot].argsort(stable=True)]
-        rows = slot // 8
+        rows = slot // k
         reverse = torch.full_like(flat, -1, dtype=torch.int32)
         reverse[slot] = torch.arange(slot.numel(), device=x.device, dtype=torch.int32)
         owner_x = rx[rows]
         p = rp.flatten()[slot]
         z = base.linear(owner_x, w1, counts)
-        y = x.new_empty((len(rows), 3072))
+        y = x.new_empty((len(rows), w2[0].size(1)))
         raw = p.new_empty(y.shape)
         _save_activation(z, p, raw, y)
         partial = base.linear(y, w2, counts)
         reduced = torch.empty_like(rx)
-        _merge[(len(rx), 14)](partial, reverse, reduced, 3584, 256)
+        if len(rx):
+            _merge[(len(rx), triton.cdiv(x.size(1), 256))](
+                partial, reverse, reduced, x.size(1), 256, k
+            )
         out, _, _ = base.buffer.combine(reduced, handle)
         ctx.save_for_backward(owner_x, z, raw, y, p, rows, slot, reverse, *weights)
         ctx.base, ctx.handle = base, handle
+        ctx.k, ctx.counts = k, counts
         return out
 
     @staticmethod
     def backward(ctx, dy):
         x, z, raw, y, p, rows, slot, reverse, *weights = ctx.saved_tensors
-        w1, w2 = weights[:8], weights[8:]
         base, handle = ctx.base, ctx.handle
-        recv, _, _, _, _ = base.buffer.dispatch(dy.contiguous(), handle=handle, num_sms=39)
+        w1, w2 = weights[: base.experts], weights[base.experts :]
+        if isinstance(base, DeepEPLegacyForward):
+            recv, *_ = base.buffer.dispatch(dy.contiguous(), handle=handle)
+            offsets = x.new_tensor([0, *ctx.counts], dtype=torch.int32).cumsum(0, dtype=torch.int32)
+        else:
+            recv, *_ = base.buffer.dispatch(dy.contiguous(), handle=handle, num_sms=base.num_sms)
+            offsets = torch.nn.functional.pad(handle.psum_num_recv_tokens_per_expert, (1, 0)).int()
         owner_dy = recv[rows]
-        offsets = torch.nn.functional.pad(handle.psum_num_recv_tokens_per_expert, (1, 0)).int()
         dh = tex.mega_moe_dgrad(owner_dy, offsets, w2)
         dz, dp = torch.empty_like(z), torch.empty_like(p)
-        _activation_grad[(len(rows),)](dh, z, p, raw, dz, dp, 3072, 4096)
+        if len(rows):
+            _activation_grad[(len(rows),)](
+                dh, z, p, raw, dz, dp, y.size(1), triton.next_power_of_2(y.size(1))
+            )
         partial = tex.mega_moe_dgrad(dz, offsets, w1)
         reduced = torch.empty_like(recv)
-        _merge[(len(recv), 14)](partial, reverse, reduced, 3584, 256)
-        rdp = dp.new_zeros((len(recv), 8))
+        if len(recv):
+            _merge[(len(recv), triton.cdiv(dy.size(1), 256))](
+                partial, reverse, reduced, dy.size(1), 256, ctx.k
+            )
+        rdp = dp.new_zeros((len(recv), ctx.k))
         rdp.flatten()[slot] = dp
         dx, dp_src, _ = base.buffer.combine(reduced, handle, topk_weights=rdp)
         dw1 = [torch.empty_like(w) for w in w1]
@@ -204,7 +236,7 @@ class DeepExpandedTraining(torch.autograd.Function):
         rdp = dp.new_empty((recv_count, k))
         if recv_count:
             _merge[(recv_count, triton.cdiv(dy.size(1), 256))](
-                partial, reverse, reduced, dy.size(1), 256
+                partial, reverse, reduced, dy.size(1), 256, k
             )
             _pack_dp[(triton.cdiv(reverse.numel(), 256),)](dp, reverse, rdp, reverse.numel(), 256)
         dx, dp_src, _ = base.buffer.combine(reduced, handle, topk_weights=rdp)
