@@ -207,6 +207,9 @@ build_arm head "$SOURCE" "$HEAD_SHA" "${WHEEL_REUSE:+$WHEEL_REUSE/build-$HEAD_SH
 
 # 固定从 head 取同一份 harness/case；不能用 base 自己的旧测试替代。
 cd "$SCRATCH"
+if [[ "${5:-grouped-gemm}" == "mega-moe" ]]; then
+    exec bash "$SOURCE/qa/L0_pytorch_mega_moe_rtc/test.sh" "$SOURCE" "$SCRATCH" "$OUT"
+fi
 for sweep in 0 1 2 3; do
     if (( sweep % 2 == 0 )); then
         arms=(base head)

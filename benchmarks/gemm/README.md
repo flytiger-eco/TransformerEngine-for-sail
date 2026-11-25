@@ -369,3 +369,70 @@ PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" OMP_NUM_THREADS=1 \
   python -m torch.distributed.run --standalone --nproc-per-node=8 \
   benchmarks/gemm/benchmark_mega_moe_ep8_training.py --include-recompute --profile
 ```
+
+## Capturing and replaying a distributed MegaMoE call
+
+Enable `NVTE_MOE_CAPTURE_TAG=routes` for eager capture. Each source rank emits
+one self-contained line per call, both to stdout and as its forward NVTX range.
+The readable prefix includes EP rank, group size, local token count, top-k,
+local expert count, dtype and FC1/FC2 input/output widths. For example,
+`[TE] --format=MegaMoE,v:2,call:demo/0/0/0.1/3,rank:1,ep:2,dtype:torch.bfloat16,t:2048,topk:2,groups:8,fc1:3584x6144,fc2:3072x3584,...`
+illustrates the prefix; replay needs the complete lines.
+
+The readable `m_src` vector counts valid slots from this source to each global expert.
+Summing these vectors gives the logical M of each expert GEMM before tile
+padding; replay includes this sum as `rows_per_global_expert`.
+
+The payload encodes every global expert ID in source-token and top-k slot order,
+including duplicate experts, -1 slots and empty source ranks. IDs use 1, 2 or 4
+bytes depending on expert count, then zlib and URL-safe base64. In `routes`
+mode, a bit mask preserves zero routing weights; replay sets each other weight
+to 1/top-k. Choose `NVTE_MOE_CAPTURE_TAG=exact` to include lossless FP32
+routing weights. Both modes preserve tensor shapes, strides, alignment and
+gradient requirements, and regenerate hidden states, parameters and upstream
+gradients from the replay seed.
+
+Use one run label across workers, unique for each capture session. The call key
+combines this label (default: torchrun rendezvous ID), restart count, process
+group name, ordered global ranks and a group-local invocation counter. Enable
+capture at the same call boundary on participating ranks and retain their call
+order. Capture copies local routing data to CPU and adds no distributed
+collectives. For timing runs, unset the capture variable. Compiled and fake
+tensor execution bypass collection.
+
+Full per-token strings can exceed a profiler UI's display limit or a shared
+pipe's atomic write size. Use separate worker stdout logs, e.g.:
+
+```bash
+export NVTE_MOE_CAPTURE_TAG=routes NVTE_MOE_CAPTURE_RUN=demo
+torchrun --standalone --nproc-per-node=8 --log-dir ./run-logs --redirects 3 train.py
+find ./run-logs -name stdout.log -exec grep -hF '[TE] --format=MegaMoE,' {} + > run.tags
+cut -d, -f3 run.tags | sort -u
+unset NVTE_MOE_CAPTURE_TAG
+# Substitute a call value listed above. Omit --call for a single invocation.
+torchrun --standalone --nproc-per-node=8 benchmarks/gemm/replay_mega_moe.py \
+  run.tags --call 'demo/0/0/0.1.2.3.4.5.6.7/0' --output step.json
+```
+
+Collect the stdout files from every host for a multi-node group. Replay maps
+the EP ranks onto the new workers, checks completeness, and compares outputs
+and requested gradients against TE's all-to-all transport. Timing JSON reports
+rank-max forward, backward and total CUDA-event samples and medians. The
+reader also accepts previously captured v1 manifests and their original shards.
+
+The 890P gate captures EP2 and EP8 test calls. It runs each BF16 distributed tag
+through merge-base MegaMoE, PR MegaMoE, and DeepEP intranode dispatch/combine with
+the PR wheel's RTC grouped GEMMs. The second sweep reverses the three-way order.
+Use `--backend deepep` on the same replay command to measure DeepEP separately.
+For a source with zero tokens, its DeepEP adapter pads one all-dropped row and
+trims the result. This padding is timed and sends no expert rows.
+The Actions job summary and the artifact's `comparison.md` list forward,
+backward and total latency in milliseconds. The artifact also includes a total-step
+latency chart in `comparison.png`. DeepEP / PR above 1 means PR
+MegaMoE is faster. The 5% regression check compares MegaMoE head with base. The checked-in Megatron example has 64 experts, H=3584,
+I=3072 and eight source tags. To add a model case, place its `.tags` under
+`qa/L0_pytorch_mega_moe_rtc/tags/` or `MEGA_MOE_CI_CAPTURES` (default
+`/mnt/wl_nas/te-ci/mega-moe/captures`) and add a line with EP size, filename
+and call key to `qa/L0_pytorch_mega_moe_rtc/cases.txt`. Numerical failures
+block the job. Manual and perf/refactor runs also enforce a 5% total latency
+regression threshold.

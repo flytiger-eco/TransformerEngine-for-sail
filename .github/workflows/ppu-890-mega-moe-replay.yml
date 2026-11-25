@@ -1,0 +1,177 @@
+name: ppu-890-mega-moe-replay
+on:
+  pull_request:
+    branches: [v2.18-SAIL]
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
+    paths:
+      - 'transformer_engine/**/mega_moe*'
+      - 'transformer_engine/**/_mega_moe*'
+      - 'transformer_engine/common/gemm/rtc/**'
+      - 'benchmarks/gemm/replay_mega_moe.py'
+      - 'benchmarks/gemm/mega_moe_tags.py'
+      - 'benchmarks/gemm/benchmark_mega_moe*.py'
+      - 'qa/L0_pytorch_mega_moe_rtc/**'
+      - 'qa/L0_pytorch_grouped_gemm_rtc/test.sh'
+      - '.github/scripts/rtc_grouped_gemm_gate.py'
+      - '.github/workflows/ppu-890-mega-moe-replay.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: mega-moe-replay-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  replay:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: k8s-runner-group-cpu-flytiger
+    outputs:
+      artifact_id: ${{ steps.archive.outputs.artifact-id }}
+    timeout-minutes: 300
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      BASE: ${{ github.event.pull_request.base.sha || 'v2.18-SAIL' }}
+      RUN_DIR: te-ci/mega-moe/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select regression policy
+        id: policy
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, runpy, subprocess
+          choose = runpy.run_path(".github/scripts/rtc_grouped_gemm_gate.py")["policy_for"]
+          base = os.environ["BASE"]
+          if base == "v2.18-SAIL":
+              base = "origin/" + base
+          subjects = subprocess.check_output(["git", "log", "--format=%s", base + "..HEAD"], text=True)
+          value = choose(subjects + "\n" + os.environ["PR_TITLE"], json.loads(os.environ["PR_LABELS"] or "[]") or [],
+                         os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              print("value=" + value, file=out)
+          PYTHON
+      - uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.11.0-ubuntu24.04-cuda13.0-py312-20261001
+          namespace: ppu-sched
+          node_selector: board-type=ZW-M890P
+          host_volumes: /nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas
+          nnodes: 0
+          nproc_per_node: 8
+          timeout_minutes: 270
+          command: |
+            set -euo pipefail
+            set +u; source /usr/local/PPU_SDK/envsetup.sh; set -u
+            curl -fsSL https://pkg.flytiger-eco.com/artifactory/generic-local/NCCL/v2.2.0/nccl-2.27.3-v13_ubuntu2404_sdk-v2.2.0.tar.gz -o /tmp/pccl.tar.gz
+            tar xzf /tmp/pccl.tar.gz -C /usr/local
+            set +u; source /usr/local/pccl/envsetup.sh; set -u
+            export EP_PCCL_ROOT_DIR=/usr/local/pccl
+            export CPATH="${NCCL_HOME}/include${CPATH:+:$CPATH}"
+            src=$(mktemp -d)
+            git -C "$src" init -q
+            git -C "$src" remote add origin 'https://github.com/${{ github.repository }}.git'
+            git -C "$src" fetch origin '${{ env.BASE }}'
+            base=$(git -C "$src" rev-parse FETCH_HEAD)
+            git -C "$src" fetch origin '${{ env.HEAD_SHA }}'
+            git -C "$src" checkout --detach FETCH_HEAD
+            base=$(git -C "$src" merge-base HEAD "$base")
+            out='/mnt/wl_nas/${{ env.RUN_DIR }}'
+            mkdir -p "$out"
+            export MEGA_MOE_CI_POLICY='${{ steps.policy.outputs.value }}'
+            bash "$src/qa/L0_pytorch_grouped_gemm_rtc/test.sh" "$src" "$base" "$out" \
+                /mnt/wl_nas/te-ci/rtc-grouped-gemm/wheels mega-moe 2>&1 | tee "$out/campaign.log"
+      - name: Summarize replay timings
+        if: always()
+        run: |
+          report="/wl_nas/${{ env.RUN_DIR }}/comparison.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+      - id: archive
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mega-moe-replay-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /wl_nas/${{ env.RUN_DIR }}/
+          if-no-files-found: error
+
+  publish:
+    name: Publish MegaMoE replay comparison
+    needs: replay
+    if: always() && !cancelled() && needs.replay.outputs.artifact_id != '' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: k8s-runner-group-cpu-flytiger
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.replay.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/mega-moe-report
+      - uses: actions/github-script@v7
+        env:
+          REPORT_DIR: ${{ runner.temp }}/mega-moe-report
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPLAY_RESULT: ${{ needs.replay.result }}
+        with:
+          script: |
+            const fs = require('fs');
+            const dir = process.env.REPORT_DIR;
+            const pr = Number(process.env.PR_NUMBER);
+            const repo = context.repo;
+            const root = `${context.serverUrl}/${repo.owner}/${repo.repo}`;
+            const run = `${root}/actions/runs/${context.runId}/attempts/${process.env.GITHUB_RUN_ATTEMPT}`;
+            const marker = '<!-- te-mega-moe-replay:ZW-M890P -->';
+            const lines = [marker, '### MegaMoE replay · 890P', '',
+              `Commit \`${process.env.HEAD_SHA.slice(0, 7)}\` · [CI ${process.env.REPLAY_RESULT}](${run})`, ''];
+            if (fs.existsSync(dir + '/comparison.md')) {
+              const table = fs.readFileSync(dir + '/comparison.md', 'utf8');
+              if (fs.existsSync(dir + '/comparison.png')) {
+                const png = fs.readFileSync(dir + '/comparison.png');
+                if (png.length > 5 * 1024 * 1024 || png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') {
+                  throw new Error('Invalid comparison.png');
+                }
+                const path = `mega-moe/pr-${pr}/run-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}/comparison.png`;
+                for (let attempt = 0; ; attempt++) {
+                  try {
+                    const {data} = await github.rest.repos.createOrUpdateFileContents({
+                      ...repo, path, branch: 'ci-reports', message: `MegaMoE replay for PR #${pr}`,
+                      content: png.toString('base64')
+                    });
+                    lines.push(`![MegaMoE and DeepEP total step latency](${root}/raw/${data.commit.sha}/${path})`, '');
+                    break;
+                  } catch (error) {
+                    if (error.status === 409 && attempt < 4) continue;
+                    core.warning(`Image publication failed: ${error.message}`);
+                    lines.push(`[Download comparison.png from the run artifacts](${run})`, '');
+                    break;
+                  }
+                }
+              }
+              lines.push(table.length <= 59000 ? table : 'Full comparison table is in the CI artifact.');
+            } else {
+              core.notice('No comparison table was produced. Keeping the previous PR report.');
+              return;
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...repo, issue_number: pr, per_page: 100
+            });
+            const previous = comments.find(c => c.body?.startsWith(marker) &&
+              ['github-actions[bot]', process.env.PR_AUTHOR].includes(c.user.login));
+            const body = lines.join('\n');
+            if (previous) {
+              await github.rest.issues.updateComment({...repo, comment_id: previous.id, body});
+            } else {
+              await github.rest.issues.createComment({...repo, issue_number: pr, body});
+            }
