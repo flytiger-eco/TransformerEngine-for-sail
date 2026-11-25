@@ -4,7 +4,9 @@
 
 """Routed BF16 and FP16 SwiGLU training on the PPU RTC backend."""
 
+from functools import lru_cache
 import os
+import sys
 from typing import Optional, Sequence
 
 import torch
@@ -13,6 +15,18 @@ from torch._subclasses.fake_tensor import is_fake
 import transformer_engine_torch as tex
 
 from ._mega_moe_routing import dispatch, redispatch, return_routes
+
+
+@lru_cache(maxsize=1)
+def _show_replay_hint():
+    print(
+        "[TE] MegaMoE UT capture and replay guide (NVTE_MOE_CAPTURE_TAG=routes, "
+        "one stdout log per EP rank): "
+        "https://github.com/flytiger-eco/TransformerEngine-for-sail/blob/75e03bc/"
+        "benchmarks/gemm/README.md#capturing-and-replaying-a-distributed-megamoe-call",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _pack(x, ids, probs, experts, group):
@@ -35,6 +49,8 @@ def _restore(values, order, plan):
 def _rtc_forward(
     x: Tensor, ids: Tensor, probs: Tensor, fc1: list[Tensor], fc2: list[Tensor], ep_group: str
 ) -> Tensor:
+    if x.is_cuda:
+        _show_replay_hint()
     if ep_group and x.is_cuda:
         from ._mega_moe_peer import peer_forward
 
@@ -112,19 +128,23 @@ _fp16_forward = _register_ops("fp16")
 
 
 def _mega_moe(x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group, dtype, forward):
-    if (
-        not torch.compiler.is_compiling()
-        and (mode := os.getenv("NVTE_MOE_CAPTURE_TAG"))
-        and x.is_cuda
-        and not is_fake(x)
-    ):
-        from ._mega_moe_capture import capture
+    if not torch.compiler.is_compiling() and x.is_cuda and not is_fake(x):
+        _show_replay_hint()
+        if mode := os.getenv("NVTE_MOE_CAPTURE_TAG"):
+            from ._mega_moe_capture import capture
 
-        tag = capture(mode, x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group)
-        with torch.cuda.nvtx.range(tag):
-            return _run_mega_moe(
-                x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group, dtype, forward
-            )
+            tag = capture(mode, x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group)
+            with torch.cuda.nvtx.range(tag):
+                return _run_mega_moe(
+                    x,
+                    expert_ids,
+                    routing_weights,
+                    fc1_weights,
+                    fc2_weights,
+                    ep_group,
+                    dtype,
+                    forward,
+                )
     return _run_mega_moe(
         x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group, dtype, forward
     )

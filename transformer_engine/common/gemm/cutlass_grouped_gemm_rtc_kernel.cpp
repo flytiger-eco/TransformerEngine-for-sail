@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -327,6 +328,13 @@ const CompiledKernel& get_or_compile(int device, const KernelConfig& kernel, con
   static std::mutex compile_mutex;
   std::lock_guard<std::mutex> compiling(compile_mutex);
   if (const auto* cached = lookup()) return *cached;
+
+  static std::once_flag replay_hint;
+  std::call_once(replay_hint, [] {
+    std::fputs("[TE] RTC GroupGEMM UT capture and replay guide (PPU_LIB_SHOW_PARAMS=1): "
+               "https://github.com/flytiger-eco/TransformerEngine-for-sail/blob/75e03bc/"
+               "benchmarks/gemm/README.md#4-collection-and-extraction\n", stderr);
+  });
 
   const auto symbol = kernel_symbol(kernel, tile);
   static const bool line_info = getenv<bool>("NVTE_GG_RTC_LINEINFO", false);
