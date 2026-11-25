@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from mega_moe_tags import read_tags
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch import _mega_moe_peer as peer
 
@@ -41,7 +42,8 @@ def restore(layout, device, values=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("capture", help="manifest.json or te_mega_moe:v1:<id>")
+    parser.add_argument("capture", help="rank tag log, legacy manifest.json or v1 ID")
+    parser.add_argument("--call", help="invocation to replay when a log contains multiple calls")
     parser.add_argument(
         "--directory", type=Path, default=Path("."), help="capture root for NVTX tags"
     )
@@ -59,31 +61,35 @@ def main():
         parser.error("expected warmup >= 0 and iters >= 1")
     match = re.fullmatch(r"te_mega_moe:v1:([a-f0-9]{32})", args.capture)
     path = args.directory / match[1] / "manifest.json" if match else Path(args.capture)
-    manifest = json.loads(path.read_text())
-    tag = manifest["tag"]
-    ranks = manifest["global_ranks"]
-    if (
-        manifest["version"] != 1
-        or (match and args.capture != tag)
-        or len(ranks) != int(os.environ.get("WORLD_SIZE", 1))
-    ):
-        raise ValueError("capture version, tag or torchrun world size mismatch")
-    os.environ.pop("NVTE_MOE_CAPTURE_DIR", None)
+    legacy = match or path.name == "manifest.json"
+    world = int(os.environ.get("WORLD_SIZE", 1))
+    os.environ.pop("NVTE_MOE_CAPTURE_TAG", None)
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
     torch.cuda.set_device(device)
     dist.init_process_group("nccl", device_id=device)
-    group = None if manifest["local"] else dist.group.WORLD
     rank = dist.get_rank()
     torch.manual_seed(args.seed + rank)
     error = None
     try:
-        shard = torch.load(path.parent / f"rank-{rank}.pt", weights_only=True, map_location="cpu")
-        if (
-            shard["rank"] != rank
-            or shard["global_rank"] != ranks[rank]
-            or tag != "te_mega_moe:v1:" + shard["id"]
-        ):
-            raise ValueError("shard does not belong to this invocation/rank")
+        if legacy:
+            manifest = json.loads(path.read_text())
+            tag = manifest["tag"]
+            ranks = manifest["global_ranks"]
+            local = manifest["local"]
+            if manifest["version"] != 1 or (match and args.capture != tag) or len(ranks) != world:
+                raise ValueError("capture version, tag or torchrun world size mismatch")
+            shard = torch.load(
+                path.parent / f"rank-{rank}.pt", weights_only=True, map_location="cpu"
+            )
+            if (
+                shard["rank"] != rank
+                or shard["global_rank"] != ranks[rank]
+                or tag != "te_mega_moe:v1:" + shard["id"]
+            ):
+                raise ValueError("shard does not belong to this invocation/rank")
+        else:
+            tag, local, shard = read_tags(path, args.call, world, rank)
+        group = None if local else dist.group.WORLD
         e = shard["experts"]
         if len(shard["layouts"]) != 3 + 2 * e:
             raise ValueError("expert layout count mismatch")
@@ -98,12 +104,12 @@ def main():
         ):
             raise ValueError("restored source slots differ from captured routing data")
         for key, value in shard.get("settings", {}).items():
-            if not key.startswith("NVTE_MOE_") or key == "NVTE_MOE_CAPTURE_DIR":
+            if not key.startswith("NVTE_MOE_") or key.startswith("NVTE_MOE_CAPTURE_"):
                 raise ValueError(f"invalid capture setting: {key}")
             os.environ[key] = value
     except Exception as exc:
         error = f"rank {rank}: {exc}"
-    errors = [None] * len(ranks)
+    errors = [None] * world
     dist.all_gather_object(errors, error)
     if any(errors):
         raise ValueError(f"incomplete or invalid MegaMoE capture: {errors}")
@@ -113,7 +119,7 @@ def main():
     grad_enabled = shard["grad_enabled"]
 
     training = grad_enabled and bool(params)
-    modes = [None] * len(ranks)
+    modes = [None] * world
     dist.all_gather_object(modes, training)
     if len(set(modes)) != 1:
         raise ValueError("only some EP ranks have differentiable inputs for backward")
@@ -171,7 +177,7 @@ def main():
     if rank == 0:
         result = {
             "tag": tag,
-            "world": len(ranks),
+            "world": world,
             "relative_l2": drift,
             "backward": training,
             "autograd_node": backend,
@@ -180,6 +186,8 @@ def main():
                 zip(("forward", "backward", "total"), map(statistics.median, zip(*samples)))
             ),
         }
+        if "expert_rows" in shard:
+            result["rows_per_global_expert"] = shard["expert_rows"]
         print(json.dumps(result), flush=True)
         if args.output:
             args.output.write_text(json.dumps(result, indent=2) + "\n")

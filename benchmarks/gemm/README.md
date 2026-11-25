@@ -372,47 +372,59 @@ PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" OMP_NUM_THREADS=1 \
 
 ## Capturing and replaying a distributed MegaMoE call
 
-Set `NVTE_MOE_CAPTURE_DIR` to the **same shared directory on every participating
-EP rank** before starting an eager BF16 or FP16 run. Each call to the public
-MegaMoE API emits one forward NVTX range named `te_mega_moe:v1:<id>` per rank.
-All ranks in that invocation share the ID. Capture synchronizes devices and
-writes files, so collect routes separately from performance measurements.
-Compiled and fake-tensor execution bypass collection.
+Enable `NVTE_MOE_CAPTURE_TAG=routes` for eager capture. Each source rank emits
+one self-contained line per call, both to stdout and as its forward NVTX range.
+The readable prefix includes EP rank, group size, local token count, top-k,
+local expert count, dtype and FC1/FC2 input/output widths. For example,
+`[TE] --format=MegaMoE,v:2,call:demo/0/0/0.1/3,rank:1,ep:2,dtype:torch.bfloat16,t:2048,topk:2,groups:8,fc1:3584x6144,fc2:3072x3584,...`
+illustrates the prefix; replay needs the complete lines.
 
-Under `<capture-dir>/<id>/`, `manifest.json` lists global ranks in EP order.
-Each `rank-<ep-rank>.pt` stores the original int32 expert IDs and FP32 routing
-weights as **[source token, top-k slot]**, including duplicate experts, skipped
-slots (-1), legitimate zero probabilities and empty source ranks. Keep the
-whole directory with the profiler trace. The manifest is published after all
-shards have been written. A manifest path also works without a profiler.
+The readable `m_src` vector counts valid slots from this source to each global expert.
+Summing these vectors gives the logical M of each expert GEMM before tile
+padding; replay includes this sum as `rows_per_global_expert`.
 
-Run from an environment containing the TE build to benchmark, using one
-process per captured EP rank (use one process for a local call):
+The payload encodes every global expert ID in source-token and top-k slot order,
+including duplicate experts, -1 slots and empty source ranks. IDs use 1, 2 or 4
+bytes depending on expert count, then zlib and URL-safe base64. In `routes`
+mode, a bit mask preserves zero routing weights; replay sets each other weight
+to 1/top-k. Choose `NVTE_MOE_CAPTURE_TAG=exact` to include lossless FP32
+routing weights. Both modes preserve tensor shapes, strides, alignment and
+gradient requirements, and regenerate hidden states, parameters and upstream
+gradients from the replay seed.
+
+Use one run label across workers, unique for each capture session. The call key
+combines this label (default: torchrun rendezvous ID), restart count, process
+group name, ordered global ranks and a group-local invocation counter. Enable
+capture at the same call boundary on participating ranks and retain their call
+order. Capture copies local routing data to CPU and adds no distributed
+collectives. For timing runs, unset the capture variable. Compiled and fake
+tensor execution bypass collection.
+
+Full per-token strings can exceed a profiler UI's display limit or a shared
+pipe's atomic write size. Use separate worker stdout logs, e.g.:
 
 ```bash
+export NVTE_MOE_CAPTURE_TAG=routes NVTE_MOE_CAPTURE_RUN=demo
+torchrun --standalone --nproc-per-node=8 --log-dir ./run-logs --redirects 3 train.py
+find ./run-logs -name stdout.log -exec grep -hF '[TE] --format=MegaMoE,' {} + > run.tags
+cut -d, -f3 run.tags | sort -u
+unset NVTE_MOE_CAPTURE_TAG
+# Substitute a call value listed above. Omit --call for a single invocation.
 torchrun --standalone --nproc-per-node=8 benchmarks/gemm/replay_mega_moe.py \
-  "te_mega_moe:v1:<id>" --directory /shared/moe-captures --output step.json
+  run.tags --call 'demo/0/0/0.1.2.3.4.5.6.7/0' --output step.json
 ```
 
-Replace the entire tag argument with the range name from the trace. Replay
-maps EP rank order onto the new workers, restores route values, tensor strides,
-base alignment, dtype and gradient requirements, and generates deterministic
-synthetic hidden states, expert parameters and upstream gradients. It measures
-the routed layer, excluding the router and optimizer. The default seed is 73.
-The correctness check compares the output and requested first-order gradients
-with TE's all-to-all transport before timing. The JSON contains forward,
-backward and whole-call CUDA-event samples, each reduced by MAX across ranks,
-and their medians. An inference capture only executes forward.
+Collect the stdout files from every host for a multi-node group. Replay maps
+the EP ranks onto the new workers, checks completeness, and compares outputs
+and requested gradients against TE's all-to-all transport. Timing JSON reports
+rank-max forward, backward and total CUDA-event samples and medians. The
+reader also accepts previously captured v1 manifests and their original shards.
 
-The 890P replay workflow builds merge-base and head with the grouped-GEMM CI
-wheel harness. It captures EP2 and EP8 fixtures once on head, checks each rank's
-stored route against its input, and replays the same shards in base/head then
-head/base order. The artifact includes the captures, timing JSON and build logs.
-Correctness failures fail the job. The paired whole-call latency threshold is
-5% for manual runs and perf/refactor changes, using the grouped-GEMM policy.
-
-To include a collected model tag in CI, put its complete ID directory under
-`/mnt/wl_nas/te-ci/mega-moe/captures` (locally override with
-`MEGA_MOE_CI_CAPTURES`) and append its EP size and tag on one line in
-`qa/L0_pytorch_mega_moe_rtc/cases.txt`. Both wheel versions consume the same
-captured slots. Missing shards fail the run.
+The 890P gate captures EP2 and EP8 test calls, then runs the same tags against
+merge-base and head wheels in AB/BA order. The checked-in Megatron example has 64 experts, H=3584,
+I=3072 and eight source tags. To add a model case, place its `.tags` under
+`qa/L0_pytorch_mega_moe_rtc/tags/` or `MEGA_MOE_CI_CAPTURES` (default
+`/mnt/wl_nas/te-ci/mega-moe/captures`) and add a line with EP size, filename
+and call key to `qa/L0_pytorch_mega_moe_rtc/cases.txt`. Numerical failures
+block the job. Manual and perf/refactor runs also enforce a 5% total latency
+regression threshold.

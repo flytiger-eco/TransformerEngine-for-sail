@@ -5,11 +5,17 @@
 
 import json
 import os
+import sys
+from unittest.mock import patch
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import transformer_engine.pytorch as te
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks/gemm"))
+from mega_moe_tags import PREFIX, decode_rank, unpack
 
 
 def main():
@@ -30,13 +36,15 @@ def main():
         [torch.randn(shape, device=device, dtype=x.dtype).requires_grad_() for _ in range(2)]
         for shape in ((512, 512), (512, 256))
     ]
-    te.bf16_mega_moe(x, ids, probs.requires_grad_(), w1, w2, ep_group=dist.group.WORLD)
-    (folder,) = Path(os.environ["NVTE_MOE_CAPTURE_DIR"]).glob("*/manifest.json")
-    manifest = json.loads(folder.read_text())
-    assert manifest["global_ranks"] == list(range(world))
-    shard = torch.load(folder.parent / f"rank-{rank}.pt", weights_only=True)
+    with patch.object(torch.cuda.nvtx, "range", wraps=torch.cuda.nvtx.range) as nvtx:
+        te.bf16_mega_moe(x, ids, probs.requires_grad_(), w1, w2, ep_group=dist.group.WORLD)
+    tag = nvtx.call_args.args[0]
+    fields = dict(item.split(":", 1) for item in tag.removeprefix(PREFIX).split(","))
+    shard = decode_rank(fields, json.loads(unpack(fields["meta"])))
     assert torch.equal(shard["ids"], ids.cpu())
-    assert torch.equal(shard["probs"], probs.cpu())
+    assert torch.equal(shard["probs"] == 0, probs.cpu() == 0)
+    if "exact" in fields:
+        assert torch.equal(shard["probs"], probs.cpu())
     dist.destroy_process_group()
 
 

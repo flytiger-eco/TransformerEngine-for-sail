@@ -8,6 +8,7 @@ on:
       - 'transformer_engine/**/_mega_moe*'
       - 'transformer_engine/common/gemm/rtc/**'
       - 'benchmarks/gemm/replay_mega_moe.py'
+      - 'benchmarks/gemm/mega_moe_tags.py'
       - 'qa/L0_pytorch_mega_moe_rtc/**'
       - 'qa/L0_pytorch_grouped_gemm_rtc/test.sh'
       - '.github/scripts/rtc_grouped_gemm_gate.py'
