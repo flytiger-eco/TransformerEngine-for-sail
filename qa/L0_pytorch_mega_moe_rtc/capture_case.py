@@ -3,6 +3,8 @@
 
 """Create a deterministic distributed CI case through the public capture entry point."""
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
 import sys
@@ -45,6 +47,18 @@ def main():
     assert torch.equal(shard["probs"] == 0, probs.cpu() == 0)
     if "exact" in fields:
         assert torch.equal(shard["probs"], probs.cpu())
+    # One bad source must reach the same collective validation as its peers.
+    if rank == 1:
+        ids[0, 0] = world * len(w1)
+    with redirect_stdout(io.StringIO()) as captured:
+        try:
+            te.bf16_mega_moe(x, ids, probs, w1, w2, ep_group=dist.group.WORLD)
+        except ValueError as exc:
+            assert "expert IDs in range or -1" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"rank {rank} accepted an invalid distributed route")
+    if rank == 1:
+        assert PREFIX not in captured.getvalue()
     dist.destroy_process_group()
 
 

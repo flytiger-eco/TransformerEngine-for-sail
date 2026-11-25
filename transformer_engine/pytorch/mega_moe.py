@@ -134,17 +134,18 @@ def _mega_moe(x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group
             from ._mega_moe_capture import capture
 
             tag = capture(mode, x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group)
-            with torch.cuda.nvtx.range(tag):
-                return _run_mega_moe(
-                    x,
-                    expert_ids,
-                    routing_weights,
-                    fc1_weights,
-                    fc2_weights,
-                    ep_group,
-                    dtype,
-                    forward,
-                )
+            if tag is not None:
+                with torch.cuda.nvtx.range(tag):
+                    return _run_mega_moe(
+                        x,
+                        expert_ids,
+                        routing_weights,
+                        fc1_weights,
+                        fc2_weights,
+                        ep_group,
+                        dtype,
+                        forward,
+                    )
     return _run_mega_moe(
         x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group, dtype, forward
     )

@@ -51,7 +51,8 @@ def capture(mode, x, ids, probs, fc1, fc2, group):
     width = 1 if experts <= 255 else 2 if experts <= 65535 else 4
     raw_ids = ids.detach().cpu().numpy()
     if np.any(raw_ids < -1) or np.any(raw_ids >= experts):
-        raise ValueError("invalid expert ID for MegaMoE capture")
+        # Let the operator reject invalid routes collectively across all EP ranks.
+        return None
     counts = np.bincount(raw_ids[raw_ids >= 0], minlength=experts)
     m_src = ".".join(map(str, counts))
     routes = _pack((raw_ids.astype(np.int64) + 1).astype(f"<u{width}").tobytes())
