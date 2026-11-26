@@ -127,7 +127,7 @@ __device__ __forceinline__ void pull_row(const MegaMoETrainArgs &p, int row) {
   constexpr int segments = TRAIN_K / 256;
   const int64_t route = static_cast<const int64_t *>(p.route)[row];
   const int src = route < 0 ? 0 : static_cast<int>(route >> 32);
-  const auto token = route < 0 ? 0u : static_cast<unsigned>(route) / 8;
+  const auto token = route < 0 ? 0u : static_cast<unsigned>(route) / TRAIN_TOPK;
   const auto *from = static_cast<const B *>(p.peer[src]) + int64_t(token) * TRAIN_K;
   auto *to = static_cast<B *>(p.a) + int64_t(row) * TRAIN_K;
   for (int first = 0; first < segments; first += Batch) {

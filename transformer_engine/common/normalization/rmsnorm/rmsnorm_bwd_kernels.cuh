@@ -49,7 +49,7 @@ union dx_add_t<Ivec, Ovec, FusedAdd, false> {
   dx_t dx;
 };
 
-template <typename Ktraits, bool FusedAdd>
+template <typename Ktraits, bool FusedAdd, bool MaskPartialStrip = false>
 __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_bwd_tuned_kernel(
     BackwardKernelParams params) {
   enum { ROWS_PER_CTA = Ktraits::ROWS_PER_CTA };
@@ -107,19 +107,23 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_bwd_tuned_ke
     gamma[it].load_from(params.gamma, idx);
     idx += Ktraits::VEC_COLS_PER_LDG;
   }
-// TODO if ROWS_PER_CTA does not divide rows, we might get divergence in the
-// last blocks with syncthreads!
-// grid stride over rows
+  const int strip_offset = MaskPartialStrip ? static_cast<int>(warp_m) : 0;
 #pragma unroll 1
-  for (int row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA) {
-    const compute_t rs_r = static_cast<const compute_t *>(params.rs)[row];
+  for (int row = r; row - strip_offset < params.rows; row += params.ctas_per_col * ROWS_PER_CTA) {
+    const bool row_valid = !MaskPartialStrip || row < params.rows;
+    const compute_t rs_r = row_valid ? static_cast<const compute_t *>(params.rs)[row] : 0.f;
     Ivec x[LDGS];
     Ovec dz[LDGS];
     index_t idx = row * Ktraits::VEC_COLS + c;
 #pragma unroll
     for (int it = 0; it < LDGS; it++) {
-      dz[it].load_from(params.dz, idx);
-      x[it].load_from(params.x, idx);
+      if (row_valid) {
+        dz[it].load_from(params.dz, idx);
+        x[it].load_from(params.x, idx);
+      } else {
+        dz[it].clear();
+        x[it].clear();
+      }
       idx += Ktraits::VEC_COLS_PER_LDG;
     }
 
@@ -143,7 +147,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_bwd_tuned_ke
         dy[it * NUM_ELTS + jt] = dy_tmp;
         y[it * NUM_ELTS + jt] = y_tmp;
 
-        dzy_sum[it].data.elt[jt] += dz_tmp * y_tmp;
+        if (row_valid) dzy_sum[it].data.elt[jt] += dz_tmp * y_tmp;
       }
     }
 
@@ -152,12 +156,13 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void rmsnorm_bwd_tuned_ke
       idx = row * Ktraits::VEC_COLS + c;
 #pragma unroll
       for (int it = 0; it < LDGS; it++) {
-        temp[it].add.load_from(params.add, idx);
+        if (row_valid) temp[it].add.load_from(params.add, idx);
         idx += Ktraits::VEC_COLS_PER_LDG;
       }
     }
 
-    reduce_t result = reducer.allreduce({0, mdyy_local}, sum);
+    reduce_t result = reducer.allreduce({0, row_valid ? mdyy_local : 0.f}, sum);
+    if (!row_valid) continue;
     mdyy_local = Get<1>::of<reduce_t, compute_t>(result) * rn;
 
     idx = row * Ktraits::VEC_COLS + c;

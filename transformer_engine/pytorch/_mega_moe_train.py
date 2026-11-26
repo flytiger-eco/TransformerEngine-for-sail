@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""Saved owner-local activations for eager BF16 EP8/top-8 training."""
+"""Saved owner-local activations for eager BF16 EP8 training."""
 import torch
 import triton
 import triton.language as tl
@@ -46,11 +46,11 @@ def _activation_grad(dy, z, prob, raw, dz, dp, I: tl.constexpr, B: tl.constexpr)
     tl.store(dp + r, tl.sum(grad * tl.load(raw + base + j, j < I, 0), 0))
 
 
-def _stage(state, group, source, cap, dropped):
-    peers = state.buffers(group, (9 * cap, source.size(1)), source)
+def _stage(state, group, source, cap, topk, dropped):
+    peers = state.buffers(group, ((1 + topk) * cap, source.size(1)), source)
     # Other ranks can still be combining the previous invocation's slots.
     state.handle.barrier(channel=0)
-    slots = stage_source(peers[group.rank()], source, cap, dropped)
+    slots = stage_source(peers[group.rank()], source, cap, topk, dropped)
     state.handle.barrier(channel=1)
     return peers, slots
 
@@ -68,11 +68,11 @@ class _Train(torch.autograd.Function):
         with state.lock:
             peers, slots = staged
             args = (route, tiles, peers, group.rank(), cap)
-            z = tex._mega_moe_train_linear(packed, w1, *args, True, True)
+            z = tex._mega_moe_train_linear(packed, w1, *args, True, True, topk=plan.topk)
             y = x.new_empty((rows, width))
             raw = prob.new_empty((rows, width))
             _save_activation(z, prob, raw, y)
-            tex._mega_moe_train_linear(y, w2, *args, False, True, True)
+            tex._mega_moe_train_linear(y, w2, *args, False, True, True, topk=plan.topk)
             state.handle.barrier(channel=2)
             out = tex.mega_moe_combine(slots)
         ctx.save_for_backward(packed, z, raw, y, prob, route, tiles, offsets, *weights)
@@ -88,16 +88,16 @@ class _Train(torch.autograd.Function):
         state = _workspace(group)
         routed_dy = torch.empty_like(x)
         with state.lock:
-            peers, slots = _stage(state, group, dy, cap, plan.dropped)
+            peers, slots = _stage(state, group, dy, cap, plan.topk, plan.dropped)
             args = (route, tiles, peers, group.rank(), cap)
-            dh = tex._mega_moe_train_linear(routed_dy, w2, *args, True, False)
+            dh = tex._mega_moe_train_linear(routed_dy, w2, *args, True, False, topk=plan.topk)
             dz, dp = torch.empty_like(z), torch.empty_like(prob)
             if x.size(0):
                 width = y.size(1)
                 _activation_grad[(x.size(0),)](
                     dh, z, prob, raw, dz, dp, width, triton.next_power_of_2(width)
                 )
-            tex._mega_moe_train_linear(dz, w1, *args, False, False, True)
+            tex._mega_moe_train_linear(dz, w1, *args, False, False, True, topk=plan.topk)
             state.handle.barrier(channel=2)
             dx = tex.mega_moe_combine(slots)
             state.done.record(torch.cuda.current_stream(x.device))

@@ -237,14 +237,9 @@ std::vector<std::pair<size_t, size_t>> test_cases = {
   {2048, 12288},
 };
 
-// Tuned-bucket coverage. The four shapes above have hidden sizes 229/541/6144/12288,
-// none of which is a tuned bucket, so they only ever exercise the *general*
-// kernels. The RMSNorm tuned launch table (the exact-hidden buckets below, gated
-// on 16B-aligned pointers and rows % 4 == 0) is what the launch-geometry tuning
-// changes, so it needs its own cases. Rows are all multiples of 4 to stay on the
-// tuned path.
 std::vector<std::pair<size_t, size_t>> tuned_test_cases = [] {
-  std::vector<std::pair<size_t, size_t>> v;
+  std::vector<std::pair<size_t, size_t>> v{{1, 1024}, {2, 1024}, {3, 1024}, {543, 512},
+                                           {545, 1024}, {546, 1024}, {547, 1024}, {257, 5120}};
   for (size_t rows : {4, 256, 4096}) {
     for (size_t hidden : {512, 768, 1024, 2048, 4096, 8192}) {
       v.emplace_back(rows, hidden);
@@ -318,6 +313,18 @@ INSTANTIATE_TEST_SUITE_P(
       std::to_string(std::get<7>(info.param));
     return name;
   });
+
+INSTANTIATE_TEST_SUITE_P(
+  OperatorTunedOutputTest, NormTestSuite,
+  ::testing::Values(
+    NormTestSuite::ParamType{false, RMSNorm, DType::kFloat32, DType::kFloat32,
+                             {2048, 512}, false, false, false},
+    NormTestSuite::ParamType{false, RMSNorm, DType::kFloat32, DType::kFloat8E4M3,
+                             {2048, 512}, false, false, false},
+    NormTestSuite::ParamType{false, RMSNorm, DType::kBFloat16, DType::kBFloat16,
+                             {2048, 768}, true, false, false},
+    NormTestSuite::ParamType{false, RMSNorm, DType::kBFloat16, DType::kFloat8E4M3,
+                             {2048, 768}, true, false, false}));
 
 // Tuned-bucket suite: Te backend, RMSNorm, matched in/out dtypes only (the tuned
 // table registers matched WTYPE/ITYPE/OTYPE triples; mixed dtypes stay on the

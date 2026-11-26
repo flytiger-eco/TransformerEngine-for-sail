@@ -19,6 +19,11 @@ void launch_rmsnorm_fwd_tuned_(LaunchParams<ForwardKernelParams> &launch_params,
   using Kernel_traits = Kernel_traits<weight_t, input_t, output_t, compute_t, index_t, HIDDEN_SIZE,
                                       CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG>;
   auto kernel = &rmsnorm_fwd_tuned_kernel<Kernel_traits>;
+  if constexpr (WARPS_M > 1 && WARPS_N > 1) {
+    if (launch_params.params.rows % WARPS_M != 0) {
+      kernel = &rmsnorm_fwd_tuned_kernel<Kernel_traits, true>;
+    }
+  }
 
   if (configure_params) {
     int ctas_per_sm;

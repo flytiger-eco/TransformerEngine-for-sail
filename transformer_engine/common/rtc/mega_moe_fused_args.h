@@ -7,12 +7,13 @@
 namespace transformer_engine::rtc {
 
 struct MegaMoETrainArgs {
+  static constexpr int kMaxExperts = 48;
   void *peer[8], *a, *d;
-  const void *weight[16];
+  const void *weight[kMaxExperts];
   const void *route;  // Device int64_t source rank and top-k slot, or -1 for padding.
   const int *expert;
   int *ready;
-  int tiles, k, n, rank, capacity;
+  int tiles, k, n, rank, capacity, topk;
 };
 
 // Passed by value to all three RTC kernels. Peer-visible arrays use group-rank order.
