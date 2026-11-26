@@ -153,6 +153,12 @@ backend-selection overview.
    :Default: ``1``
    :Description: Enable or disable FlashAttention 3 (the ``flash-attn-3`` package) for DotProductAttention, without affecting FlashAttention 2 or 4. When set to ``0``, FlashAttention 3 will not be used even if it is installed.
 
+.. envvar:: NVTE_FLASH_ATTN_V3_DETERMINISTIC_LARGE_HEAD_DIM
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Allow FlashAttention 3 for deterministic PyTorch training when the larger of the Q/K and V head dimensions is at least 256. Set to ``1`` before launching the process only if the installed FA3 build supports deterministic forward and backward for the configuration. Request determinism separately with :envvar:`NVTE_ALLOW_NONDETERMINISTIC_ALGO` set to ``0`` or with ``torch.use_deterministic_algorithms(True)``.
+
 .. envvar:: NVTE_FLASH_ATTN_V4
 
    :Type: ``int`` (0 or 1)

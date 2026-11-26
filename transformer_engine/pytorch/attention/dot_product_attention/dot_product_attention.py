@@ -208,10 +208,14 @@ class DotProductAttention(TransformerEngineBaseModule):
 
     .. warning::
 
-        FlashAttention uses a non-deterministic algorithm for optimal performance. To observe
-        deterministic behavior at the cost of performance, use FlashAttention version >= ``2.4.1``
-        and set the environment variable :attr:`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`. In order
-        to disable ``flash-attn`` entirely, set :attr:`NVTE_FLASH_ATTN=0`.
+        To request deterministic execution, set :attr:`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`
+        or enable ``torch.use_deterministic_algorithms(True)`` before constructing this module.
+        Deterministic execution requires ``flash-attn`` >= ``2.4.1`` for FlashAttention 2 and
+        a build with deterministic forward and backward support for FlashAttention 3.
+        For FA3 training with ``max(head_dim_qk, head_dim_v) >= 256``, set
+        :envvar:`NVTE_FLASH_ATTN_V3_DETERMINISTIC_LARGE_HEAD_DIM` to ``1`` before launching
+        the process if the installed build supports this configuration.
+        To disable FlashAttention entirely, set :attr:`NVTE_FLASH_ATTN=0`.
 
     .. note::
 
