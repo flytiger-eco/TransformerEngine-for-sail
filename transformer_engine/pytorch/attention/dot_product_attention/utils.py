@@ -1423,7 +1423,7 @@ def get_attention_backend(
     # FlashAttention               |
     #     v2 < 2.4.1               | no
     #     v2 >= 2.4.1              | yes
-    #     v3                       | yes
+    #     v3                       | training with head dim >= 256 requires opt-in
     # FusedAttention               |
     #     sub-backend 0            | yes
     #     sub-backend 1            | workspace optimization path and sm90: yes;
@@ -1440,6 +1440,20 @@ def get_attention_backend(
                 "please install flash-attn >= 2.4.1."
             )
             use_flash_attention_2 = False
+    if (
+        use_flash_attention_3
+        and FlashAttentionUtils.v3_is_installed
+        and deterministic
+        and is_training
+        and max(head_dim_qk, head_dim_v) >= 256
+        and os.getenv("NVTE_FLASH_ATTN_V3_DETERMINISTIC_LARGE_HEAD_DIM", "0") != "1"
+    ):
+        logger.debug(
+            "Disabling FlashAttention 3 for deterministic training with "
+            "max(head_dim_qk, head_dim_v) >= 256. For builds supporting this configuration, "
+            "set NVTE_FLASH_ATTN_V3_DETERMINISTIC_LARGE_HEAD_DIM=1."
+        )
+        use_flash_attention_3 = False
     if use_fused_attention and deterministic:
         if softmax_type != "vanilla":
             logger.debug(

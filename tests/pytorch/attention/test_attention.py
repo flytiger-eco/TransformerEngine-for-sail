@@ -320,25 +320,45 @@ def test_dpa_num_splits(dtype, model_configs, model):
 
 
 @pytest.mark.skipif(not FlashAttentionUtils.v3_is_installed, reason="FlashAttention 3 is required.")
-def test_fa3_deterministic_hdim256_backend(monkeypatch):
-    """Keep FA3 eligible for deterministic training with head_dim=256."""
+@pytest.mark.parametrize(
+    "opt_in, head_dim, deterministic, is_training, expect_fa3",
+    [
+        pytest.param(None, 256, True, True, False, id="default-fallback"),
+        pytest.param("0", 256, True, True, False, id="explicit-fallback"),
+        pytest.param("1", 256, True, True, True, id="opt-in"),
+        pytest.param(None, 128, True, True, True, id="smaller-head-dim"),
+        pytest.param(None, 256, False, True, True, id="nondeterministic"),
+        pytest.param(None, 256, True, False, True, id="inference"),
+    ],
+)
+def test_fa3_deterministic_hdim256_backend(
+    monkeypatch, opt_in, head_dim, deterministic, is_training, expect_fa3
+):
+    """Require explicit opt-in for FA3 deterministic training with head_dim=256."""
     monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
     monkeypatch.setenv("NVTE_FLASH_ATTN_V2", "0")
     monkeypatch.setenv("NVTE_FLASH_ATTN_V3", "1")
     monkeypatch.setenv("NVTE_FLASH_ATTN_V4", "0")
     monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
-    use_flash_attention, flash_attention_backend, *_ = get_attention_backend(
+    monkeypatch.setenv("NVTE_UNFUSED_ATTN", "1")
+    opt_in_env = "NVTE_FLASH_ATTN_V3_DETERMINISTIC_LARGE_HEAD_DIM"
+    if opt_in is None:
+        monkeypatch.delenv(opt_in_env, raising=False)
+    else:
+        monkeypatch.setenv(opt_in_env, opt_in)
+    use_flash, flash_backend, _, _, use_unfused, _ = get_attention_backend(
         AttentionParams(
-            head_dim_qk=256,
-            head_dim_v=256,
+            head_dim_qk=head_dim,
+            head_dim_v=head_dim,
             core_attention_bias_shape=None,
             core_attention_bias_requires_grad=False,
-            deterministic=True,
-            is_training=True,
+            deterministic=deterministic,
+            is_training=is_training,
         )
     )
-    assert use_flash_attention
-    assert flash_attention_backend == FlashAttentionUtils.fa3_version
+    assert use_flash == expect_fa3
+    assert flash_backend == (FlashAttentionUtils.fa3_version if expect_fa3 else None)
+    assert use_unfused == (not expect_fa3)
 
 
 # ==============================
