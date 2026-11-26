@@ -71,11 +71,12 @@ def profile_steps(forward, backward, training, device, local_experts):
     samples = []
     symbols = [set() for _ in STAGES]
     for _ in range(steps):
-        dist.barrier()
-        torch.cuda.synchronize()
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
         ) as prof:
+            # Kineto startup varies by rank. Align ranks before the first measured region.
+            dist.barrier()
+            torch.cuda.synchronize()
             for layer in range(layers):
                 with torch.profiler.record_function(f"replay_fwd_{layer}"):
                     y = forward()
