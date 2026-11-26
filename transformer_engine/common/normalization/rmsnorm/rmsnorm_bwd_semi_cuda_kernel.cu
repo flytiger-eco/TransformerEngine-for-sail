@@ -19,6 +19,11 @@ void launch_rmsnorm_bwd_tuned_(LaunchParams<BackwardKernelParams> &launch_params
   using Kernel_traits = Kernel_traits<weight_t, input_t, output_t, compute_t, index_t, HIDDEN_SIZE,
                                       CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG_MAIN>;
   auto kernel = &rmsnorm_bwd_tuned_kernel<Kernel_traits, FUSED_ADD>;
+  if constexpr (WARPS_M > 1 && WARPS_N > 1) {
+    if (launch_params.params.rows % WARPS_M != 0) {
+      kernel = &rmsnorm_bwd_tuned_kernel<Kernel_traits, FUSED_ADD, true>;
+    }
+  }
 
   if (configure_params) {
     int ctas_per_sm = 0;

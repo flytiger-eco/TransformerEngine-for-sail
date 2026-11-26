@@ -65,7 +65,7 @@ template <typename KernelParamsType>
 TeNormalizationPlan<KernelParamsType>::TeNormalizationPlan(
     NVTE_Norm_Type NormType, NVTE_Norm_Stage NormStage, DType wtype, DType itype, DType otype,
     DType ctype, const size_t batch_size, const size_t hidden_size, const size_t sm_count,
-    const bool zero_centered_gamma, const bool is_tuned)
+    const bool zero_centered_gamma, const bool is_aligned)
     : _is_layernorm(NormType == NVTE_Norm_Type::LayerNorm) {
   _launch_params.multiprocessorCount = sm_count;
 
@@ -78,8 +78,8 @@ TeNormalizationPlan<KernelParamsType>::TeNormalizationPlan(
   }
   // TE kernels have no template for batch_size and zero_centered_gamma, thus zero out those
   auto key = get_key(NVTE_Norm_Backend::Te, NormType, NormStage, wtype, itype, otype, ctype, 0,
-                     hidden_size, false, is_tuned);
-  _kernel = KernelRegistry::getKernel(key);
+                     hidden_size, false, is_aligned);
+  _kernel = KernelRegistry::getKernel(key, batch_size);
 
   this->_build();
 }
@@ -514,10 +514,9 @@ NormalizationPlanBase* NormalizationPlanRegistry::getNormalizationPlan(
     const size_t sm_count, const bool zero_centered_gamma, const bool is_aligned,
     const NVTEScalingMode mode, const bool training, const bool gamma_in_weight_dtype) {
   const DType ctype = DType::kFloat32;
-  bool is_tuned = is_aligned && (batch_size % 4 == 0);
   auto key =
       get_key(NormBackend, NormType, NormStage, wtype, itype, otype, ctype, batch_size, hidden_size,
-              zero_centered_gamma, is_tuned, mode, training, gamma_in_weight_dtype);
+              zero_centered_gamma, is_aligned, mode, training, gamma_in_weight_dtype);
 
   auto it = normalizationPlanMap.find(key);
   if (it != normalizationPlanMap.end()) {
@@ -532,11 +531,11 @@ NormalizationPlanBase* NormalizationPlanRegistry::getNormalizationPlan(
   } else if (NormStage == NVTE_Norm_Stage::Forward) {
     plan = std::make_unique<TeNormalizationPlan<ForwardKernelParams>>(
         NormType, NormStage, wtype, itype, otype, ctype, batch_size, hidden_size, sm_count,
-        zero_centered_gamma, is_tuned);
+        zero_centered_gamma, is_aligned);
   } else {
     plan = std::make_unique<TeNormalizationPlan<BackwardKernelParams>>(
         NormType, NormStage, wtype, itype, otype, ctype, batch_size, hidden_size, sm_count,
-        zero_centered_gamma, is_tuned);
+        zero_centered_gamma, is_aligned);
   }
   normalizationPlanMap.insert({key, std::move(plan)});
   return normalizationPlanMap[key].get();
