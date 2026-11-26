@@ -210,9 +210,10 @@ static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &rout
                            bool pull, bool transpose, bool scatter_only) {
   TORCH_CHECK(!scatter_only || !pull, "Scatter-only mode needs a return operation");
   TORCH_CHECK(a.is_cuda() && a.is_contiguous() && a.dim() == 2 &&
-                  a.scalar_type() == at::kBFloat16 && !w.empty() && w.size() <= 16 && rank >= 0 &&
-                  rank < 8 && peers.size() == 8 && capacity > 0 && a.size(0) <= INT_MAX &&
-                  a.size(1) > 0 && a.size(1) <= INT_MAX,
+                  a.scalar_type() == at::kBFloat16 && !w.empty() &&
+                  w.size() <= rtc::MegaMoETrainArgs::kMaxExperts && rank >= 0 && rank < 8 &&
+                  peers.size() == 8 && capacity > 0 && a.size(0) <= INT_MAX && a.size(1) > 0 &&
+                  a.size(1) <= INT_MAX,
               "Invalid MegaMoE training operands");
   c10::cuda::CUDAGuard guard(a.device());
   TORCH_CHECK(route.device() == a.device() && route.is_contiguous() &&

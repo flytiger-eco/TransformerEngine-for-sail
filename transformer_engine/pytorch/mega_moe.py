@@ -247,7 +247,8 @@ def bf16_mega_moe(
     peer access use variable-split all-to-all.
 
     Eager BF16 training on eight peer-accessible SM89 PPUs with Triton, K=8,
-    the same tile and batch requirements, and I <= 16384 saves expert-local
+    aligned weights, H and I divisible by 256, I <= 16384, at most 32 experts per
+    rank, and at least 2048 input tokens on one rank saves expert-local
     inputs, gate/up and SwiGLU outputs for backward. FC2 dgrad gathers source
     output gradients, FC1 dgrad scatters per-route input gradients, and both
     expert weight gradients are local grouped GEMMs. Backward returns gradients

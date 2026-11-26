@@ -24,13 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks/gemm"))
 from benchmark_mega_moe_deepep import error, make_weights, reference
 
 
-def make_case(tokens, rank, seed, device, special=False, empty_owners=False):
+def make_case(tokens, rank, seed, device, special=False, empty_owners=False, total_experts=16):
     gen = torch.Generator(device=device).manual_seed(seed + rank)
     x = torch.randn(tokens, 512, device=device, generator=gen).bfloat16()
-    ids = torch.rand(tokens, 16, device=device, generator=gen).argsort(1)[:, :8].int()
+    ids = torch.rand(tokens, total_experts, device=device, generator=gen).argsort(1)[:, :8].int()
     probs = torch.randn(tokens, 8, device=device, generator=gen).softmax(1)
     if empty_owners:
-        # Only global experts 0..7 are used; ranks 4..7 own zero expert rows.
+        # Route exclusively to global experts 0..7 to leave some owner ranks empty.
         ids = torch.rand(tokens, 8, device=device, generator=gen).argsort(1).int()
     if special:
         ids[::11, 1] = ids[::11, 0]
@@ -112,7 +112,8 @@ def training_reference(x, ids, probs, dy, all1, all2):
         dw2[expert] = grad.float().T @ y.float()
     dist.all_reduce(dw1)
     dist.all_reduce(dw2)
-    owner = slice(2 * dist.get_rank(), 2 * dist.get_rank() + 2)
+    local = len(all1) // dist.get_world_size()
+    owner = slice(local * dist.get_rank(), local * (dist.get_rank() + 1))
     return (out.to(x.dtype), dx.to(x.dtype), dp, *dw1[owner].to(x.dtype), *dw2[owner].to(x.dtype))
 
 
@@ -170,17 +171,20 @@ def check_admission(rank, device):
 
 
 @torch.enable_grad()
-def check_training(rank, device):
+def check_training(rank, device, local_experts=2):
     import transformer_engine.pytorch as te
 
     group = dist.group.WORLD
-    all1, all2 = make_weights(512, 256, 16, device, 87001)
-    w1 = [w.requires_grad_() for w in all1[2 * rank : 2 * rank + 2]]
-    w2 = [w.requires_grad_() for w in all2[2 * rank : 2 * rank + 2]]
+    total = local_experts * dist.get_world_size()
+    all1, all2 = make_weights(512, 256, total, device, 87001)
+    owner = slice(rank * local_experts, (rank + 1) * local_experts)
+    w1 = [w.requires_grad_() for w in all1[owner]]
+    w2 = [w.requires_grad_() for w in all2[owner]]
     cases = []
     for step, tokens in enumerate((2048, 0 if rank == 0 else 2051 + rank)):
         x, ids, p = make_case(
-            tokens, rank, 87035 + step, device, special=True, empty_owners=bool(step)
+            tokens, rank, 87035 + step, device, special=True, empty_owners=bool(step),
+            total_experts=total,
         )
         x.requires_grad_()
         p.requires_grad_()
@@ -209,7 +213,7 @@ def check_training(rank, device):
 def check_training_tile_tails(rank, device):
     """Exercise the tuned widths with uneven owner tile counts and skipped source slots."""
     import transformer_engine.pytorch as te
-    from transformer_engine.pytorch.mega_moe import _bf16_forward
+    from transformer_engine.pytorch import _mega_moe_peer
 
     group = dist.group.WORLD
     gen = torch.Generator(device=device).manual_seed(87063 + rank)
@@ -228,8 +232,9 @@ def check_training_tile_tails(rank, device):
     for param in params:
         param.requires_grad_()
     dy = torch.randn(x.shape, device=device, generator=gen, dtype=x.dtype)
-    reference = _bf16_forward(x, ids, probs, w1, w2, group.group_name)
-    expected = (reference.detach(), *torch.autograd.grad(reference, params, dy))
+    with patch.object(_mega_moe_peer, "_peer_supported", return_value=False):
+        reference = te.bf16_mega_moe(x, ids, probs, w1, w2, ep_group=group)
+        expected = (reference.detach(), *torch.autograd.grad(reference, params, dy))
     output = te.bf16_mega_moe(x, ids, probs, w1, w2, ep_group=group)
     assert "TrainBackward" in type(output.grad_fn).__name__
     result = (output.detach(), *torch.autograd.grad(output, params, dy))
@@ -261,6 +266,7 @@ def main():
     if args.training:
         check_admission(rank, device)
         check_training(rank, device)
+        check_training(rank, device, local_experts=32)
         check_training_tile_tails(rank, device)
         dist.destroy_process_group()
         return
