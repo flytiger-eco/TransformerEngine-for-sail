@@ -1421,8 +1421,9 @@ def get_attention_backend(
     # backend                      | deterministic
     # ---------------------------------------------
     # FlashAttention               |
-    #     flash-attn >=2.0, <2.4.1 | no
-    #     flash-attn >=2.4.1       | yes
+    #     v2 < 2.4.1               | no
+    #     v2 >= 2.4.1              | yes
+    #     v3                       | yes
     # FusedAttention               |
     #     sub-backend 0            | yes
     #     sub-backend 1            | workspace optimization path and sm90: yes;
@@ -1439,15 +1440,6 @@ def get_attention_backend(
                 "please install flash-attn >= 2.4.1."
             )
             use_flash_attention_2 = False
-    if use_flash_attention_3 and deterministic and FlashAttentionUtils.v3_is_installed:
-        if is_training and max(head_dim_qk, head_dim_v) >= 256:
-            logger.debug(
-                "Disabling FlashAttention 3 for deterministic backward with"
-                " max(head_dim_qk, head_dim_v) >= 256. Found: head_dim_qk = %s, head_dim_v = %s.",
-                head_dim_qk,
-                head_dim_v,
-            )
-            use_flash_attention_3 = False
     if use_fused_attention and deterministic:
         if softmax_type != "vanilla":
             logger.debug(

@@ -28,8 +28,10 @@ from transformer_engine.pytorch.attention.dot_product_attention import (
     _attention_backends,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+    AttentionParams,
     FlashAttentionUtils,
     check_set_window_size,
+    get_attention_backend,
 )
 from transformer_engine.pytorch.attention import RotaryPositionEmbedding
 import transformer_engine.pytorch.cpp_extensions as ext
@@ -315,6 +317,28 @@ def test_dpa_num_splits(dtype, model_configs, model):
         False,
         False,
     )
+
+
+@pytest.mark.skipif(not FlashAttentionUtils.v3_is_installed, reason="FlashAttention 3 is required.")
+def test_fa3_deterministic_hdim256_backend(monkeypatch):
+    """Keep FA3 eligible for deterministic training with head_dim=256."""
+    monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
+    monkeypatch.setenv("NVTE_FLASH_ATTN_V2", "0")
+    monkeypatch.setenv("NVTE_FLASH_ATTN_V3", "1")
+    monkeypatch.setenv("NVTE_FLASH_ATTN_V4", "0")
+    monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
+    use_flash_attention, flash_attention_backend, *_ = get_attention_backend(
+        AttentionParams(
+            head_dim_qk=256,
+            head_dim_v=256,
+            core_attention_bias_shape=None,
+            core_attention_bias_requires_grad=False,
+            deterministic=True,
+            is_training=True,
+        )
+    )
+    assert use_flash_attention
+    assert flash_attention_backend == FlashAttentionUtils.fa3_version
 
 
 # ==============================
