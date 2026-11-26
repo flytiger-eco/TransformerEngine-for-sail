@@ -246,9 +246,9 @@ def bf16_mega_moe(
     Other peer shapes use the bulk or generic peer implementation. Groups without
     peer access use variable-split all-to-all.
 
-    Eager BF16 training on eight peer-accessible SM89 PPUs with Triton, K=8,
-    aligned weights, H and I divisible by 256, I <= 16384, at most 32 experts per
-    rank, and at least 2048 input tokens on one rank saves expert-local
+    Eager BF16 training on eight peer-accessible SM89 PPUs with Triton, K=6 or K=8,
+    aligned weights, H and I divisible by 256, I <= 16384, at most 48 experts per
+    rank, and at least 1024 (K=6) or 2048 (K=8) input tokens on one rank saves expert-local
     inputs, gate/up and SwiGLU outputs for backward. FC2 dgrad gathers source
     output gradients, FC1 dgrad scatters per-route input gradients, and both
     expert weight gradients are local grouped GEMMs. Backward returns gradients

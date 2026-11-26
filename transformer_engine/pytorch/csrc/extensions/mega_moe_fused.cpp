@@ -207,7 +207,8 @@ std::tuple<Tensor, int, int> fused_forward(const Tensor &x, const Tensor &ids, c
 // Internal entry point. route/expert come from the collectively validated router.
 static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &route,
                            const Tensor &expert, const Weights &peers, int rank, int capacity,
-                           bool pull, bool transpose, bool scatter_only) {
+                           bool pull, bool transpose, bool scatter_only, int topk) {
+  TORCH_CHECK(topk == 6 || topk == 8, "Unsupported MegaMoE training top-k");
   TORCH_CHECK(!scatter_only || !pull, "Scatter-only mode needs a return operation");
   TORCH_CHECK(a.is_cuda() && a.is_contiguous() && a.dim() == 2 &&
                   a.scalar_type() == at::kBFloat16 && !w.empty() &&
@@ -224,6 +225,7 @@ static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &rout
   rtc::MegaMoETrainArgs p{};
   p.rank = rank;
   p.capacity = capacity;
+  p.topk = topk;
   p.tiles = expert.numel();
   p.k = a.size(1);
   TORCH_CHECK(w.front().dim() == 2 && w.front().size(transpose ? 0 : 1) <= INT_MAX);
@@ -240,7 +242,8 @@ static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &rout
   for (int r = 0; r < 8; ++r) {
     TORCH_CHECK(peers[r].device() == a.device() && peers[r].is_contiguous() &&
                 peers[r].scalar_type() == a.scalar_type() && peers[r].dim() == 2 &&
-                peers[r].size(0) == 9LL * capacity && peers[r].size(1) == (pull ? p.k : p.n));
+                peers[r].size(0) == (1LL + topk) * capacity &&
+                peers[r].size(1) == (pull ? p.k : p.n));
     p.peer[r] = peers[r].data_ptr();
   }
   auto d = scatter_only ? Tensor() : at::empty({a.size(0), p.n}, a.options());
@@ -259,7 +262,7 @@ void init_mega_moe_fused_bindings(pybind11::module &m) {
         pybind11::arg("route"), pybind11::arg("expert"), pybind11::arg("peers"),
         pybind11::arg("rank"), pybind11::arg("capacity"), pybind11::arg("pull"),
         pybind11::arg("transpose"), pybind11::arg("scatter_only") = false,
-        pybind11::call_guard<pybind11::gil_scoped_release>());
+        pybind11::arg("topk") = 8, pybind11::call_guard<pybind11::gil_scoped_release>());
   pybind11::class_<FusedStatus>(m, "MegaMoEFusedStatus").def(pybind11::init<const Tensor &>());
   m.def("mega_moe_fused_available", &fused_available);
   m.def("mega_moe_fused_workspace_sizes", &workspace_sizes, pybind11::arg("capacity"),

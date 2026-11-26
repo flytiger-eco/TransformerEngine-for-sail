@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""EP8/top-8 forward and saved-activation backward regressions for public MegaMoE; run with eight torchrun ranks.
+"""EP8 forward and saved-activation backward regressions for public MegaMoE on eight ranks.
 
 Includes empty/ragged source ranks, skipped/duplicate/zero-weight slots, empty
 expert owners, and workspace growth/reuse across independently scheduled streams.
@@ -24,14 +24,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks/gemm"))
 from benchmark_mega_moe_deepep import error, make_weights, reference
 
 
-def make_case(tokens, rank, seed, device, special=False, empty_owners=False, total_experts=16):
+def make_case(
+    tokens, rank, seed, device, special=False, empty_owners=False, total_experts=16, topk=8
+):
     gen = torch.Generator(device=device).manual_seed(seed + rank)
     x = torch.randn(tokens, 512, device=device, generator=gen).bfloat16()
-    ids = torch.rand(tokens, total_experts, device=device, generator=gen).argsort(1)[:, :8].int()
-    probs = torch.randn(tokens, 8, device=device, generator=gen).softmax(1)
+    order = torch.rand(tokens, total_experts, device=device, generator=gen).argsort(1)
+    ids = order[:, :topk].int()
+    probs = torch.randn(tokens, topk, device=device, generator=gen).softmax(1)
     if empty_owners:
-        # Route exclusively to global experts 0..7 to leave some owner ranks empty.
-        ids = torch.rand(tokens, 8, device=device, generator=gen).argsort(1).int()
+        # Use only the first topk global experts so some owner ranks stay empty.
+        ids = torch.rand(tokens, topk, device=device, generator=gen).argsort(1).int()
     if special:
         ids[::11, 1] = ids[::11, 0]
         ids[::13, 3] = -1
@@ -171,7 +174,7 @@ def check_admission(rank, device):
 
 
 @torch.enable_grad()
-def check_training(rank, device, local_experts=2):
+def check_training(rank, device, local_experts=2, topk=8, tokens_per_rank=2048):
     import transformer_engine.pytorch as te
 
     group = dist.group.WORLD
@@ -181,10 +184,17 @@ def check_training(rank, device, local_experts=2):
     w1 = [w.requires_grad_() for w in all1[owner]]
     w2 = [w.requires_grad_() for w in all2[owner]]
     cases = []
-    for step, tokens in enumerate((2048, 0 if rank == 0 else 2051 + rank)):
+    ragged_tokens = 0 if rank == 0 else tokens_per_rank + 3 + rank
+    for step, tokens in enumerate((tokens_per_rank, ragged_tokens)):
         x, ids, p = make_case(
-            tokens, rank, 87035 + step, device, special=True, empty_owners=bool(step),
+            tokens,
+            rank,
+            87035 + step,
+            device,
+            special=True,
+            empty_owners=bool(step),
             total_experts=total,
+            topk=topk,
         )
         x.requires_grad_()
         p.requires_grad_()
@@ -267,6 +277,7 @@ def main():
         check_admission(rank, device)
         check_training(rank, device)
         check_training(rank, device, local_experts=32)
+        check_training(rank, device, local_experts=48, topk=6, tokens_per_rank=1024)
         check_training_tile_tails(rank, device)
         dist.destroy_process_group()
         return

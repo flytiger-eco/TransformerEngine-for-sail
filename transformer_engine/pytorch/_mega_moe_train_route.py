@@ -16,9 +16,9 @@ import triton.language as tl
 from ._mega_moe_peer import _workspace
 
 
-_MAX_LOCAL_EXPERTS = 32
+_MAX_LOCAL_EXPERTS = 48
 # All ranks exchange the same header, even when they disagree about the shape.
-_ROUTE_BINS = 8 * _MAX_LOCAL_EXPERTS
+_ROUTE_BINS = triton.next_power_of_2(8 * _MAX_LOCAL_EXPERTS)
 
 
 @triton.jit
@@ -100,6 +100,7 @@ def _bases(
         hidden = tl.load(counts + (BINS + 3))
         width = tl.load(counts + (BINS + 4))
         tokens = tl.load(counts + (BINS + 5))
+        topk = tl.load(counts + (BINS + 6))
         eligible = tl.load(counts + (BINS + 7))
         cap = tl.max(tokens, 0)
         mismatch = (tl.min(experts, 0) != tl.max(experts, 0)) | (
@@ -108,8 +109,9 @@ def _bases(
         fallback = (
             (tl.min(eligible, 0) == 0)
             | (tl.min(width, 0) != tl.max(width, 0))
-            | (cap < 2048)
-            | (tl.sum(tokens.to(tl.int64), 0) * 8 + E * 256 >= 2147483648)
+            | (tl.min(topk, 0) != tl.max(topk, 0))
+            | (cap < tl.where(tl.max(topk, 0) == 6, 1024, 2048))
+            | (tl.sum(tokens.to(tl.int64) * topk, 0) + E * 256 >= 2147483648)
         )
         status = tl.where(bad, 2, tl.where(mismatch, 3, tl.where(fallback, 1, 0)))
         tl.store(report + 8, status)
@@ -156,13 +158,14 @@ def _push(
     ps1,
     rank,
     E: tl.constexpr,
+    TOPK: tl.constexpr,
     BINS: tl.constexpr,
     B: tl.constexpr,
 ):
     block = tl.program_id(0)
     lane = tl.arange(0, B)
     slot = block * B + lane
-    exp = tl.load(ids + slot // 8 * is0 + slot % 8 * is1, slot < n, -1)
+    exp = tl.load(ids + slot // TOPK * is0 + slot % TOPK * is1, slot < n, -1)
     # Sort only one CTA's slots. The prefix table preserves the order across CTAs.
     key = tl.sort(tl.where(exp >= 0, exp, BINS) * B + lane, descending=False)
     expert = key // B
@@ -176,7 +179,7 @@ def _push(
         - first
     )
     source_slot = block * B + key % B
-    prob = tl.load(probs + source_slot // 8 * ps0 + source_slot % 8 * ps1, valid, 0)
+    prob = tl.load(probs + source_slot // TOPK * ps0 + source_slot % TOPK * ps1, valid, 0)
     target = _peer(P0, P1, P2, P3, P4, P5, P6, P7, expert // E) + 2 * row.to(tl.int64)
     route = ((tl.full((1,), 0, tl.int64) + rank) << 32) | source_slot.to(tl.int64)
     tl.store(target, route, valid)
@@ -271,14 +274,15 @@ class TrainingRoute:
     group: dist.ProcessGroup
     cap: int
     tokens: int
+    topk: int
     dropped: bool
     any_dropped: bool
 
 
-def stage_source(local, source, cap, dropped):
+def stage_source(local, source, cap, topk, dropped):
     tokens, hidden = source.shape
     local[:tokens].copy_(source)
-    slots = local[cap : cap + tokens * 8].view(tokens, 8, hidden)
+    slots = local[cap : cap + tokens * topk].view(tokens, topk, hidden)
     if dropped:
         slots.zero_()
     return slots
@@ -290,7 +294,7 @@ def prepare(x, ids, probs, experts, width, aligned, group):
     hidden = x.size(1)
     slots = ids.numel()
     eligible = (
-        k == 8
+        k in (6, 8)
         and 0 < width <= 16384
         and width % 256 == 0
         and hidden > 0
@@ -357,12 +361,12 @@ def prepare(x, ids, probs, experts, width, aligned, group):
     # Storage is shared across steps. The results saved for backward have independent lifetimes.
     state = _workspace(group)
     with state.lock:
-        scratch = _scratch(group, x.device, max(2 * max(host[:8]), cap * 4))
-        peers = state.buffers(group, (9 * cap, hidden), x)
+        scratch = _scratch(group, x.device, max(2 * max(host[:8]), (cap * k + 1) // 2))
+        peers = state.buffers(group, ((1 + k) * cap, hidden), x)
         # Both workspace completion events are queued before this cross-rank barrier.
         # It protects the previous generation's local reads of routes and output slots.
         scratch.handle.barrier(channel=0)
-        output_slots = stage_source(peers[rank], x, cap, bool(dropped))
+        output_slots = stage_source(peers[rank], x, cap, k, bool(dropped))
         if slots:
             _push[(blocks,)](
                 ids,
@@ -375,6 +379,7 @@ def prepare(x, ids, probs, experts, width, aligned, group):
                 *probs.stride(),
                 rank,
                 experts,
+                k,
                 _ROUTE_BINS,
                 256,
             )
@@ -394,7 +399,7 @@ def prepare(x, ids, probs, experts, width, aligned, group):
                 triton.next_power_of_2(experts),
             )
         scratch.done.record(torch.cuda.current_stream(x.device))
-    plan = TrainingRoute(group, cap, tokens, bool(dropped), bool(any_dropped))
+    plan = TrainingRoute(group, cap, tokens, k, bool(dropped), bool(any_dropped))
     return plan, route, tiles, offsets, packed_prob, (peers, output_slots)
 
 
@@ -402,9 +407,9 @@ def return_grad(dp, route, plan):
     """Write the owner gradient to its unique source slot, leaving skipped slots at zero."""
     state = _workspace(plan.group)
     with state.lock:
-        scratch = _scratch(plan.group, dp.device, plan.cap * 4)
+        scratch = _scratch(plan.group, dp.device, (plan.cap * plan.topk + 1) // 2)
         rank = plan.group.rank()
-        values = scratch.grad_peers[rank][: plan.tokens * 8].view(plan.tokens, 8)
+        values = scratch.grad_peers[rank][: plan.tokens * plan.topk].view(plan.tokens, plan.topk)
         scratch.handle.barrier(channel=0)
         if plan.any_dropped:
             if plan.dropped:

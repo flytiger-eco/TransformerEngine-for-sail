@@ -100,7 +100,8 @@ void mega_moe_train_linear(const MegaMoETrainArgs &p, bool pull, bool transpose,
   const auto name =
       concat_strings("nvte_mega_moe_", transpose ? "fwd_" : "dgrad_", pull ? "pull" : "scatter");
   const bool scatter_only = !pull && p.d == nullptr;
-  const auto label = concat_strings(name, "_k", p.k, "_n", p.n, scatter_only ? "_direct" : "");
+  const auto label =
+      concat_strings(name, "_k", p.k, "_n", p.n, "_topk", p.topk, scatter_only ? "_direct" : "");
   static std::mutex mutex;
   static std::set<std::pair<int, std::string>> configured;
   {
@@ -114,7 +115,8 @@ void mega_moe_train_linear(const MegaMoETrainArgs &p, bool pull, bool transpose,
            "-DNVTE_GG_COMMON_K=1", "-DNVTE_GG_N_EXPAND=1", concat_strings("-DTRAIN_KERNEL=", name),
            concat_strings("-DTRAIN_PULL=", static_cast<int>(pull)),
            concat_strings("-DTRAIN_SCATTER_ONLY=", static_cast<int>(scatter_only)),
-           concat_strings("-DTRAIN_K=", p.k), concat_strings("-DTRAIN_N=", p.n)});
+           concat_strings("-DTRAIN_TOPK=", p.topk), concat_strings("-DTRAIN_K=", p.k),
+           concat_strings("-DTRAIN_N=", p.n)});
       manager.compile(label, name, string_code_mega_moe_train_cuh, "mega_moe_train.cu", opts,
                       headers());
       manager.set_function_attribute(label, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
