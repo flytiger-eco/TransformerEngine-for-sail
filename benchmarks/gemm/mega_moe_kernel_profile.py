@@ -25,10 +25,13 @@ MEGA = {
 }
 
 
-def attribute(kernels, backward):
+def attribute(kernels, backward, local_experts):
     """A phase contains one invocation. Repeated gradient symbols launch FC2 first."""
     groups = [[] for _ in STAGES]
     counts = Counter()
+    # expert_gemm batches tensor gradients by MegaMoEGradArgs::kMaxExperts.
+    # FC2 and FC1 each launch all their chunks, including a partial final chunk.
+    tensor_chunks = (local_experts + 31) // 32
     for name, us in kernels:
         stage = MEGA.get(name)
         # FC1 can also appear as a separate recompute during generic backward.
@@ -43,9 +46,10 @@ def attribute(kernels, backward):
             elif backward and name in ("nvte_mega_moe_wgrad", "nvte_mega_moe_tensor_wgrad"):
                 pair = 4
             if pair is not None:
-                if counts[pair] >= 2:
+                launches = tensor_chunks if name.startswith("nvte_mega_moe_tensor_") else 1
+                if counts[pair] >= 2 * launches:
                     raise ValueError(f"ambiguous GEMM sequence: {name}")
-                stage = pair + counts[pair]
+                stage = pair + counts[pair] // launches
                 counts[pair] += 1
             elif any(s in name for s in ("intranode::dispatch", "elastic::dispatch")):
                 stage = 2 if backward else 0
@@ -60,7 +64,7 @@ def attribute(kernels, backward):
     return groups
 
 
-def profile_steps(forward, backward, training, device):
+def profile_steps(forward, backward, training, device, local_experts):
     # Replay one captured layer four times per logical step. Release each graph before
     # the next replay, so profiling does not require four layers of activation memory.
     layers, steps = 4, 3
@@ -93,7 +97,9 @@ def profile_steps(forward, backward, training, device):
         times = [0.0] * len(STAGES)
         for region, span in regions.items():
             events = [(n, us) for start, n, us in kernels if span.start <= start < span.end]
-            for i, group in enumerate(attribute(events, region.startswith("replay_bwd_"))):
+            for i, group in enumerate(
+                attribute(events, region.startswith("replay_bwd_"), local_experts)
+            ):
                 times[i] += sum(us for _, us in group) / 1000
                 symbols[i].update(n for n, _ in group)
         values = torch.tensor(times, device=device, dtype=torch.float64)

@@ -217,7 +217,7 @@ def main():
     if args.profile_stages:
         from mega_moe_kernel_profile import profile_steps
 
-        profile = profile_steps(forward, backward, training, device)
+        profile = profile_steps(forward, backward, training, device, e)
     if rank == 0:
         result = {
             "tag": tag,
