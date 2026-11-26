@@ -9,6 +9,7 @@ on:
       - 'transformer_engine/common/gemm/rtc/**'
       - 'benchmarks/gemm/replay_mega_moe.py'
       - 'benchmarks/gemm/mega_moe_tags.py'
+      - 'benchmarks/gemm/mega_moe_kernel_profile.py'
       - 'benchmarks/gemm/benchmark_mega_moe*.py'
       - 'qa/L0_pytorch_mega_moe_rtc/**'
       - 'qa/L0_pytorch_grouped_gemm_rtc/test.sh'
@@ -137,24 +138,24 @@ jobs:
               `Commit \`${process.env.HEAD_SHA.slice(0, 7)}\` · [CI ${process.env.REPLAY_RESULT}](${run})`, ''];
             if (fs.existsSync(dir + '/comparison.md')) {
               const table = fs.readFileSync(dir + '/comparison.md', 'utf8');
-              if (fs.existsSync(dir + '/comparison.png')) {
-                const png = fs.readFileSync(dir + '/comparison.png');
+              for (const file of fs.readdirSync(dir).filter(f => /^stages-[A-Za-z0-9_.-]+\.png$/.test(f)).sort()) {
+                const png = fs.readFileSync(dir + '/' + file);
                 if (png.length > 5 * 1024 * 1024 || png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') {
-                  throw new Error('Invalid comparison.png');
+                  throw new Error(`Invalid ${file}`);
                 }
-                const path = `mega-moe/pr-${pr}/run-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}/comparison.png`;
+                const path = `mega-moe/pr-${pr}/run-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}/${file}`;
                 for (let attempt = 0; ; attempt++) {
                   try {
                     const {data} = await github.rest.repos.createOrUpdateFileContents({
                       ...repo, path, branch: 'ci-reports', message: `MegaMoE replay for PR #${pr}`,
                       content: png.toString('base64')
                     });
-                    lines.push(`![MegaMoE and DeepEP total step latency](${root}/raw/${data.commit.sha}/${path})`, '');
+                    lines.push(`![${file.slice(7, -4)} kernel times](${root}/raw/${data.commit.sha}/${path})`, '');
                     break;
                   } catch (error) {
                     if (error.status === 409 && attempt < 4) continue;
                     core.warning(`Image publication failed: ${error.message}`);
-                    lines.push(`[Download comparison.png from the run artifacts](${run})`, '');
+                    lines.push(`[Download ${file} from the run artifacts](${run})`, '');
                     break;
                   }
                 }

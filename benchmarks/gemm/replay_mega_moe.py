@@ -55,6 +55,7 @@ def main():
         help="require the EP8 saved-activation backend",
     )
     parser.add_argument("--backend", choices=("megamoe", "deepep"), default="megamoe")
+    parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--seed", type=int, default=73)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -213,6 +214,10 @@ def main():
             dist.all_reduce(times, op=dist.ReduceOp.MAX)
             samples.append(times.tolist())
         del grads, y
+    if args.profile_stages:
+        from mega_moe_kernel_profile import profile_steps
+
+        profile = profile_steps(forward, backward, training, device)
     if rank == 0:
         result = {
             "tag": tag,
@@ -226,6 +231,8 @@ def main():
                 zip(("forward", "backward", "total"), map(statistics.median, zip(*samples)))
             ),
         }
+        if args.profile_stages:
+            result["kernel_profile"] = profile
         if "expert_rows" in shard:
             result["rows_per_global_expert"] = shard["expert_rows"]
         print(json.dumps(result), flush=True)

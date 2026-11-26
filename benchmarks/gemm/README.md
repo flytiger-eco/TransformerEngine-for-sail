@@ -427,12 +427,14 @@ Use `--backend deepep` on the same replay command to measure DeepEP separately.
 For a source with zero tokens, its DeepEP adapter pads one all-dropped row and
 trims the result. This padding is timed and sends no expert rows.
 The Actions job summary and the artifact's `comparison.md` list forward,
-backward and total latency in milliseconds. The artifact also includes a total-step
-latency chart in `comparison.png`. DeepEP / PR above 1 means PR
+backward and total latency in milliseconds. The artifact also includes one six-stage kernel chart per case in `stages-<case>.png`.
+Each profiling step repeats the same captured invocation four times. Stage values sum
+rank-local kernel durations, take the maximum across ranks, then average three steps.
+The raw reports include matched device kernel names for each stage. DeepEP / PR above 1 means PR
 MegaMoE is faster. The 5% regression check compares MegaMoE head with base. The checked-in Megatron example has 64 experts, H=3584,
 I=3072 and eight source tags. To add a model case, place its `.tags` under
 `qa/L0_pytorch_mega_moe_rtc/tags/` or `MEGA_MOE_CI_CAPTURES` (default
-`/mnt/wl_nas/te-ci/mega-moe/captures`) and add a line with EP size, filename
-and call key to `qa/L0_pytorch_mega_moe_rtc/cases.txt`. Numerical failures
+`/mnt/wl_nas/te-ci/mega-moe/captures`) and add a line with EP size, filename,
+call key and a unique model/call label to `qa/L0_pytorch_mega_moe_rtc/cases.txt`. Numerical failures
 block the job. Manual and perf/refactor runs also enforce a 5% total latency
 regression threshold.

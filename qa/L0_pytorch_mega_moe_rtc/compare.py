@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 
 out = Path(sys.argv[1])
 failed = False
-totals = []
+charts = []
 summary = [
     "| Case | EP | Stage | MegaMoE base (ms) | MegaMoE PR (ms) | DeepEP + GroupGEMM (ms) | DeepEP / PR |",
     "|---|---:|---|---:|---:|---:|---:|",
@@ -48,27 +48,84 @@ for line in (out / "cases.txt").read_text().splitlines():
         if stage == "backward" and not head["backward"]:
             continue
         b, h, d = [statistics.median(r["median_ms"][stage] for r in arm) for arm in zip(*runs)]
-        if stage == "total":
-            totals.append((name, b, h, d))
         summary.append(f"| {name} | {world} | {stage} | {b:.3f} | {h:.3f} | {d:.3f} | {d/h:.3f}× |")
     failed |= ratio > 1.05
-report = "\n".join(summary) + "\n"
+    labels = ("Forward L1", "Forward L2", "Dgrad L2", "Dgrad L1", "Wgrad L2", "Wgrad L1")
+    keys = ("fwd_l1", "fwd_l2", "dgrad_l2", "dgrad_l1", "wgrad_l2", "wgrad_l1")
+    profiles = [r["kernel_profile"] for r in runs[0][1:]]
+    if any((p["layers_per_step"], p["steps"]) != (4, 3) for p in profiles):
+        raise ValueError("incompatible kernel profiles")
+    fig, ax = plt.subplots(figsize=(9, 4.5), layout="constrained")
+    charts.extend(
+        [
+            "",
+            f"#### {name} · EP{world}",
+            "",
+            "| Kernel stage | MegaMoE PR (ms) | DeepEP + GroupGEMM (ms) |",
+            "|---|---:|---:|",
+        ]
+    )
+    columns = []
+    for index, (profile, legend) in enumerate(zip(profiles, ("MegaMoE PR", "DeepEP + GroupGEMM"))):
+        column = []
+        for row, key in enumerate(keys):
+            names = profile["kernels"][key]
+            has_gemm = any(
+                n.startswith(("nvte_mega_moe_", "nvte_grouped_gemm")) and "bulk_" not in n
+                for n in names
+            )
+            has_comm = (
+                index == 0
+                or row >= 4
+                or any(("dispatch" if row in (0, 2) else "combine") in n for n in names)
+            )
+            value = profile["mean_ms"][key]
+            y = row + (index - 0.5) * 0.36
+            if has_gemm and has_comm and math.isfinite(value) and value > 0:
+                bar = ax.barh(
+                    y,
+                    value,
+                    height=0.34,
+                    color=("steelblue", "darkorange")[index],
+                    label=legend if row == 0 else None,
+                )
+                ax.bar_label(bar, fmt="%.2f", padding=3, fontsize=8)
+                column.append(f"{value:.3f}")
+            else:
+                ax.text(0, y, "N/A", va="center", fontsize=8)
+                column.append("N/A")
+        columns.append(column)
+    for label, h, d in zip(labels, *columns):
+        charts.append(f"| {label} | {h} | {d} |")
+    deep_ops = (
+        "dispatch + FC1",
+        "FC2 + combine",
+        "dispatch + FC2 dgrad",
+        "FC1 dgrad + combine",
+        "FC2 wgrad",
+        "FC1 wgrad",
+    )
+    ax.set_yticks(range(len(labels)), [f"{label}\n{op}" for label, op in zip(labels, deep_ops)])
+    ax.invert_yaxis()
+    ax.margins(x=0.17)
+    ax.set_xlabel("Mean kernel time per step (ms, four replays of the same layer)")
+    ax.set_title(f"{name}  ·  EP{world}")
+    ax.legend()
+    fig.savefig(out / f"stages-{name}.png", dpi=150)
+    plt.close(fig)
+summary.extend(
+    [
+        "",
+        "Stage timings sum selected device kernels over four replays of the same "
+        "captured layer, take the maximum rank per stage, then average three profiled steps. "
+        "DeepEP includes dispatch with forward L1 / dgrad L2 and combine with forward L2 / "
+        "dgrad L1. MegaMoE uses the executed GEMMs (pull/scatter when available) and any "
+        "explicit bulk payload kernels. Separate layout, activation, recompute, collectives "
+        "outside these kernels and local reductions are excluded. N/A indicates a missing "
+        "kernel match. Whole-step timings above measure one unprofiled layer.",
+    ]
+)
+report = "\n".join(summary + charts) + "\n"
 print(report)
 (out / "comparison.md").write_text(report)
-fig, ax = plt.subplots(figsize=(9, max(3, 0.95 * len(totals) + 1.6)), layout="constrained")
-for index, label in enumerate(("MegaMoE base", "MegaMoE PR", "DeepEP + GroupGEMM")):
-    bars = ax.barh(
-        [row + (index - 1) * 0.25 for row in range(len(totals))],
-        [row[index + 1] for row in totals],
-        height=0.24,
-        label=label,
-    )
-    ax.bar_label(bars, fmt="%.2f", padding=3, fontsize=8)
-ax.set_yticks(range(len(totals)), [row[0] for row in totals])
-ax.invert_yaxis()
-ax.margins(x=0.13)
-ax.set_xlabel("Total step latency (ms), lower is faster")
-ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1), ncols=3)
-fig.savefig(out / "comparison.png", dpi=150)
-plt.close(fig)
 sys.exit(int(failed and os.getenv("MEGA_MOE_CI_POLICY", "enforced") != "advisory"))

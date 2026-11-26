@@ -24,6 +24,7 @@ replay_case() {
                 venv=head
                 flags=(--backend deepep)
             fi
+            if [[ $arm != base && $sweep == 0 ]]; then flags+=(--profile-stages); fi
             "$scratch/$venv-venv/bin/python" -m torch.distributed.run --standalone \
                 --nproc-per-node="$world" "$source_dir/benchmarks/gemm/replay_mega_moe.py" \
                 "$log" --call "$tag" "${flags[@]}" --output "$out/$arm/$name-$sweep.json"
@@ -45,13 +46,13 @@ for world in 2 8; do
     tag=$(head -n 1 "$log" | cut -d, -f3 | cut -d: -f2-)
     backend=()
     if (( world == 8 )); then backend=(--expect-ep8-training); fi
-    replay_case "$world" "$tag" "$log" "ep$world" "${backend[@]}"
+    replay_case "$world" "$tag" "$log" "Synthetic-EP$world" "${backend[@]}"
 done
-while read -r world file call extra; do
+while read -r world file call name extra; do
     [[ -z "$world" || "$world" == \#* ]] && continue
-    [[ "$world" =~ ^[1-8]$ && "$file" =~ ^[a-zA-Z0-9_-]+\.tags$ && -n "$call" && -z "$extra" ]] || exit 2
+    [[ "$world" =~ ^[1-8]$ && "$file" =~ ^[a-zA-Z0-9_-]+\.tags$ && -n "$call" && "$name" =~ ^[a-zA-Z0-9_.-]+$ && -z "$extra" ]] || exit 2
     log="$source_dir/qa/L0_pytorch_mega_moe_rtc/tags/$file"
     if [[ ! -f "$log" ]]; then log="${MEGA_MOE_CI_CAPTURES:-/mnt/wl_nas/te-ci/mega-moe/captures}/$file"; fi
-    replay_case "$world" "$call" "$log" "model-$(printf '%s' "$file/$call" | sha256sum | cut -c1-16)"
+    replay_case "$world" "$call" "$log" "$name"
 done < "$source_dir/qa/L0_pytorch_mega_moe_rtc/cases.txt"
 "$scratch/head-venv/bin/python" "$source_dir/qa/L0_pytorch_mega_moe_rtc/compare.py" "$out"
