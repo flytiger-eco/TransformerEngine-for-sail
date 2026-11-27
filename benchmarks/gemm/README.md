@@ -349,15 +349,15 @@ The fused public path admits EP2/EP8, BF16, top-k one through eight, H and I div
 
 ## 11. EP8 training with saved SwiGLU activations
 
-The balanced BF16 case in section 10 has 2,048 source tokens per rank and 2,048 rows per expert. The training replay uses 64 experts, top-k eight, FC1 [6144,3584] and FC2 [3584,3072]. It checks the output, input gradient, routing-weight gradient and both lists of expert weight gradients before timing. The DeepEP training baseline uses non-expanded dispatch, local grouping and the cached handle for backward dispatch and gradient return. Both saved-activation implementations use the same activation derivative and local weight-gradient kernels.
+The balanced BF16 case in section 10 has 2,048 source tokens per rank and 2,048 rows per expert. The training replay uses 64 experts, top-k eight, FC1 [6144,3584] and FC2 [3584,3072]. It checks the output, input gradient, routing-weight gradient and both lists of expert weight gradients before timing. The DeepEP training baseline uses non-expanded dispatch, local grouping and the cached handle for backward dispatch and gradient return. Both saved-activation implementations use the same activation derivative. For each expert projection the DeepEP baseline uses TE RTC GroupGEMM with the GroupedLinear layouts TN for forward, NN for dgrad and NT for wgrad.
 
-On eight ICN64-connected SM89 PPUs, three warmups and eight timed iterations gave the following median latencies in ms. Each sample takes the maximum across ranks for its interval. The total measures forward plus backward in one iteration.
+The following historical comparison used MegaMoE gradient GEMMs in the DeepEP backward pass. On eight ICN64-connected SM89 PPUs, three warmups and eight timed iterations gave these median latencies in ms. Each sample takes the maximum across ranks for its interval. The total measures forward plus backward in one iteration.
 
 | Training path | Forward | Backward | Total |
 | --- | ---: | ---: | ---: |
 | MegaMoE, saved activations | 8.615 | 11.905 | 20.522 |
 | MegaMoE, FC1 recompute | 4.834 | 14.183 | 19.005 |
-| DeepEP + grouped GEMM | 5.036 | 8.241 | 13.267 |
+| DeepEP, RTC forward and MegaMoE dgrad/wgrad | 5.036 | 8.241 | 13.267 |
 
 Saving the activations reduced backward by 2.278 ms. Forward took 3.781 ms longer, increasing the total by 1.518 ms. The saved path retained 592 MiB per owner for packed input, gate/up, weighted BF16 activation and unweighted FP32 activation, excluding route metadata, workspace and temporaries. The backward profile contained one pull dgrad, one activation derivative, one scatter dgrad and two local weight-gradient GEMMs.
 

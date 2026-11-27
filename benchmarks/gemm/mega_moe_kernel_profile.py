@@ -39,8 +39,13 @@ def attribute(kernels, backward, local_experts):
             continue
         if stage is None:
             pair = None
-            if not backward and name.startswith("nvte_grouped_gemm"):
-                pair = 0
+            if name.startswith("nvte_grouped_gemm"):
+                if not backward:
+                    pair = 0
+                elif "_LA_RM_LB_RM_" in name:  # GroupedLinear NN dgrad
+                    pair = 2
+                elif "_LA_CM_LB_RM_" in name:  # GroupedLinear NT wgrad
+                    pair = 4
             elif backward and name in ("nvte_mega_moe_dgrad", "nvte_mega_moe_tensor_dgrad"):
                 pair = 2
             elif backward and name in ("nvte_mega_moe_wgrad", "nvte_mega_moe_tensor_wgrad"):

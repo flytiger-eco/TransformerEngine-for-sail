@@ -19,7 +19,10 @@ out = Path(sys.argv[1])
 failed = False
 charts = []
 summary = [
-    "| Case | EP | Stage | MegaMoE base (ms) | MegaMoE PR (ms) | DeepEP + GroupGEMM (ms) | DeepEP / PR |",
+    (
+        "| Case | EP | Stage | MegaMoE base (ms) | MegaMoE PR (ms) | DeepEP + TE RTC GroupGEMM (ms)"
+        " | DeepEP / PR |"
+    ),
     "|---|---:|---|---:|---:|---:|---:|",
 ]
 for line in (out / "cases.txt").read_text().splitlines():
@@ -55,18 +58,29 @@ for line in (out / "cases.txt").read_text().splitlines():
     profiles = [r["kernel_profile"] for r in runs[0][1:]]
     if any((p["layers_per_step"], p["steps"]) != (4, 3) for p in profiles):
         raise ValueError("incompatible kernel profiles")
+    deepep = runs[0][2]
+    expert_rows = deepep.get("rows_per_global_expert")
+    if expert_rows is None or any(expert_rows):
+        for key in keys if deepep["backward"] else keys[:2]:
+            names = profiles[1]["kernels"][key]
+            if any(n.startswith("nvte_mega_moe_") for n in names) or not any(
+                n.startswith("nvte_grouped_gemm3_") for n in names
+            ):
+                raise ValueError(f"{name} DeepEP {key}: expected TE RTC GroupGEMM, got {names}")
     fig, ax = plt.subplots(figsize=(9, 4.5), layout="constrained")
     charts.extend(
         [
             "",
             f"#### {name} · EP{world}",
             "",
-            "| Kernel stage | MegaMoE PR (ms) | DeepEP + GroupGEMM (ms) |",
+            "| Kernel stage | MegaMoE PR (ms) | DeepEP + TE RTC GroupGEMM (ms) |",
             "|---|---:|---:|",
         ]
     )
     columns = []
-    for index, (profile, legend) in enumerate(zip(profiles, ("MegaMoE PR", "DeepEP + GroupGEMM"))):
+    for index, (profile, legend) in enumerate(
+        zip(profiles, ("MegaMoE PR", "DeepEP + TE RTC GroupGEMM"))
+    ):
         column = []
         for row, key in enumerate(keys):
             names = profile["kernels"][key]
@@ -116,13 +130,16 @@ for line in (out / "cases.txt").read_text().splitlines():
 summary.extend(
     [
         "",
-        "Stage timings sum selected device kernels over four replays of the same "
-        "captured layer, take the maximum rank per stage, then average three profiled steps. "
-        "DeepEP includes dispatch with forward L1 / dgrad L2 and combine with forward L2 / "
-        "dgrad L1. MegaMoE uses the executed GEMMs (pull/scatter when available) and any "
-        "explicit bulk payload kernels. Separate layout, activation, recompute, collectives "
-        "outside these kernels and local reductions are excluded. N/A indicates a missing "
-        "kernel match. Whole-step timings above measure one unprofiled layer.",
+        (
+            "Stage timings sum selected device kernels over four replays of the same "
+            "captured layer, take the maximum rank per stage, then average three profiled steps. "
+            "DeepEP uses TE RTC GroupGEMM for forward (TN), dgrad (NN) and wgrad (NT). "
+            "Its times include dispatch with forward L1 / dgrad L2 and combine with forward L2 / "
+            "dgrad L1. MegaMoE uses the executed GEMMs (pull/scatter when available) and any "
+            "explicit bulk payload kernels. Separate layout, activation, recompute, collectives "
+            "outside these kernels and local reductions are excluded. N/A indicates a missing "
+            "kernel match. Whole-step timings above measure one unprofiled layer."
+        ),
     ]
 )
 report = "\n".join(summary + charts) + "\n"
