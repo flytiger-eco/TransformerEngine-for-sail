@@ -420,6 +420,23 @@ and requested gradients against TE's all-to-all transport. Timing JSON reports
 rank-max forward, backward and total CUDA-event samples and medians. The
 reader also accepts previously captured v1 manifests and their original shards.
 
+For the Qwen EP16 training capture, start one torchrun agent on each of two
+eight-PPU hosts in the same ICN fabric. Use the same PyTorch build on both
+hosts. Set `NODE_RANK` to 0 and 1 respectively and `MASTER_ADDR` to the
+first host's reachable address. The opt-in uses cross-host CUDA symmetric
+memory for expert inputs and output slots.
+
+```bash
+export NVTE_MOE_EP16_FUSED=1
+torchrun --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+  benchmarks/gemm/replay_mega_moe.py \
+  qa/L0_pytorch_mega_moe_rtc/tags/qwen35-ep16-r5-call0.tags \
+  --profile-ep16-path --output qwen-ep16.json
+# Run on rank zero's host after torchrun exits.
+python qa/L0_pytorch_mega_moe_rtc/verify_ep16.py qwen-ep16.json
+```
+
 The 890P gate captures EP2 and EP8 test calls. It runs each BF16 distributed tag
 through merge-base MegaMoE, PR MegaMoE, and DeepEP intranode dispatch/combine with
 the PR wheel's RTC grouped GEMMs. The second sweep reverses the three-way order.

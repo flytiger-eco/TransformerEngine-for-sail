@@ -182,23 +182,23 @@ def _run_mega_moe(
         not torch.compiler.is_compiling()
         and not is_fake(x)
         and ep_group is not None
-        and ep_group.size() == 8
+        and ep_group.size() in (8, 16)
         and x.is_cuda
     ):
         from ._mega_moe_peer import _peer_supported, _workspace
 
         with torch.cuda.device(x.device):
             if _peer_supported(ep_group, x.device) and _workspace(ep_group).training_supported:
-                # All eager EP8 peers must agree before entering different transports.
+                # All eager training peers must agree before entering different transports.
                 # Sum two binary flags to distinguish mixed precision and mixed grad mode.
                 mode = x.new_tensor(
                     [dtype == torch.bfloat16, torch.is_grad_enabled()], dtype=torch.int32
                 )
                 torch.distributed.all_reduce(mode, group=ep_group)
                 bf16, grad = mode.tolist()
-                if bf16 not in (0, 8):
+                if bf16 not in (0, ep_group.size()):
                     raise ValueError("Expert-parallel input dtype must match on every rank")
-                if grad not in (0, 8):
+                if grad not in (0, ep_group.size()):
                     raise ValueError("Expert-parallel grad mode must match on every rank")
                 if bf16 and grad:
                     from ._mega_moe_train import training_forward
@@ -252,7 +252,9 @@ def bf16_mega_moe(
     inputs, gate/up and SwiGLU outputs for backward. FC2 dgrad gathers source
     output gradients, FC1 dgrad scatters per-route input gradients, and both
     expert weight gradients are local grouped GEMMs. Backward returns gradients
-    for x, routing weights, and both expert weight lists.
+    for x, routing weights, and both expert weight lists. Set NVTE_MOE_EP16_FUSED=1
+    on all sixteen ranks to use this training path on an ICN fabric with cross-host
+    CUDA symmetric memory. All ranks must use a compatible symmetric-memory runtime.
 
     The fallback first-order backward recomputes FC1 and returns gradients for x, routing
     weights and both local expert weight lists. Two peer-accessible SM89 PPUs

@@ -55,6 +55,11 @@ def main():
         help="require the EP8 saved-activation backend",
     )
     parser.add_argument("--backend", choices=("megamoe", "deepep"), default="megamoe")
+    parser.add_argument(
+        "--profile-ep16-path",
+        action="store_true",
+        help="record per-rank forward/backward kernel and collective counts for a two-node EP16 replay",
+    )
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--seed", type=int, default=73)
     parser.add_argument("--output", type=Path)
@@ -132,6 +137,11 @@ def main():
     if len(set(modes)) != 1:
         raise ValueError("only some EP ranks have differentiable inputs for backward")
 
+    if args.profile_ep16_path and (
+        world != 16 or group is None or not training or args.backend != "megamoe"
+    ):
+        raise ValueError("--profile-ep16-path requires a distributed EP16 MegaMoE training capture")
+
     def megamoe_forward():
         with torch.set_grad_enabled(grad_enabled):
             return op(x, ids, probs, weights[:e], weights[e:], ep_group=group)
@@ -177,8 +187,8 @@ def main():
 
     y = forward()
     backend = type(y.grad_fn).__name__ if y.grad_fn is not None else None
-    if args.expect_ep8_training and backend != "_TrainBackward":
-        raise AssertionError(f"expected saved-activation EP8 training, got {backend}")
+    if (args.expect_ep8_training or args.profile_ep16_path) and backend != "_TrainBackward":
+        raise AssertionError(f"expected fused EP{world} training, got {backend}")
     actual = (y.detach(), *backward(y))
     errors = torch.stack(
         [
@@ -218,6 +228,10 @@ def main():
         from mega_moe_kernel_profile import profile_steps
 
         profile = profile_steps(forward, backward, training, device, e)
+    if args.profile_ep16_path:
+        from mega_moe_kernel_profile import profile_ep16_call
+
+        paths = profile_ep16_call(forward, backward)
     if rank == 0:
         result = {
             "tag": tag,
@@ -233,6 +247,8 @@ def main():
         }
         if args.profile_stages:
             result["kernel_profile"] = profile
+        if args.profile_ep16_path:
+            result["rank_paths"] = paths
         if "expert_rows" in shard:
             result["rows_per_global_expert"] = shard["expert_rows"]
         print(json.dumps(result), flush=True)

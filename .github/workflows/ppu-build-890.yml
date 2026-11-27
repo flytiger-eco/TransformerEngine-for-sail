@@ -168,3 +168,55 @@ jobs:
             ${{ env.ENV_SETUP }}
             ${{ env.TEST_SETUP }}
             ${{ env.SMOKE_TEST }}
+
+  qwen-ep16:
+    name: Qwen EP16 fused MegaMoE (2 nodes × 8 PPUs)
+    needs: build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: k8s-runner-group-cpu-flytiger
+    timeout-minutes: 100
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TE_REF }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select MegaMoE changes
+        id: select
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ -n "$BASE" ]] && git diff --quiet "$BASE...HEAD" -- \
+              ':(glob)transformer_engine/**/*mega_moe*' transformer_engine/common/gemm \
+              benchmarks/gemm/mega_moe_tags.py benchmarks/gemm/mega_moe_kernel_profile.py \
+              benchmarks/gemm/replay_mega_moe.py qa/L0_pytorch_mega_moe_rtc \
+              .github/workflows/ppu-build-890.yml; then
+            echo "selected=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "selected=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Replay Qwen BF16 EP16 and verify kernels on every rank
+        if: steps.select.outputs.selected == 'true'
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          rack_policy: same
+          nnodes: 2
+          nproc_per_node: 8
+          timeout_minutes: 90
+          command: |
+            ${{ env.ENV_SETUP }}
+            wheel_dir='${{ env.ARTIFACT_DIR }}'
+            [[ $(cat "$wheel_dir/commit") == '${{ env.TE_REF }}' ]]
+            bash "$SOURCE_DIR/qa/L0_pytorch_mega_moe_rtc/test_ep16.sh" "$wheel_dir"
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.select.outputs.selected == 'true'
+        with:
+          name: qwen-ep16-rank-paths
+          path: /wl_nas/${{ env.ARTIFACT_SUBDIR }}/qwen-ep16-paths.json
+          if-no-files-found: warn

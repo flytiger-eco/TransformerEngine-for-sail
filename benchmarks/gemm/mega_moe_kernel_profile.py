@@ -120,3 +120,38 @@ def profile_steps(forward, backward, training, device, local_experts):
         "mean_ms": dict(zip(STAGES, map(statistics.mean, zip(*samples)))),
         "kernels": dict(zip(STAGES, names)),
     }
+
+
+def profile_ep16_call(forward, backward):
+    """Record the actual collectives and device kernels for each half of one EP16 call."""
+    import os
+    import socket
+
+    rank = dist.get_rank()
+    node = os.environ.get("NODE_NAME") or socket.gethostname()
+    local_rank = torch.cuda.current_device()
+
+    def observe(fn):
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            result = fn()
+            torch.cuda.synchronize()
+        kernels = Counter()
+        collectives = Counter()
+        for event in prof.events():
+            if event.device_type == torch.autograd.DeviceType.CUDA:
+                if "mega_moe" in event.name or "nvte_grouped_gemm" in event.name:
+                    kernels[event.name] += 1
+            elif event.name.startswith("c10d::") and "alltoall" in event.name.replace("_", ""):
+                collectives[event.name] += 1
+        return result, {"kernels": dict(kernels), "collectives": dict(collectives)}
+
+    y, fwd = observe(forward)
+    _, bwd = observe(lambda: backward(y))
+    records = [None] * dist.get_world_size()
+    dist.all_gather_object(
+        records,
+        {"rank": rank, "node": node, "local_rank": local_rank, "forward": fwd, "backward": bwd},
+    )
+    return records
