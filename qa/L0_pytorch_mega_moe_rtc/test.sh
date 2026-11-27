@@ -5,6 +5,7 @@ set -euo pipefail
 source_dir=$1
 scratch=$2
 out=$3
+base_sha=$(git -C "$scratch/base" rev-parse HEAD)
 mkdir -p "$out/deepep"
 "$scratch/head-venv/bin/python" -m pip install --no-deps --no-build-isolation \
     --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
@@ -18,8 +19,10 @@ while read -r world file call name extra; do
     echo "$name $world $call" >> "$out/cases.txt"
     launch=(-m torch.distributed.run --standalone --nproc-per-node="$world")
     for sweep in 0 1; do
+        flags=()
+        if (( sweep == 0 )); then flags+=(--profile-stages); fi
         "$scratch/base-venv/bin/python" "${launch[@]}" "$source_dir/benchmarks/gemm/replay_mega_moe.py" \
-            "$log" --call "$call" --output "$out/base/$name-$sweep.json"
+            "$log" --call "$call" "${flags[@]}" --output "$out/base/$name-$sweep.json"
         if (( sweep == 0 )); then
             "$scratch/head-venv/bin/python" "${launch[@]}" \
                 "$source_dir/qa/L0_pytorch_mega_moe_rtc/replay_head_sweeps.py" \
@@ -27,4 +30,5 @@ while read -r world file call name extra; do
         fi
     done
 done < "$source_dir/qa/L0_pytorch_mega_moe_rtc/cases.txt"
-"$scratch/head-venv/bin/python" "$source_dir/qa/L0_pytorch_mega_moe_rtc/compare.py" "$out"
+"$scratch/head-venv/bin/python" "$source_dir/qa/L0_pytorch_mega_moe_rtc/compare.py" "$out" \
+    --baseline-commit "$base_sha"

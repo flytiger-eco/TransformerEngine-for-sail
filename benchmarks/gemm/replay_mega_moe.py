@@ -55,10 +55,19 @@ def parse_args(argv=None):
         help="require the EP8 saved-activation backend",
     )
     parser.add_argument("--backend", choices=("megamoe", "deepep"), default="megamoe")
-    parser.add_argument(
+    ep16 = parser.add_mutually_exclusive_group()
+    ep16.add_argument(
         "--profile-ep16-path",
-        action="store_true",
-        help="record per-rank forward/backward kernel and collective counts for a two-node EP16 replay",
+        action="store_const",
+        const="fused",
+        help="record per-rank kernel and collective counts and require fused EP16 training",
+    )
+    ep16.add_argument(
+        "--profile-ep16-baseline-path",
+        dest="profile_ep16_path",
+        action="store_const",
+        const="auto",
+        help="record the EP16 path selected by the baseline wheel, including its fallback",
     )
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--seed", type=int, default=73)
@@ -195,7 +204,9 @@ def replay(args, device):
 
     y = forward()
     backend = type(y.grad_fn).__name__ if y.grad_fn is not None else None
-    if (args.expect_ep8_training or args.profile_ep16_path) and backend != "_TrainBackward":
+    if (
+        args.expect_ep8_training or args.profile_ep16_path == "fused"
+    ) and backend != "_TrainBackward":
         raise AssertionError(f"expected fused EP{world} training, got {backend}")
     actual = (y.detach(), *backward(y))
     errors = torch.stack(

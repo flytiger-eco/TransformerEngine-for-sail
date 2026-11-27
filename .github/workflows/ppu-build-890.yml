@@ -198,7 +198,35 @@ jobs:
             echo "selected=false" >> "$GITHUB_OUTPUT"
           else
             echo "selected=true" >> "$GITHUB_OUTPUT"
+            base=$(git merge-base HEAD "${BASE:-origin/v2.18-SAIL}")
+            cache="te-ci/rtc-grouped-gemm/wheels/cache-$base"
+            if [[ $base == "$(git rev-parse HEAD)" ]]; then
+              dir=$ARTIFACT_SUBDIR
+            elif [[ -f /wl_nas/$cache/commit && $(cat "/wl_nas/$cache/commit") == "$base" ]] && compgen -G "/wl_nas/$cache/transformer_engine*.whl" > /dev/null; then
+              dir=$cache
+            else
+              dir="$ARTIFACT_SUBDIR/merge-base-wheel"
+              echo "build_base=true" >> "$GITHUB_OUTPUT"
+            fi
+            echo "base_sha=$base" >> "$GITHUB_OUTPUT"
+            echo "base_dir=$dir" >> "$GITHUB_OUTPUT"
           fi
+      - name: Build missing EP16 merge-base wheel
+        if: steps.select.outputs.build_base == 'true'
+        uses: flytiger-eco/shared-workflows/cluster-task@ff0ba437e1be55f5cecc51e4fde43c2908beaf56
+        with:
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          nnodes: 0
+          nproc_per_node: 1
+          timeout_minutes: 90
+          command: |
+            ${{ env.ENV_SETUP }}
+            export TE_REF='${{ steps.select.outputs.base_sha }}'
+            export ARTIFACT_DIR='/mnt/wl_nas/${{ steps.select.outputs.base_dir }}'
+            ${{ env.BUILD_COMMAND }}
       - name: Replay Qwen BF16 EP16 and verify kernels on every rank
         if: steps.select.outputs.selected == 'true'
         uses: flytiger-eco/shared-workflows/cluster-task@ff0ba437e1be55f5cecc51e4fde43c2908beaf56
@@ -218,7 +246,8 @@ jobs:
             ${{ env.ENV_SETUP }}
             wheel_dir='${{ env.ARTIFACT_DIR }}'
             [[ $(cat "$wheel_dir/commit") == '${{ env.TE_REF }}' ]]
-            bash "$SOURCE_DIR/qa/L0_pytorch_mega_moe_rtc/test_ep16.sh" "$wheel_dir"
+            bash "$SOURCE_DIR/qa/L0_pytorch_mega_moe_rtc/test_ep16.sh" "$wheel_dir" \
+              '/mnt/wl_nas/${{ steps.select.outputs.base_dir }}' '${{ steps.select.outputs.base_sha }}'
       - name: Summarize EP16 replay timings
         if: steps.select.outputs.selected == 'true' && success()
         run: cat "/wl_nas/${{ env.ARTIFACT_SUBDIR }}/qwen-ep16/comparison.md" >> "$GITHUB_STEP_SUMMARY"

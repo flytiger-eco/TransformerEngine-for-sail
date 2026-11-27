@@ -3,6 +3,9 @@
 # See LICENSE for license information.
 set -euo pipefail
 wheel_dir=$1
+base_dir=$2
+base_sha=$3
+[[ $(cat "$base_dir/commit") == "$base_sha" ]]
 qa="$SOURCE_DIR/qa/L0_pytorch_mega_moe_rtc"
 out="$wheel_dir/qwen-ep16"
 name=Qwen35-EP16-r5
@@ -11,27 +14,44 @@ call=qwen35-ep16-r5/0/135/0.1.2.3.4.5.6.7.8.9.10.11.12.13.14.15/0
 scratch=$(mktemp -d)
 cd "$scratch"
 unset PYTHONPATH
-python3 -m venv --system-site-packages venv
-py="$scratch/venv/bin/python"
-"$py" -m pip install --only-binary=:all: --no-deps packaging==24.2 nvidia-cudnn-frontend==1.25.0
-"$py" -m pip install --only-binary=:all: pydantic importlib-metadata einops onnx onnxscript nvdlfw-inspect
-"$py" -m pip install --ignore-installed --no-deps "$wheel_dir"/transformer_engine*.whl
+for arm in base head; do
+    dir=$base_dir
+    if [[ $arm == head ]]; then dir=$wheel_dir; fi
+    python3 -m venv --system-site-packages "$arm-venv"
+    py="$scratch/$arm-venv/bin/python"
+    "$py" -m pip install --only-binary=:all: --no-deps packaging==24.2 nvidia-cudnn-frontend==1.25.0
+    "$py" -m pip install --only-binary=:all: pydantic importlib-metadata einops onnx onnxscript nvdlfw-inspect
+    "$py" -m pip install --ignore-installed --no-deps "$dir"/transformer_engine*.whl
+    "$py" - <<'CHECK_WHEEL'
+import sys
+from pathlib import Path
+import transformer_engine.pytorch as te
+from transformer_engine.common import _get_shared_object_file
+
+for path in (te.__file__, _get_shared_object_file("core"), _get_shared_object_file("torch")):
+    assert Path(path).resolve().is_relative_to(Path(sys.prefix)), path
+CHECK_WHEEL
+done
+head_py="$scratch/head-venv/bin/python"
 export EP_PCCL_ROOT_DIR=/usr/local/pccl DEEPEP_NUM_MAX_ICN_PEERS=16
-"$py" -m pip install --no-deps --no-build-isolation \
+"$head_py" -m pip install --no-deps --no-build-isolation \
     --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
     'deep-ep==2.2.1+v0.1.0.ppu2.2.0'
 export OMP_NUM_THREADS=1 NVTE_MOE_EP16_FUSED=1
-mkdir -p "$out/head" "$out/deepep"
+mkdir -p "$out/base" "$out/head" "$out/deepep"
 for sweep in 0 1; do
-    arms=(head deepep)
-    if (( sweep == 1 )); then arms=(deepep head); fi
+    arms=(base head deepep)
+    if (( sweep == 1 )); then arms=(deepep head base); fi
     for arm in "${arms[@]}"; do
+        py="$head_py"
+        if [[ $arm == base ]]; then py="$scratch/base-venv/bin/python"; fi
         backend=megamoe
         flags=()
         if [[ $arm == deepep ]]; then backend=deepep; fi
         if (( sweep == 0 )); then
             flags+=(--profile-stages)
             if [[ $arm == head ]]; then flags+=(--profile-ep16-path); fi
+            if [[ $arm == base ]]; then flags+=(--profile-ep16-baseline-path); fi
         fi
         report="$out/$arm/$name-$sweep.json"
         "$py" -m torch.distributed.run --nnodes="$NNODES" --nproc-per-node="$NPROC_PER_NODE" \
@@ -46,7 +66,7 @@ for sweep in 0 1; do
     done
 done
 if [[ $NODE_RANK == 0 ]]; then
-    "$py" -m pip install --only-binary=:all: 'matplotlib>=3.7,<4'
+    "$head_py" -m pip install --only-binary=:all: 'matplotlib>=3.7,<4'
     printf '%s 16 %s\n' "$name" "$call" > "$out/cases.txt"
-    "$py" "$qa/compare.py" "$out" --head-vs-deepep
+    MEGA_MOE_CI_POLICY=advisory "$head_py" "$qa/compare.py" "$out" --baseline-commit "$base_sha"
 fi

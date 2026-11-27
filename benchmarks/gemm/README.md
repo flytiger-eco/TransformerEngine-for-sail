@@ -437,16 +437,18 @@ torchrun --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
 python qa/L0_pytorch_mega_moe_rtc/verify_ep16.py qwen-ep16.json
 ```
 
-The two-node Qwen CI job measures fused MegaMoE and DeepEP with TE RTC GroupGEMM
-on the same 16 PPUs and route capture. The two sweeps reverse the backend order.
+The two-node Qwen CI job measures merge-base MegaMoE, PR MegaMoE and DeepEP with TE RTC
+GroupGEMM on the same 16 PPUs and route capture. The second sweep reverses their order.
+The baseline uses the path selected by its own wheel. The report records how many
+baseline ranks executed all-to-all in each direction.
 Each backend runs five warmups and twenty timed replays per sweep. The PR report
 includes single-layer forward, backward and total latency, plus a chart for the
 six kernel stages using the same profiling convention as the single-node gate.
 The `qwen-ep16-rank-paths` artifact contains the timing samples, rank-path
 verification and plotted data.
 
-The single-node 890P gate replays the captured Megatron EP8 and Qwen35B-A3B
-EP8 training calls. It runs each BF16 distributed tag through merge-base MegaMoE, PR MegaMoE, and DeepEP intranode dispatch/combine with
+The single-node 890P gate replays Megatron EP8, DeepSeek-V4.1 calls 0 and 1,
+and Qwen35B-A3B call 3. It runs each BF16 distributed tag through merge-base MegaMoE, PR MegaMoE, and DeepEP intranode dispatch/combine with
 the PR wheel's RTC grouped GEMMs. The second sweep reverses the three-way order.
 The four middle arms of each single-node case share one PR-wheel process group.
 Each arm restores the capture and seed, checks the reference, and performs its own warmup and timing.
@@ -454,7 +456,8 @@ Use `--backend deepep` on the same replay command to measure DeepEP separately.
 For a source with zero tokens, its DeepEP adapter pads one all-dropped row and
 trims the result. This padding is timed and sends no expert rows.
 The Actions job summary and the artifact's `comparison.md` list forward,
-backward and total latency in milliseconds. The artifact also includes one six-stage kernel chart per case in `stages-<case>.png`.
+backward and total latency in milliseconds. Each `stages-<case>.png` plots all three implementations across six kernel stages.
+The report records the merge-base SHA and shows both baseline / PR and DeepEP / PR latency ratios.
 Each profiling step repeats the same captured invocation four times. Stage values sum
 rank-local kernel durations, take the maximum across ranks, then average three steps.
 The raw reports include matched device kernel names for each stage. DeepEP / PR above 1 means PR
