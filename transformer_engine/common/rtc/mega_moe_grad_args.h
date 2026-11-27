@@ -11,6 +11,7 @@ namespace transformer_engine::rtc {
 struct MegaMoEGradArgs {
   static constexpr int kMaxExperts = 32;
   const int *offsets;
+  const int *reduction_rows;  // Optional wgrad K lengths within the packed expert intervals.
   const void *a, *b;
   void *d;
   void *expert[kMaxExperts];  // Input weights for dgrad/recompute, destinations for wgrad.

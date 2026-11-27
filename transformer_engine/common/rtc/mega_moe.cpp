@@ -106,15 +106,22 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
   const bool fixed_wgrad = wgrad && !p.accumulate && !fp32_out && p.groups > 1 && n >= 2048 &&
                            n % 256 == 0 && p.output_width % 256 == 0 && p.rows % p.groups == 0 &&
                            mean >= 512 && mean <= 1536 && mean % 256 == 0;
-  const int common_n = fixed || fixed_wgrad ? n : 0;
+  // The training router supplies aligned K bounds. Four consecutive N tiles can share
+  // one pipeline even if adjacent experts have different reduction lengths.
+  const bool ragged_columns =
+      wgrad && p.reduction_rows && !p.accumulate && !fp32_out && n >= 1024 && n % 256 == 0 &&
+      p.output_width % 256 == 0 &&
+      int64_t(p.output_width / 256) * (n / 1024) * p.groups >= 2 * cuda::sm_count();
+  const int common_n = fixed || fixed_wgrad || ragged_columns ? n : 0;
   const int common_k =
       fixed_wgrad ? mean : (fixed ? (recompute ? p.input_width : p.output_width) : 0);
-  const int weight_rows = fixed_wgrad ? p.output_width : 0;
+  const int weight_rows = fixed_wgrad || ragged_columns ? p.output_width : 0;
   const bool four_columns =
       fixed_wgrad && mean == 512 && n % 1024 == 0 &&
       int64_t(p.output_width / 256) * (n / 1024) * p.groups >= cuda::sm_count() * 2;
+  const int column_mode = ragged_columns ? 2 : static_cast<int>(four_columns);
   const auto label = concat_strings(name, "_", fp16, "_", fp32_out, "_", common_n, "_", common_k,
-                                    "_", weight_rows, "_", four_columns);
+                                    "_", weight_rows, "_", column_mode);
   constexpr int smem = 196608;
   // Function attributes belong to a device even if its architecture shares a compiled image.
   static std::mutex mutex;
@@ -132,7 +139,7 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
                       concat_strings("-DNVTE_MOE_FP16=", int(fp16)),
                       concat_strings("-DNVTE_GG_COMMON_K=", recompute ? 0 : common_k),
                       concat_strings("-DNVTE_MOE_WEIGHT_ROWS=", weight_rows),
-                      concat_strings("-DNVTE_MOE_FOUR_COLUMNS=", int(four_columns)),
+                      concat_strings("-DNVTE_MOE_FOUR_COLUMNS=", column_mode),
                       concat_strings("-DNVTE_MOE_COMMON_N=", common_n),
                       concat_strings("-DNVTE_MOE_COMMON_K=", common_k)});
       manager.compile(label, name, string_code_mega_moe_backward_gemm_cu,
