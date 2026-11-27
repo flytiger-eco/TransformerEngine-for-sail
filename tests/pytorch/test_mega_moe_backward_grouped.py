@@ -146,6 +146,33 @@ def test_wgrad_checks_each_experts_reduction_length():
             _assert_gradient(grad[m[:, None], n], ref, 0.006)
 
 
+def test_dense_wgrad_overwrites_empty_and_partial_reductions():
+    torch.manual_seed(361)
+    stride, n = 1536, 2048
+    counts = (0, 129, stride, 64)
+    # The dense launcher needs (m // 256) * (n // 1024) * groups >= 2 * CUs.
+    cus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    tiles_per_m = (n // 1024) * len(counts)
+    m = 256 * ((2 * cus + tiles_per_m - 1) // tiles_per_m)
+    rows = len(counts) * stride
+    x = torch.full((rows, n), 7, dtype=torch.bfloat16, device="cuda")
+    dy = x.new_full((rows, m), -5)
+    lengths = torch.tensor(counts, dtype=torch.int32, device=x.device)
+    offsets = torch.arange(len(counts) + 1, dtype=torch.int32, device=x.device) * stride
+    grads = [x.new_full((m, n), float("nan")) for _ in counts]
+
+    # Small integers accumulate exactly in FP32. Keep every padded element nonzero.
+    for expert, count in enumerate(counts):
+        live = slice(expert * stride, expert * stride + count)
+        x[live].random_(-1, 2)
+        dy[live].random_(-1, 2)
+    tex.mega_moe_wgrad(dy, x, offsets, grads, False, lengths)
+    for expert, (count, grad) in enumerate(zip(counts, grads)):
+        live = slice(expert * stride, expert * stride + count)
+        reference = dy[live].float().T @ x[live].float()
+        torch.testing.assert_close(grad, reference.to(grad.dtype), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("m", [1024, 2048])
 def test_wgrad_uses_live_rows_with_padded_offsets(m):
     torch.manual_seed(303)
