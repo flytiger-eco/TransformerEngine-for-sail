@@ -459,8 +459,10 @@ struct CollectiveMma<
   CUTLASS_DEVICE void compute_nexpand(Acc& accum, TensorA gA, TensorB gB,
                                       int k_tiles_per_n, int thread_idx, char* smem_buf,
                                       AfterNTile&& after_n_tile, int n_tile_start) {
-    static_assert(DispatchPolicy::Stages == 3 && size<0>(TileShape{}) == 256 &&
-                  (size<1>(TileShape{}) == 128 || size<1>(TileShape{}) == 256) &&
+    constexpr bool persistent_tile =
+        (DispatchPolicy::Stages == 3 && size<0>(TileShape{}) == 256) ||
+        (DispatchPolicy::Stages == 2 && size<0>(TileShape{}) == 128 && size<1>(TileShape{}) == 256);
+    static_assert(persistent_tile && (size<1>(TileShape{}) == 128 || size<1>(TileShape{}) == 256) &&
                   size<2>(TileShape{}) == 64);
     static_assert(is_rmem<Acc>::value);
     int warp_idx = canonical_warp_idx_sync();

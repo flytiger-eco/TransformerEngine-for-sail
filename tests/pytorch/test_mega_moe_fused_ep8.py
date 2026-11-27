@@ -197,6 +197,12 @@ def check_training(rank, device, local_experts=2, topk=8, tokens_per_rank=2048):
             total_experts=total,
             topk=topk,
         )
+        # At top-6 this token spans two 256-slot router blocks. Its last
+        # two slots repeat experts from the first block on the same owner.
+        if topk == 6 and tokens > 256 // topk:
+            destination = 0 if step else (rank + 1) % dist.get_world_size()
+            experts = torch.tensor([5, 0, 4, 1, 0, 5], dtype=ids.dtype, device=device)
+            ids[256 // topk] = destination * local_experts + experts % local_experts
         x.requires_grad_()
         p.requires_grad_()
         dy = torch.randn((x.size(1), tokens), device=device, dtype=x.dtype).T
@@ -233,33 +239,46 @@ def check_training(rank, device, local_experts=2, topk=8, tokens_per_rank=2048):
 
 
 @torch.enable_grad()
-def check_saved_route_hooks(rank, device):
-    """Offload the weight-gradient row bounds and release them while the output is still live."""
+def check_saved_route_hooks(rank, device, width):
+    """Offload row bounds and restore optional fanout links with a noncontiguous layout."""
     import transformer_engine.pytorch as te
 
     class SavedRows:
-        def __init__(self, tensor):
+        def __init__(self, tensor, strided=False):
             self.cpu = tensor.detach().cpu()
+            self.strided = strided
 
     local_experts = 2
-    packed, restored = [], []
+    packed, restored, link_strides = [], [], []
 
     def pack(tensor):
         if tensor.dtype == torch.int32 and tensor.shape == (local_experts,):
             saved = SavedRows(tensor)
             packed.append(ref(saved))
             return saved
+        if tensor.dtype == torch.int32 and tensor.shape == (owner_rows,):
+            return SavedRows(tensor, strided=True)
         return tensor.detach()
 
     def unpack(value):
         if isinstance(value, SavedRows):
+            tensor = value.cpu.to(device)
+            if value.strided:
+                links = torch.stack((tensor, tensor), dim=1)[:, 0]
+                link_strides.append(links.stride(0))
+                return links
             restored.append(True)
-            return value.cpu.to(device)
+            return tensor
         return value
 
     x, ids, probs = make_case(2048, rank, 87074, device, special=True)
-    all1, all2 = make_weights(512, 256, local_experts * dist.get_world_size(), device, 87075)
+    total_experts = local_experts * dist.get_world_size()
+    all1, all2 = make_weights(512, width, total_experts, device, 87075)
     owner = slice(rank * local_experts, (rank + 1) * local_experts)
+    counts = torch.stack([(ids == expert).sum() for expert in range(total_experts)])
+    dist.all_reduce(counts)
+    owner_rows = int((((counts[owner] + 255) // 256) * 256).sum().item())
+    assert owner_rows > local_experts + 1
     w1, w2 = all1[owner], all2[owner]
     inputs = (x, probs, *w1, *w2)
     for t in inputs:
@@ -279,6 +298,8 @@ def check_saved_route_hooks(rank, device):
     actual = (out.detach(), *torch.autograd.grad(out, inputs, dy))
     current.wait_stream(side)
     assert restored == [True] and packed[0]() is None
+    assert link_strides == ([2] if width <= 512 else [])
+    assert len(actual) == len(expected)
     errors = torch.stack(
         [
             (v.float() - w.float()).norm() / w.float().norm().clamp_min(1e-10)
@@ -288,7 +309,9 @@ def check_saved_route_hooks(rank, device):
     dist.all_reduce(errors, op=dist.ReduceOp.MAX)
     assert errors.max().item() < 0.01, errors
     if rank == 0:
-        print("EP8 saved route hooks and cross-stream backward passed", flush=True)
+        print(
+            f"EP8 saved route hooks and cross-stream backward passed at width {width}", flush=True
+        )
 
 
 @torch.enable_grad()
@@ -347,7 +370,8 @@ def main():
     assert dist.get_world_size() == 8
     if args.training:
         check_admission(rank, device)
-        check_saved_route_hooks(rank, device)
+        for width in (256, 768):
+            check_saved_route_hooks(rank, device, width)
         check_training(rank, device)
         check_training(rank, device, local_experts=32)
         check_training(rank, device, local_experts=48, topk=6, tokens_per_rank=1024)

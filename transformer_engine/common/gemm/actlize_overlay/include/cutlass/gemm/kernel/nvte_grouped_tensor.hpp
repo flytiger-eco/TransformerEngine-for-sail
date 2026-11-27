@@ -51,7 +51,9 @@ struct NvteNativeGrouped {
 
   CUTLASS_DEVICE static void run_nexpand(NativeExpert e, int mi, int ni, char* smem) {
     using namespace cute;
-    static_assert(BM == 256 && BN == 256 && BK == 64 && Mainloop::DispatchPolicy::Stages == 3);
+    static_assert(BN == 256 && BK == 64 &&
+                  ((BM == 256 && Mainloop::DispatchPolicy::Stages == 3) ||
+                   (BM == 128 && Mainloop::DispatchPolicy::Stages == 2)));
     if constexpr (CommonK != 0) {
       e.n = CommonN;
       e.k = CommonK;
@@ -85,6 +87,7 @@ struct NvteNativeGrouped {
     __syncthreads();
   }
 
+  template <bool FullOutput = false>
   CUTLASS_DEVICE static void run_tile(const NativeExpert& expert, int mi, int ni, char* smem) {
     NativeExpert e = expert;
     if constexpr (CommonK != 0) {
@@ -128,7 +131,9 @@ struct NvteNativeGrouped {
     __syncthreads();
     auto* dst = reinterpret_cast<ElementD*>(e.d);
     bool aligned = e.d % 16 == 0 && (uint64_t(e.n) * sizeof(ElementD)) % 16 == 0;
-    if (aligned && e.alpha == 1 && e.beta == 0 && cols >= BN) {
+    if constexpr (FullOutput) {
+      Epilogue::store_full_tile(dst, e.m, e.n, TileShape{}, coordinate, acc, mma, tid);
+    } else if (aligned && e.alpha == 1 && e.beta == 0 && cols >= BN) {
       if (rows >= BM)
         Epilogue::store_full_tile(dst, e.m, e.n, TileShape{}, coordinate, acc, mma, tid);
       else

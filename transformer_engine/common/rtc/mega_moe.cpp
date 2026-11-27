@@ -8,8 +8,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <map>
 #include <mutex>
-#include <set>
 #include <string>
 
 #include "../gemm/cutlass_grouped_gemm_rtc_kernel.h"
@@ -120,16 +121,33 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
       fixed_wgrad && mean == 512 && n % 1024 == 0 &&
       int64_t(p.output_width / 256) * (n / 1024) * p.groups >= cuda::sm_count() * 2;
   const int column_mode = ragged_columns ? 2 : static_cast<int>(four_columns);
-  const auto label = concat_strings(name, "_", fp16, "_", fp32_out, "_", common_n, "_", common_k,
-                                    "_", weight_rows, "_", column_mode);
-  constexpr int smem = 196608;
+  bool dense = ragged_columns && !fp16 && mean >= 1536;
+  bool compact_wgrad =
+      ragged_columns && !fp16 && !p.reserve_sms && n >= 2048 && p.output_width >= 2048 &&
+      int64_t(p.rows) <= int64_t(1024) * p.groups &&
+      int64_t(p.output_width / 128) * (n / 256) * p.groups <= std::numeric_limits<int>::max();
+  if (dense || compact_wgrad) {
+    const bool aligned =
+        ((reinterpret_cast<uintptr_t>(p.a) | reinterpret_cast<uintptr_t>(p.b)) % 16 == 0) &&
+        std::all_of(p.expert, p.expert + p.groups,
+                    [](const void *ptr) { return reinterpret_cast<uintptr_t>(ptr) % 16 == 0; });
+    dense = dense && aligned;
+    compact_wgrad = compact_wgrad && aligned;
+  }
+  const int threads = compact_wgrad ? 256 : 512;
+  const int smem = compact_wgrad ? 98304 : 196608;
+  const auto label =
+      concat_strings(name, "_", fp16, "_", fp32_out, "_", common_n, "_", common_k, "_", weight_rows,
+                     "_", column_mode, "_", dense, compact_wgrad ? "_m128" : "");
   // Function attributes belong to a device even if its architecture shares a compiled image.
   static std::mutex mutex;
-  static std::set<std::pair<int, std::string>> configured;
+  static std::map<std::pair<int, std::string>, int> residency;
+  int blocks_per_sm;
   {
     std::lock_guard<std::mutex> lock(mutex);
     auto key = std::make_pair(cuda::current_device(), label);
-    if (!configured.count(key)) {
+    auto it = residency.find(key);
+    if (it == residency.end()) {
       auto options = grouped_gemm_rtc::actlize_compiler_options();
       options.insert(options.end(),
                      {"-DNVTE_GG_ARCH=89", "-DNVTE_GG_N_EXPAND=0",
@@ -140,16 +158,22 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
                       concat_strings("-DNVTE_GG_COMMON_K=", recompute ? 0 : common_k),
                       concat_strings("-DNVTE_MOE_WEIGHT_ROWS=", weight_rows),
                       concat_strings("-DNVTE_MOE_FOUR_COLUMNS=", column_mode),
+                      concat_strings("-DNVTE_MOE_DENSE_WGRAD=", static_cast<int>(dense)),
+                      concat_strings("-DNVTE_MOE_WGRAD_M128=", static_cast<int>(compact_wgrad)),
                       concat_strings("-DNVTE_MOE_COMMON_N=", common_n),
                       concat_strings("-DNVTE_MOE_COMMON_K=", common_k)});
       manager.compile(label, name, string_code_mega_moe_backward_gemm_cu,
                       "mega_moe_backward_gemm.cu", options,
                       {{string_code_mega_moe_grad_args_h, "mega_moe_grad_args.h"}});
       manager.set_function_attribute(label, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem);
-      configured.insert(key);
+      const int active =
+          compact_wgrad ? manager.occupancy_max_active_blocks_per_sm(label, threads, smem) : 1;
+      NVTE_CHECK(active > 0, "MegaMoE gradient kernel has no resident CTA");
+      it = residency.emplace(key, std::min(active, 2)).first;
     }
+    blocks_per_sm = it->second;
   }
-  // One persistent CTA per CU keeps the successive output tiles local.
+  // Compact weight gradients can run two persistent CTAs per CU.
   const int sm = cuda::sm_count();
   int blocks = sm;
   if (wgrad) {
@@ -157,7 +181,7 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
     // Leave the requested CUs available for the concurrent source-gradient return.
     blocks = int(std::min<int64_t>(std::max(1, sm - p.reserve_sms), count));
   }
-  manager.launch(label, blocks, 512, smem, stream, p);
+  manager.launch(label, blocks * blocks_per_sm, threads, smem, stream, p);
 }
 
 void mega_moe_activation_backward(const MegaMoEProblem &p, const void *projection,

@@ -146,20 +146,23 @@ def test_wgrad_checks_each_experts_reduction_length():
             _assert_gradient(grad[m[:, None], n], ref, 0.006)
 
 
-def test_wgrad_uses_live_rows_with_padded_offsets():
+@pytest.mark.parametrize("m", [1024, 2048])
+def test_wgrad_uses_live_rows_with_padded_offsets(m):
     torch.manual_seed(303)
     # The 33rd expert uses a second pointer window. The nine N tiles also
     # exercise the remainder after two four-column work items.
     counts = [0, 64, 128, 192, 256] * 6 + [64, 192, 129]
+    counts[2] = 129  # Exercise a partial K tile in both pointer windows.
     device = "cuda"
-    m, n, stride = 1024, 2304, 256
+    # M=2048 exercises the compact BF16 overwrite kernel in the first window.
+    n, stride = 2304, 256
     lengths = torch.tensor(counts, device=device, dtype=torch.int32)
     offsets = torch.arange(len(counts) + 1, device=device, dtype=torch.int32) * stride
     x = torch.randn(len(counts) * stride, n, device=device, dtype=torch.bfloat16)
     dy = torch.randn(len(counts) * stride, m, device=device, dtype=x.dtype)
     grads = [x.new_full((m, n), 1) for _ in counts]
     # Nonzero padding makes accidental reductions beyond the live rows observable.
-    rows = torch.tensor([0, 255, 256, m - 1], device=device)
+    rows = torch.tensor([0, 127, 128, 255, 256, m - 1], device=device)
     columns = torch.arange(0, n, 256, device=device)
     columns = torch.cat((columns, columns + 255))
     for accumulate in (True, False):
@@ -197,3 +200,35 @@ def test_backward_rejects_overlapping_outputs_with_separate_storage():
         tex.mega_moe_bulk_pull(ids, ids, dy, x, 1, 0, out=torch.from_dlpack(dy))
     torch.testing.assert_close(dy, saved_dy, atol=0, rtol=0)
     torch.testing.assert_close(probs, saved_probs, atol=0, rtol=0)
+
+
+def test_routed_activation_skips_padded_rows():
+    from transformer_engine.pytorch._mega_moe_train import _activation_grad, _save_activation
+
+    # At width 2304 a 2048-element flat block crosses live/padded rows in both
+    # directions. The adjacent padding rows also contain a fully padded block.
+    width = 2304
+    route = torch.tensor([0, -1, -1, 1 << 32], dtype=torch.int64, device="cuda")
+    live = route >= 0
+    prob = torch.tensor([0.0, float("nan"), float("nan"), 0.75], device=route.device)
+    torch.manual_seed(733)
+    z = torch.randn(route.numel(), 2 * width, dtype=torch.bfloat16, device=route.device)
+    dy = torch.randn(route.numel(), width, dtype=z.dtype, device=route.device)
+    z[0] = dy[0] = 1
+    z[~live] = dy[~live] = float("nan")
+
+    def run(routes):
+        y = torch.full_like(dy, float("nan"))
+        dz = torch.full_like(z, float("nan"))
+        dp = torch.full_like(prob, float("nan"))
+        _save_activation(z, prob, None, y, routes)
+        _activation_grad[(route.numel(),)](dy, z, prob, None, dz, dp, width, 4096, routes)
+        return y, dz, dp
+
+    expected = run(None)
+    y, dz, dp = run(route)
+    for value, reference in zip((y, dz, dp), expected):
+        torch.testing.assert_close(value[live], reference[live], atol=0, rtol=0)
+        torch.testing.assert_close(value[~live], torch.zeros_like(value[~live]), atol=0, rtol=0)
+    # A valid zero-probability route still has a derivative with respect to its weight.
+    assert dp[0] > 0

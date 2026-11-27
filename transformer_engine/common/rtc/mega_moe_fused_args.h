@@ -13,6 +13,7 @@ struct MegaMoETrainArgs {
   const void *weight[kMaxExperts];
   const void *route;  // Device int64_t source rank and top-k slot, or -1 for padding.
   const int *expert;
+  const int *links;
   int *ready;
   int tiles, k, n, rank, capacity, topk;
 };
