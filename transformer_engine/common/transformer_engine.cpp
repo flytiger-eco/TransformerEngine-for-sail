@@ -396,8 +396,10 @@ void CheckOutputGroupedTensor(const GroupedTensor &t, std::string_view name, boo
 class TensorAllocator {
  public:
   static TensorAllocator &instance() {
-    static TensorAllocator allocator;
-    return allocator;
+    // Autograd workers can destroy thread-local TensorWrappers after static destruction.
+    // Keep the handle pool alive until process exit so those handles can still be returned.
+    static TensorAllocator *const allocator = new TensorAllocator;
+    return *allocator;
   }
 
   ~TensorAllocator() {}
