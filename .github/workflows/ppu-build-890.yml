@@ -174,6 +174,8 @@ jobs:
     needs: build
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: k8s-runner-group-cpu-flytiger
+    outputs:
+      artifact_id: ${{ steps.archive.outputs.artifact-id }}
     timeout-minutes: 100
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -192,7 +194,7 @@ jobs:
               ':(glob)transformer_engine/**/*mega_moe*' transformer_engine/common/gemm \
               benchmarks/gemm/mega_moe_tags.py benchmarks/gemm/mega_moe_kernel_profile.py \
               benchmarks/gemm/replay_mega_moe.py qa/L0_pytorch_mega_moe_rtc \
-              .github/workflows/ppu-build-890.yml; then
+              .github/workflows/ppu-build-890.yml .github/workflows/publish-mega-moe-report.yml; then
             echo "selected=false" >> "$GITHUB_OUTPUT"
           else
             echo "selected=true" >> "$GITHUB_OUTPUT"
@@ -217,9 +219,26 @@ jobs:
             wheel_dir='${{ env.ARTIFACT_DIR }}'
             [[ $(cat "$wheel_dir/commit") == '${{ env.TE_REF }}' ]]
             bash "$SOURCE_DIR/qa/L0_pytorch_mega_moe_rtc/test_ep16.sh" "$wheel_dir"
-      - uses: actions/upload-artifact@v4
+      - name: Summarize EP16 replay timings
+        if: steps.select.outputs.selected == 'true' && success()
+        run: cat "/wl_nas/${{ env.ARTIFACT_SUBDIR }}/qwen-ep16/comparison.md" >> "$GITHUB_STEP_SUMMARY"
+      - id: archive
+        uses: actions/upload-artifact@v4
         if: always() && steps.select.outputs.selected == 'true'
         with:
           name: qwen-ep16-rank-paths
-          path: /wl_nas/${{ env.ARTIFACT_SUBDIR }}/qwen-ep16-paths.json
-          if-no-files-found: warn
+          path: /wl_nas/${{ env.ARTIFACT_SUBDIR }}/qwen-ep16/
+          if-no-files-found: error
+
+  publish-ep16:
+    name: Publish Qwen EP16 comparison
+    needs: qwen-ep16
+    if: always() && !cancelled() && needs.qwen-ep16.outputs.artifact_id != '' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: ./.github/workflows/publish-mega-moe-report.yml
+    with:
+      report: ep16
+      artifact_id: ${{ needs.qwen-ep16.outputs.artifact_id }}
+      replay_result: ${{ needs.qwen-ep16.result }}

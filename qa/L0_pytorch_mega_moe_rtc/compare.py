@@ -3,6 +3,7 @@
 
 """Compare paired base/head sweeps of the same route capture."""
 
+import argparse
 import json
 import math
 import os
@@ -15,50 +16,68 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-out = Path(sys.argv[1])
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("out", type=Path)
+parser.add_argument(
+    "--head-vs-deepep", action="store_true", help="compare two backends from the same wheel"
+)
+args = parser.parse_args()
+out = args.out
+arms = ["head", "deepep"] if args.head_vs_deepep else ["base", "head", "deepep"]
 failed = False
 charts = []
-summary = [
-    (
-        "| Case | EP | Stage | MegaMoE base (ms) | MegaMoE PR (ms) | DeepEP + TE RTC GroupGEMM (ms)"
-        " | DeepEP / PR |"
-    ),
-    "|---|---:|---|---:|---:|---:|---:|",
-]
+columns = ["Case", "EP", "Stage"]
+titles = {"base": "MegaMoE base", "head": "MegaMoE PR", "deepep": "DeepEP + TE RTC GroupGEMM"}
+columns.extend(titles[arm] + " (ms)" for arm in arms)
+columns.append("DeepEP / PR")
+summary = ["| " + " | ".join(columns) + " |", "|---|---:|---|" + "---:|" * (len(arms) + 1)]
 for line in (out / "cases.txt").read_text().splitlines():
     name, world_text, tag = line.split()
     world = int(world_text)
     ratios = []
     runs = []
     for sweep in (0, 1):
-        base, head, deepep = [
-            json.loads((out / arm / f"{name}-{sweep}.json").read_text())
-            for arm in ("base", "head", "deepep")
-        ]
-        if any(run["tag"] != tag or run["world"] != world for run in (base, head, deepep)):
-            raise ValueError("incompatible performance reports")
-        for run in (base, head, deepep):
-            total = run["median_ms"]["total"]
-            if not math.isfinite(total) or total <= 0 or not run["relative_l2"] < 0.012:
+        sweep_runs = {
+            arm: json.loads((out / arm / f"{name}-{sweep}.json").read_text()) for arm in arms
+        }
+        head, deepep = sweep_runs["head"], sweep_runs["deepep"]
+        for run in sweep_runs.values():
+            if run["tag"] != tag or run["world"] != world or run["backward"] != head["backward"]:
+                raise ValueError("incompatible performance reports")
+            if not run["relative_l2"] < 0.012 or not all(
+                math.isfinite(v) and v > 0
+                for k, v in run["median_ms"].items()
+                if k != "backward" or run["backward"]
+            ):
                 raise ValueError(f"invalid EP{world} replay result")
-        if deepep["backend"] != "deepep" or len({r["backward"] for r in (base, head, deepep)}) != 1:
-            raise ValueError("incompatible DeepEP baseline")
-        runs.append((base, head, deepep))
-        ratios.append(head["median_ms"]["total"] / base["median_ms"]["total"])
-    ratio = statistics.median(ratios)
-    print(f"{name} (EP{world}) head/base step latency: {ratio:.3f}x (sweeps: {ratios})")
+        if deepep["backend"] != "deepep" or head["backend"] != "megamoe":
+            raise ValueError("incompatible replay backends")
+        if (
+            args.head_vs_deepep
+            and head["rows_per_global_expert"] != deepep["rows_per_global_expert"]
+        ):
+            raise ValueError("backends replayed different expert loads")
+        runs.append(sweep_runs)
+        if "base" in sweep_runs:
+            ratios.append(head["median_ms"]["total"] / sweep_runs["base"]["median_ms"]["total"])
+    if ratios:
+        ratio = statistics.median(ratios)
+        print(f"{name} (EP{world}) head/base step latency: {ratio:.3f}x (sweeps: {ratios})")
+        failed |= ratio > 1.05
     for stage in ("forward", "backward", "total"):
         if stage == "backward" and not head["backward"]:
             continue
-        b, h, d = [statistics.median(r["median_ms"][stage] for r in arm) for arm in zip(*runs)]
-        summary.append(f"| {name} | {world} | {stage} | {b:.3f} | {h:.3f} | {d:.3f} | {d/h:.3f}× |")
-    failed |= ratio > 1.05
+        times = {arm: statistics.median(s[arm]["median_ms"][stage] for s in runs) for arm in arms}
+        values = " | ".join(f"{v:.3f}" for v in times.values())
+        summary.append(
+            f"| {name} | {world} | {stage} | {values} | {times['deepep']/times['head']:.3f}× |"
+        )
     labels = ("Forward L1", "Forward L2", "Dgrad L2", "Dgrad L1", "Wgrad L2", "Wgrad L1")
     keys = ("fwd_l1", "fwd_l2", "dgrad_l2", "dgrad_l1", "wgrad_l2", "wgrad_l1")
-    profiles = [r["kernel_profile"] for r in runs[0][1:]]
+    profiles = [runs[0][arm]["kernel_profile"] for arm in ("head", "deepep")]
     if any((p["layers_per_step"], p["steps"]) != (4, 3) for p in profiles):
         raise ValueError("incompatible kernel profiles")
-    deepep = runs[0][2]
+    deepep = runs[0]["deepep"]
     expert_rows = deepep.get("rows_per_global_expert")
     if expert_rows is None or any(expert_rows):
         for key in keys if deepep["backward"] else keys[:2]:
@@ -106,6 +125,10 @@ for line in (out / "cases.txt").read_text().splitlines():
                 ax.bar_label(bar, fmt="%.2f", padding=3, fontsize=8)
                 column.append(f"{value:.3f}")
             else:
+                if args.head_vs_deepep:
+                    raise ValueError(
+                        f"{name} {legend} {key}: missing measurable kernel stage: {names}"
+                    )
                 ax.text(0, y, "N/A", va="center", fontsize=8)
                 column.append("N/A")
         columns.append(column)

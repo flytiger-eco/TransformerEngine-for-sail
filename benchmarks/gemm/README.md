@@ -437,6 +437,14 @@ torchrun --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
 python qa/L0_pytorch_mega_moe_rtc/verify_ep16.py qwen-ep16.json
 ```
 
+The two-node Qwen CI job measures fused MegaMoE and DeepEP with TE RTC GroupGEMM
+on the same 16 PPUs and route capture. The two sweeps reverse the backend order.
+Each backend runs five warmups and twenty timed replays per sweep. The PR report
+includes single-layer forward, backward and total latency, plus a chart for the
+six kernel stages using the same profiling convention as the single-node gate.
+The `qwen-ep16-rank-paths` artifact contains the timing samples, rank-path
+verification and plotted data.
+
 The 890P gate captures EP2 and EP8 test calls. It runs each BF16 distributed tag
 through merge-base MegaMoE, PR MegaMoE, and DeepEP intranode dispatch/combine with
 the PR wheel's RTC grouped GEMMs. The second sweep reverses the three-way order.

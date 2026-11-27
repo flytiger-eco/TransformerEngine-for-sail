@@ -165,6 +165,13 @@ def main():
             group, x.size(0), x.size(1), e, None, weights[:e], weights[e:], 0
         )
 
+        if world == 16 and os.environ.get("DEEPEP_NUM_MAX_ICN_PEERS") == "16":
+            topology = (baseline.buffer.local_ranks, baseline.buffer.runtime.get_num_rdma_ranks())
+            topologies = [None] * world
+            dist.all_gather_object(topologies, topology)
+            if any(t != (16, 1) for t in topologies):
+                raise ValueError(f"DeepEP expected one 16-rank ICN domain, got {topologies}")
+
         def deepep_forward():
             with torch.set_grad_enabled(grad_enabled):
                 if x.size(0) == 0:
