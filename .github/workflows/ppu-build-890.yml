@@ -199,13 +199,16 @@ jobs:
           fi
       - name: Replay Qwen BF16 EP16 and verify kernels on every rank
         if: steps.select.outputs.selected == 'true'
-        uses: flytiger-eco/shared-workflows/cluster-task@main
+        uses: flytiger-eco/shared-workflows/cluster-task@ff0ba437e1be55f5cecc51e4fde43c2908beaf56
         with:
           image: ${{ env.IMAGE }}
           namespace: ${{ env.NAMESPACE }}
           node_selector: ${{ env.NODE_SELECTOR }}
           host_volumes: ${{ env.HOST_VOLUMES }}
           rack_policy: same
+          # PCCL needs access to the IMEX channel to allocate cross-node FABRIC memory.
+          container_options: |
+            privileged: true
           nnodes: 2
           nproc_per_node: 8
           timeout_minutes: 90
