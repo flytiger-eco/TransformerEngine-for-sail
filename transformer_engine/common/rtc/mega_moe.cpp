@@ -121,7 +121,10 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
       fixed_wgrad && mean == 512 && n % 1024 == 0 &&
       int64_t(p.output_width / 256) * (n / 1024) * p.groups >= cuda::sm_count() * 2;
   const int column_mode = ragged_columns ? 2 : static_cast<int>(four_columns);
-  bool dense = ragged_columns && !fp16 && mean >= 1536;
+  // For 16 experts with a 1024x2048 weight gradient, long reductions run faster
+  // with the regular ragged tiles. Keep the fixed-K case at mean == 1536.
+  const bool prefer_ragged = p.groups == 16 && p.output_width == 1024 && n == 2048 && mean > 1536;
+  bool dense = ragged_columns && !fp16 && mean >= 1536 && !prefer_ragged;
   bool compact_wgrad =
       ragged_columns && !fp16 && !p.reserve_sms && n >= 2048 && p.output_width >= 2048 &&
       int64_t(p.rows) <= int64_t(1024) * p.groups &&
