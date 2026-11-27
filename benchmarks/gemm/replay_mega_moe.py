@@ -40,7 +40,7 @@ def restore(layout, device, values=None):
     return tensor.requires_grad_(layout["requires_grad"])
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", help="rank tag log, legacy manifest.json or v1 ID")
     parser.add_argument("--call", help="invocation to replay when a log contains multiple calls")
@@ -55,25 +55,41 @@ def main():
         help="require the EP8 saved-activation backend",
     )
     parser.add_argument("--backend", choices=("megamoe", "deepep"), default="megamoe")
+    ep16 = parser.add_mutually_exclusive_group()
+    ep16.add_argument(
+        "--profile-ep16-path",
+        action="store_const",
+        const="fused",
+        help="record per-rank kernel and collective counts and require fused EP16 training",
+    )
+    ep16.add_argument(
+        "--profile-ep16-baseline-path",
+        dest="profile_ep16_path",
+        action="store_const",
+        const="auto",
+        help="record the EP16 path selected by the baseline wheel, including its fallback",
+    )
+    parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--seed", type=int, default=73)
     parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.warmup < 0 or args.iters < 1:
+        parser.error("expected warmup >= 0 and iters >= 1")
+    return args
+
+
+def replay(args, device):
     if args.backend == "deepep":
         os.environ.update(
             NVTE_USE_CUTLASS_GROUPED_GEMM="1",
             NVTE_USE_CUTLASS_GROUPED_GEMM_RTC="1",
             NVTE_FORCE_RTC_NO_FALLBACK="1",
         )
-    if args.warmup < 0 or args.iters < 1:
-        parser.error("expected warmup >= 0 and iters >= 1")
     match = re.fullmatch(r"te_mega_moe:v1:([a-f0-9]{32})", args.capture)
     path = args.directory / match[1] / "manifest.json" if match else Path(args.capture)
     legacy = match or path.name == "manifest.json"
-    world = int(os.environ.get("WORLD_SIZE", 1))
+    world = dist.get_world_size()
     os.environ.pop("NVTE_MOE_CAPTURE_TAG", None)
-    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
-    torch.cuda.set_device(device)
-    dist.init_process_group("nccl", device_id=device)
     rank = dist.get_rank()
     torch.manual_seed(args.seed + rank)
     error = None
@@ -131,6 +147,11 @@ def main():
     if len(set(modes)) != 1:
         raise ValueError("only some EP ranks have differentiable inputs for backward")
 
+    if args.profile_ep16_path and (
+        world != 16 or group is None or not training or args.backend != "megamoe"
+    ):
+        raise ValueError("--profile-ep16-path requires a distributed EP16 MegaMoE training capture")
+
     def megamoe_forward():
         with torch.set_grad_enabled(grad_enabled):
             return op(x, ids, probs, weights[:e], weights[e:], ep_group=group)
@@ -154,6 +175,13 @@ def main():
             group, x.size(0), x.size(1), e, None, weights[:e], weights[e:], 0
         )
 
+        if world == 16 and os.environ.get("DEEPEP_NUM_MAX_ICN_PEERS") == "16":
+            topology = (baseline.buffer.local_ranks, baseline.buffer.runtime.get_num_rdma_ranks())
+            topologies = [None] * world
+            dist.all_gather_object(topologies, topology)
+            if any(t != (16, 1) for t in topologies):
+                raise ValueError(f"DeepEP expected one 16-rank ICN domain, got {topologies}")
+
         def deepep_forward():
             with torch.set_grad_enabled(grad_enabled):
                 if x.size(0) == 0:
@@ -176,8 +204,10 @@ def main():
 
     y = forward()
     backend = type(y.grad_fn).__name__ if y.grad_fn is not None else None
-    if args.expect_ep8_training and backend != "_TrainBackward":
-        raise AssertionError(f"expected saved-activation EP8 training, got {backend}")
+    if (
+        args.expect_ep8_training or args.profile_ep16_path == "fused"
+    ) and backend != "_TrainBackward":
+        raise AssertionError(f"expected fused EP{world} training, got {backend}")
     actual = (y.detach(), *backward(y))
     errors = torch.stack(
         [
@@ -213,6 +243,14 @@ def main():
             dist.all_reduce(times, op=dist.ReduceOp.MAX)
             samples.append(times.tolist())
         del grads, y
+    if args.profile_stages:
+        from mega_moe_kernel_profile import profile_steps
+
+        profile = profile_steps(forward, backward, training, device, e)
+    if args.profile_ep16_path:
+        from mega_moe_kernel_profile import profile_ep16_call
+
+        paths = profile_ep16_call(forward, backward)
     if rank == 0:
         result = {
             "tag": tag,
@@ -226,6 +264,10 @@ def main():
                 zip(("forward", "backward", "total"), map(statistics.median, zip(*samples)))
             ),
         }
+        if args.profile_stages:
+            result["kernel_profile"] = profile
+        if args.profile_ep16_path:
+            result["rank_paths"] = paths
         if "expert_rows" in shard:
             result["rows_per_global_expert"] = shard["expert_rows"]
         print(json.dumps(result), flush=True)
@@ -233,7 +275,23 @@ def main():
             args.output.write_text(json.dumps(result, indent=2) + "\n")
     if baseline is not None:
         baseline.buffer.destroy()
-    dist.destroy_process_group()
+
+
+def run_replays(cases):
+    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl", device_id=device)
+    try:
+        for args in cases:
+            # A capture may change routing flags, and DeepEP forces TE RTC on its arm.
+            with patch.dict(os.environ):
+                replay(args, device)
+    finally:
+        dist.destroy_process_group()
+
+
+def main():
+    run_replays([parse_args()])
 
 
 if __name__ == "__main__":

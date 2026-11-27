@@ -128,6 +128,21 @@ def _peer_supported(group, device):
                 )
                 and symm.get_backend(device) == "CUDA"
             )
+            if group.size() == 16:
+                # Device ordinals enumerate local devices only. On a fabric, symmetric-memory
+                # rendezvous imports the peers' allocation handles across hosts.
+                enabled = (
+                    supported
+                    and os.getenv("NVTE_MOE_EP16_FUSED", "0") == "1"
+                    and find_spec("triton") is not None
+                    and tex.mega_moe_fused_available()
+                )
+                all_enabled = torch.tensor(int(enabled), device=device, dtype=torch.int32)
+                dist.all_reduce(all_enabled, op=dist.ReduceOp.MIN, group=group)
+                state.training_supported = bool(all_enabled.item())
+                state.supported = state.training_supported
+                state.device = device
+                return state.supported
             properties = torch.cuda.get_device_properties(device) if supported else None
             uuid = getattr(properties, "uuid", None)
             uuid = str(uuid) if uuid is not None else None
@@ -175,7 +190,7 @@ def peer_forward(x, ids, probs, fc1, fc2, ep_group_name):
     if not ep_group_name:
         return None
     group = dist.distributed_c10d._resolve_process_group(ep_group_name)
-    if group.size() == 1 or not x.is_cuda:
+    if group.size() in (1, 16) or not x.is_cuda:
         return None
     with torch.cuda.device(x.device):
         if not _peer_supported(group, x.device):

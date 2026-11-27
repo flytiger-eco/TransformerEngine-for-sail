@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""Build stable expert-major training rows from source slots on eight peers."""
+"""Build stable expert-major training rows from source slots on the training EP group."""
 
 from dataclasses import dataclass
 from weakref import finalize
@@ -17,16 +17,16 @@ from ._mega_moe_peer import _workspace
 
 
 _MAX_LOCAL_EXPERTS = 48
-# All ranks exchange the same header, even when they disagree about the shape.
-_ROUTE_BINS = triton.next_power_of_2(8 * _MAX_LOCAL_EXPERTS)
 
 
 @triton.jit
-def _count_blocks(ids, hist, slots, k, s0, s1, experts, BINS: tl.constexpr, B: tl.constexpr):
+def _count_blocks(
+    ids, hist, slots, k, s0, s1, experts, WORLD: tl.constexpr, BINS: tl.constexpr, B: tl.constexpr
+):
     block = tl.program_id(0)
     slot = block * B + tl.arange(0, B)
     value = tl.load(ids + slot // k * s0 + slot % k * s1, slot < slots, -1)
-    valid = (value >= 0) & (value < experts * 8)
+    valid = (value >= 0) & (value < experts * WORLD)
     bins = tl.arange(0, BINS)
     counts = tl.histogram(tl.where(valid, value, 0), BINS)
     counts -= tl.where(bins == 0, tl.sum((~valid).to(tl.int32), 0), 0)
@@ -76,11 +76,12 @@ def _bases(
     rank,
     E: tl.constexpr,
     NE: tl.constexpr,
+    WORLD: tl.constexpr,
     BINS: tl.constexpr,
 ):
     owner = tl.program_id(0)
     expert = tl.arange(0, NE)
-    source = tl.arange(0, 8)
+    source = tl.arange(0, WORLD)
     count = tl.load(
         reports + source[:, None] * (BINS + 8) + owner * E + expert[None, :],
         expert[None, :] < E,
@@ -114,22 +115,21 @@ def _bases(
             | (tl.sum(tokens.to(tl.int64) * topk, 0) + E * 256 >= 2147483648)
         )
         status = tl.where(bad, 2, tl.where(mismatch, 3, tl.where(fallback, 1, 0)))
-        tl.store(report + 8, status)
-        tl.store(report + 9, cap)
-        tl.store(report + 10, tl.load(reports + rank * (BINS + 8) + (BINS + 1)))
-        tl.store(report + 11, tl.max(dropped, 0))
+        tl.store(report + WORLD, status)
+        tl.store(report + WORLD + 1, cap)
+        tl.store(report + WORLD + 2, tl.load(reports + rank * (BINS + 8) + (BINS + 1)))
+        tl.store(report + WORLD + 3, tl.max(dropped, 0))
         tl.store(sizes + expert, total, expert < E)
         tl.store(offsets + expert, begin, expert < E)
         tl.store(offsets + E, tl.sum(padded, 0))
 
 
 @triton.jit
-def _peer(P0, P1, P2, P3, P4, P5, P6, P7, rank):
-    p01 = tl.where(rank == 0, P0, P1)
-    p23 = tl.where(rank == 2, P2, P3)
-    p45 = tl.where(rank == 4, P4, P5)
-    p67 = tl.where(rank == 6, P6, P7)
-    return tl.where(rank < 4, tl.where(rank < 2, p01, p23), tl.where(rank < 6, p45, p67))
+def _peer(peers, rank):
+    ptr = peers[0]
+    for i in tl.static_range(1, len(peers)):
+        ptr = tl.where(rank == i, peers[i], ptr)
+    return ptr
 
 
 @triton.jit
@@ -143,14 +143,7 @@ def _push(
     probs,
     prefix,
     bases,
-    P0,
-    P1,
-    P2,
-    P3,
-    P4,
-    P5,
-    P6,
-    P7,
+    peers,
     n,
     is0,
     is1,
@@ -171,7 +164,7 @@ def _push(
     expert = key // B
     previous = tl.gather(expert, tl.maximum(lane - 1, 0), 0)
     first = tl.associative_scan(tl.where(expert != previous, lane, 0), 0, _max_index)
-    valid = expert < E * 8
+    valid = expert < E * len(peers)
     row = (
         tl.load(bases + expert, valid, 0)
         + tl.load(prefix + block * BINS + expert, valid, 0)
@@ -180,7 +173,7 @@ def _push(
     )
     source_slot = block * B + key % B
     prob = tl.load(probs + source_slot // TOPK * ps0 + source_slot % TOPK * ps1, valid, 0)
-    target = _peer(P0, P1, P2, P3, P4, P5, P6, P7, expert // E) + 2 * row.to(tl.int64)
+    target = _peer(peers, expert // E) + 2 * row.to(tl.int64)
     route = ((tl.full((1,), 0, tl.int64) + rank) << 32) | source_slot.to(tl.int64)
     tl.store(target, route, valid)
     tl.store(target + 1, prob.to(tl.int32, bitcast=True).to(tl.int64), valid)
@@ -205,21 +198,14 @@ def _unpack(buf, offsets, sizes, route, prob, tiles, E: tl.constexpr, NE: tl.con
 def _push_grad(
     route,
     dp,
-    P0,
-    P1,
-    P2,
-    P3,
-    P4,
-    P5,
-    P6,
-    P7,
+    peers,
     n,
     B: tl.constexpr,
 ):
     row = tl.program_id(0) * B + tl.arange(0, B)
     entry = tl.load(route + row, row < n, -1)
     valid = entry >= 0
-    peer = _peer(P0, P1, P2, P3, P4, P5, P6, P7, (entry >> 32).to(tl.int32))
+    peer = _peer(peers, (entry >> 32).to(tl.int32))
     slot = (entry & 0xFFFFFFFF).to(tl.int32)
     tl.store(peer + slot, tl.load(dp + row, valid, 0), valid)
 
@@ -290,6 +276,8 @@ def stage_source(local, source, cap, topk, dropped):
 
 def prepare(x, ids, probs, experts, width, aligned, group):
     """Agree on dimensions, then publish each (slot, probability) in owner-row order."""
+    world = group.size()
+    bins = triton.next_power_of_2(world * _MAX_LOCAL_EXPERTS)
     tokens, k = ids.shape
     hidden = x.size(1)
     slots = ids.numel()
@@ -305,9 +293,9 @@ def prepare(x, ids, probs, experts, width, aligned, group):
     )
     kwargs = dict(device=x.device, dtype=torch.int32)
     blocks = max(1, triton.cdiv(slots, 256)) if eligible else 1
-    hist = torch.empty((blocks, _ROUTE_BINS + 2), **kwargs)
-    prefix = torch.empty((blocks, _ROUTE_BINS), **kwargs)
-    header = torch.empty(_ROUTE_BINS + 8, **kwargs)
+    hist = torch.empty((blocks, bins + 2), **kwargs)
+    prefix = torch.empty((blocks, bins), **kwargs)
+    header = torch.empty(bins + 8, **kwargs)
     _count_blocks[(blocks,)](
         ids,
         hist,
@@ -315,11 +303,12 @@ def prepare(x, ids, probs, experts, width, aligned, group):
         k,
         *ids.stride(),
         experts,
-        _ROUTE_BINS,
+        world,
+        bins,
         256,
     )
     scan_blocks = blocks if blocks <= 4096 else 1
-    _scan_blocks[(_ROUTE_BINS + 2,)](
+    _scan_blocks[(bins + 2,)](
         hist,
         prefix,
         header,
@@ -330,27 +319,27 @@ def prepare(x, ids, probs, experts, width, aligned, group):
         tokens,
         k,
         int(eligible),
-        _ROUTE_BINS,
+        bins,
         triton.next_power_of_2(scan_blocks),
     )
     if blocks > scan_blocks:
         cumulative = torch.cumsum(hist, dim=0, dtype=torch.int32)
-        torch.sub(cumulative[:, :_ROUTE_BINS], hist[:, :_ROUTE_BINS], out=prefix)
-        header[:_ROUTE_BINS + 2].copy_(cumulative[-1])
-    reports = torch.empty((8, _ROUTE_BINS + 8), **kwargs)
+        torch.sub(cumulative[:, :bins], hist[:, :bins], out=prefix)
+        header[: bins + 2].copy_(cumulative[-1])
+    reports = torch.empty((world, bins + 8), **kwargs)
     dist.all_gather_into_tensor(reports.view(-1), header, group=group)
     rank = group.rank()
     # Read only the fixed-size summary. Bases and segment sizes stay on the device.
     e = min(experts, _MAX_LOCAL_EXPERTS)
-    bases = torch.empty(8 * e, **kwargs)
+    bases = torch.empty(world * e, **kwargs)
     offsets = torch.empty(e + 1, **kwargs)
     sizes = torch.empty(e, **kwargs)
-    summary = torch.empty(12, **kwargs)
-    _bases[(8,)](
-        reports, bases, offsets, sizes, summary, rank, e, triton.next_power_of_2(e), _ROUTE_BINS
+    summary = torch.empty(world + 4, **kwargs)
+    _bases[(world,)](
+        reports, bases, offsets, sizes, summary, rank, e, triton.next_power_of_2(e), world, bins
     )
     host = summary.cpu().tolist()
-    status, cap, dropped, any_dropped = host[8:]
+    status, cap, dropped, any_dropped = host[world:]
     if status == 2:
         raise ValueError("Expected expert IDs in range or -1")
     if status == 3:
@@ -361,7 +350,7 @@ def prepare(x, ids, probs, experts, width, aligned, group):
     # Storage is shared across steps. The results saved for backward have independent lifetimes.
     state = _workspace(group)
     with state.lock:
-        scratch = _scratch(group, x.device, max(2 * max(host[:8]), (cap * k + 1) // 2))
+        scratch = _scratch(group, x.device, max(2 * max(host[:world]), (cap * k + 1) // 2))
         peers = state.buffers(group, ((1 + k) * cap, hidden), x)
         # Both workspace completion events are queued before this cross-rank barrier.
         # It protects the previous generation's local reads of routes and output slots.
@@ -373,14 +362,14 @@ def prepare(x, ids, probs, experts, width, aligned, group):
                 probs,
                 prefix,
                 bases,
-                *scratch.peers,
+                tuple(scratch.peers),
                 slots,
                 *ids.stride(),
                 *probs.stride(),
                 rank,
                 experts,
                 k,
-                _ROUTE_BINS,
+                bins,
                 256,
             )
         scratch.handle.barrier(channel=1)
@@ -417,7 +406,7 @@ def return_grad(dp, route, plan):
             scratch.handle.barrier(channel=1)
         if route.numel():
             _push_grad[(triton.cdiv(route.numel(), 256),)](
-                route, dp, *scratch.grad_peers, route.numel(), 256
+                route, dp, tuple(scratch.grad_peers), route.numel(), 256
             )
         scratch.handle.barrier(channel=2)
         result = values.clone()

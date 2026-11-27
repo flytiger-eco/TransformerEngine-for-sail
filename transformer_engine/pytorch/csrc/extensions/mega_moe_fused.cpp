@@ -212,9 +212,10 @@ static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &rout
   TORCH_CHECK(!scatter_only || !pull, "Scatter-only mode needs a return operation");
   TORCH_CHECK(a.is_cuda() && a.is_contiguous() && a.dim() == 2 &&
                   a.scalar_type() == at::kBFloat16 && !w.empty() &&
-                  w.size() <= rtc::MegaMoETrainArgs::kMaxExperts && rank >= 0 && rank < 8 &&
-                  peers.size() == 8 && capacity > 0 && a.size(0) <= INT_MAX && a.size(1) > 0 &&
-                  a.size(1) <= INT_MAX,
+                  w.size() <= rtc::MegaMoETrainArgs::kMaxExperts && rank >= 0 &&
+                  static_cast<size_t>(rank) < peers.size() &&
+                  (peers.size() == 8 || peers.size() == rtc::MegaMoETrainArgs::kMaxPeers) &&
+                  capacity > 0 && a.size(0) <= INT_MAX && a.size(1) > 0 && a.size(1) <= INT_MAX,
               "Invalid MegaMoE training operands");
   c10::cuda::CUDAGuard guard(a.device());
   TORCH_CHECK(route.device() == a.device() && route.is_contiguous() &&
@@ -239,7 +240,7 @@ static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &rout
                 w[i].size(transpose ? 1 : 0) == p.k);
     p.weight[i] = w[i].data_ptr();
   }
-  for (int r = 0; r < 8; ++r) {
+  for (size_t r = 0; r < peers.size(); ++r) {
     TORCH_CHECK(peers[r].device() == a.device() && peers[r].is_contiguous() &&
                 peers[r].scalar_type() == a.scalar_type() && peers[r].dim() == 2 &&
                 peers[r].size(0) == (1LL + topk) * capacity &&

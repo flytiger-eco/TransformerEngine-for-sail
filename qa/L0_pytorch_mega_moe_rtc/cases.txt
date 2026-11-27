@@ -1,2 +1,5 @@
-# EP size, rank-tag filename, call key. Look in tags/ first, then MEGA_MOE_CI_CAPTURES.
-8 megatron-ep8.tags megatrondemo/0/71/0.1.2.3.4.5.6.7/0
+# EP size, rank-tag filename, call key, unique report label. Look in tags/ first, then MEGA_MOE_CI_CAPTURES.
+8 megatron-ep8.tags megatrondemo/0/71/0.1.2.3.4.5.6.7/0 Megatron-EP8
+8 dpskv41-megamoe-ep8.tags 20261126-155637-u109-megamoe-r1_reindex-s2048-SDDP/0/74/0.1.2.3.4.5.6.7/0 DeepSeek-V4.1-call-0
+8 dpskv41-megamoe-ep8.tags 20261126-155637-u109-megamoe-r1_reindex-s2048-SDDP/0/74/0.1.2.3.4.5.6.7/1 DeepSeek-V4.1-call-1
+8 qwen35b-a3b-megamoe-ep8.tags 20261126-165739-capture-U0Ro/0/79/0.1.2.3.4.5.6.7/3 Qwen35B-A3B-call-3

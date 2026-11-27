@@ -21,7 +21,8 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 import transformer_engine.pytorch as te
-import transformer_engine_torch as tex
+from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
+from transformer_engine.pytorch.module.base import _2X_ACC_DGRAD, _2X_ACC_WGRAD
 from transformer_engine.pytorch._mega_moe_train import _activation_grad, _save_activation
 from transformer_engine.pytorch.mega_moe import _bf16_forward
 from deep_ep import topk_idx_t
@@ -36,6 +37,38 @@ def _merge(part, reverse, dst, H: tl.constexpr, B: tl.constexpr, K: tl.constexpr
         src = tl.load(reverse + row * K + k)
         acc += tl.load(part + src.to(tl.int64) * H + col, (src >= 0) & (col < H), 0).to(tl.float32)
     tl.store(dst + row.to(tl.int64) * H + col, acc, col < H)
+
+
+def _linear_backward(dy, x, weights, counts):
+    """Run the BF16 GroupedLinear backward for one expert projection."""
+    grad_outputs = dy.split(counts)
+    dx = dy.new_empty(x.shape)
+    dw = [torch.empty_like(w) for w in weights]
+    quantizers = [None] * len(weights)
+    general_grouped_gemm(
+        weights,
+        grad_outputs,
+        [dx],
+        quantizers,
+        dy.dtype,
+        layout="NN",
+        m_splits=counts,
+        grad=True,
+        single_output=True,
+        use_split_accumulator=_2X_ACC_DGRAD,
+    )
+    general_grouped_gemm(
+        x.split(counts),
+        grad_outputs,
+        dw,
+        quantizers,
+        dy.dtype,
+        layout="NT",
+        m_splits=counts,
+        grad=True,
+        use_split_accumulator=_2X_ACC_WGRAD,
+    )
+    return dx, dw
 
 
 class DeepTraining(torch.autograd.Function):
@@ -107,18 +140,16 @@ class DeepTraining(torch.autograd.Function):
         w1, w2 = weights[: base.experts], weights[base.experts :]
         if isinstance(base, DeepEPLegacyForward):
             recv, *_ = base.buffer.dispatch(dy.contiguous(), handle=handle)
-            offsets = x.new_tensor([0, *ctx.counts], dtype=torch.int32).cumsum(0, dtype=torch.int32)
         else:
             recv, *_ = base.buffer.dispatch(dy.contiguous(), handle=handle, num_sms=base.num_sms)
-            offsets = torch.nn.functional.pad(handle.psum_num_recv_tokens_per_expert, (1, 0)).int()
         owner_dy = recv[rows]
-        dh = tex.mega_moe_dgrad(owner_dy, offsets, w2)
+        dh, dw2 = _linear_backward(owner_dy, y, w2, ctx.counts)
         dz, dp = torch.empty_like(z), torch.empty_like(p)
         if len(rows):
             _activation_grad[(len(rows),)](
                 dh, z, p, raw, dz, dp, y.size(1), triton.next_power_of_2(y.size(1))
             )
-        partial = tex.mega_moe_dgrad(dz, offsets, w1)
+        partial, dw1 = _linear_backward(dz, x, w1, ctx.counts)
         reduced = torch.empty_like(recv)
         if len(recv):
             _merge[(len(recv), triton.cdiv(dy.size(1), 256))](
@@ -127,10 +158,6 @@ class DeepTraining(torch.autograd.Function):
         rdp = dp.new_zeros((len(recv), ctx.k))
         rdp.flatten()[slot] = dp
         dx, dp_src, _ = base.buffer.combine(reduced, handle, topk_weights=rdp)
-        dw1 = [torch.empty_like(w) for w in w1]
-        dw2 = [torch.empty_like(w) for w in w2]
-        tex.mega_moe_wgrad(owner_dy, y, offsets, dw2, False)
-        tex.mega_moe_wgrad(dz, x, offsets, dw1, False)
         return dx, None, dp_src, None, *dw1, *dw2
 
 
@@ -188,7 +215,7 @@ class DeepExpandedTraining(torch.autograd.Function):
         partial = base.linear(y, w2, counts)
         out, _, _ = base.buffer.combine(partial, handle)
         ctx.save_for_backward(owner_x, z, raw, y, p, *weights)
-        ctx.base, ctx.handle = base, handle
+        ctx.base, ctx.handle, ctx.counts = base, handle, counts
         return out
 
     @staticmethod
@@ -223,15 +250,14 @@ class DeepExpandedTraining(torch.autograd.Function):
                 meta, source_to_recv, reverse, gather, meta.size(0), k, 256
             )
         owner_dy = torch.index_select(recv, 0, gather)
-        offsets = torch.nn.functional.pad(forward.psum_num_recv_tokens_per_expert, (1, 0)).int()
-        dh = tex.mega_moe_dgrad(owner_dy, offsets, w2)
+        dh, dw2 = _linear_backward(owner_dy, y, w2, ctx.counts)
         dz, dp = torch.empty_like(z), torch.empty_like(p)
         if x.size(0):
             width = y.size(1)
             _activation_grad[(x.size(0),)](
                 dh, z, p, raw, dz, dp, width, triton.next_power_of_2(width)
             )
-        partial = tex.mega_moe_dgrad(dz, offsets, w1)
+        partial, dw1 = _linear_backward(dz, x, w1, ctx.counts)
         reduced = torch.empty_like(recv)
         rdp = dp.new_empty((recv_count, k))
         if recv_count:
@@ -240,10 +266,6 @@ class DeepExpandedTraining(torch.autograd.Function):
             )
             _pack_dp[(triton.cdiv(reverse.numel(), 256),)](dp, reverse, rdp, reverse.numel(), 256)
         dx, dp_src, _ = base.buffer.combine(reduced, handle, topk_weights=rdp)
-        dw1 = [torch.empty_like(w) for w in w1]
-        dw2 = [torch.empty_like(w) for w in w2]
-        tex.mega_moe_wgrad(owner_dy, y, offsets, dw2, False)
-        tex.mega_moe_wgrad(dz, x, offsets, dw1, False)
         return dx, None, dp_src, None, *dw1, *dw2
 
 

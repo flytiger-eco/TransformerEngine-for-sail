@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""Saved owner-local activations for eager BF16 EP8 training."""
+"""Saved owner-local activations for eager BF16 peer-accessible EP training."""
 import torch
 import triton
 import triton.language as tl

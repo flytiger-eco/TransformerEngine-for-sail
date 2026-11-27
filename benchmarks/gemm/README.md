@@ -349,15 +349,15 @@ The fused public path admits EP2/EP8, BF16, top-k one through eight, H and I div
 
 ## 11. EP8 training with saved SwiGLU activations
 
-The balanced BF16 case in section 10 has 2,048 source tokens per rank and 2,048 rows per expert. The training replay uses 64 experts, top-k eight, FC1 [6144,3584] and FC2 [3584,3072]. It checks the output, input gradient, routing-weight gradient and both lists of expert weight gradients before timing. The DeepEP training baseline uses non-expanded dispatch, local grouping and the cached handle for backward dispatch and gradient return. Both saved-activation implementations use the same activation derivative and local weight-gradient kernels.
+The balanced BF16 case in section 10 has 2,048 source tokens per rank and 2,048 rows per expert. The training replay uses 64 experts, top-k eight, FC1 [6144,3584] and FC2 [3584,3072]. It checks the output, input gradient, routing-weight gradient and both lists of expert weight gradients before timing. The DeepEP training baseline uses non-expanded dispatch, local grouping and the cached handle for backward dispatch and gradient return. Both saved-activation implementations use the same activation derivative. For each expert projection the DeepEP baseline uses TE RTC GroupGEMM with the GroupedLinear layouts TN for forward, NN for dgrad and NT for wgrad.
 
-On eight ICN64-connected SM89 PPUs, three warmups and eight timed iterations gave the following median latencies in ms. Each sample takes the maximum across ranks for its interval. The total measures forward plus backward in one iteration.
+The following historical comparison used MegaMoE gradient GEMMs in the DeepEP backward pass. On eight ICN64-connected SM89 PPUs, three warmups and eight timed iterations gave these median latencies in ms. Each sample takes the maximum across ranks for its interval. The total measures forward plus backward in one iteration.
 
 | Training path | Forward | Backward | Total |
 | --- | ---: | ---: | ---: |
 | MegaMoE, saved activations | 8.615 | 11.905 | 20.522 |
 | MegaMoE, FC1 recompute | 4.834 | 14.183 | 19.005 |
-| DeepEP + grouped GEMM | 5.036 | 8.241 | 13.267 |
+| DeepEP, RTC forward and MegaMoE dgrad/wgrad | 5.036 | 8.241 | 13.267 |
 
 Saving the activations reduced backward by 2.278 ms. Forward took 3.781 ms longer, increasing the total by 1.518 ms. The saved path retained 592 MiB per owner for packed input, gate/up, weighted BF16 activation and unweighted FP32 activation, excluding route metadata, workspace and temporaries. The backward profile contained one pull dgrad, one activation derivative, one scatter dgrad and two local weight-gradient GEMMs.
 
@@ -420,19 +420,51 @@ and requested gradients against TE's all-to-all transport. Timing JSON reports
 rank-max forward, backward and total CUDA-event samples and medians. The
 reader also accepts previously captured v1 manifests and their original shards.
 
-The 890P gate captures EP2 and EP8 test calls. It runs each BF16 distributed tag
-through merge-base MegaMoE, PR MegaMoE, and DeepEP intranode dispatch/combine with
+For the Qwen EP16 training capture, start one torchrun agent on each of two
+eight-PPU hosts in the same ICN fabric. Use the same PyTorch build on both
+hosts. Set `NODE_RANK` to 0 and 1 respectively and `MASTER_ADDR` to the
+first host's reachable address. The opt-in uses cross-host CUDA symmetric
+memory for expert inputs and output slots.
+
+```bash
+export NVTE_MOE_EP16_FUSED=1
+torchrun --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+  benchmarks/gemm/replay_mega_moe.py \
+  qa/L0_pytorch_mega_moe_rtc/tags/qwen35-ep16-r5-call0.tags \
+  --profile-ep16-path --output qwen-ep16.json
+# Run on rank zero's host after torchrun exits.
+python qa/L0_pytorch_mega_moe_rtc/verify_ep16.py qwen-ep16.json
+```
+
+The two-node Qwen CI job measures merge-base MegaMoE, PR MegaMoE and DeepEP with TE RTC
+GroupGEMM on the same 16 PPUs and route capture. The second sweep reverses their order.
+The baseline uses the path selected by its own wheel. The report records how many
+baseline ranks executed all-to-all in each direction.
+Each backend runs five warmups and twenty timed replays per sweep. The PR report
+includes single-layer forward, backward and total latency, plus a chart for the
+six kernel stages using the same profiling convention as the single-node gate.
+The `qwen-ep16-rank-paths` artifact contains the timing samples, rank-path
+verification and plotted data.
+
+The single-node 890P gate replays Megatron EP8, DeepSeek-V4.1 calls 0 and 1,
+and Qwen35B-A3B call 3. It runs each BF16 distributed tag through merge-base MegaMoE, PR MegaMoE, and DeepEP intranode dispatch/combine with
 the PR wheel's RTC grouped GEMMs. The second sweep reverses the three-way order.
+The four middle arms of each single-node case share one PR-wheel process group.
+Each arm restores the capture and seed, checks the reference, and performs its own warmup and timing.
 Use `--backend deepep` on the same replay command to measure DeepEP separately.
 For a source with zero tokens, its DeepEP adapter pads one all-dropped row and
 trims the result. This padding is timed and sends no expert rows.
 The Actions job summary and the artifact's `comparison.md` list forward,
-backward and total latency in milliseconds. The artifact also includes a total-step
-latency chart in `comparison.png`. DeepEP / PR above 1 means PR
+backward and total latency in milliseconds. Each `stages-<case>.png` plots all three implementations across six kernel stages.
+The report records the merge-base SHA and shows both baseline / PR and DeepEP / PR latency ratios.
+Each profiling step repeats the same captured invocation four times. Stage values sum
+rank-local kernel durations, take the maximum across ranks, then average three steps.
+The raw reports include matched device kernel names for each stage. DeepEP / PR above 1 means PR
 MegaMoE is faster. The 5% regression check compares MegaMoE head with base. The checked-in Megatron example has 64 experts, H=3584,
 I=3072 and eight source tags. To add a model case, place its `.tags` under
 `qa/L0_pytorch_mega_moe_rtc/tags/` or `MEGA_MOE_CI_CAPTURES` (default
-`/mnt/wl_nas/te-ci/mega-moe/captures`) and add a line with EP size, filename
-and call key to `qa/L0_pytorch_mega_moe_rtc/cases.txt`. Numerical failures
+`/mnt/wl_nas/te-ci/mega-moe/captures`) and add a line with EP size, filename,
+call key and a unique model/call label to `qa/L0_pytorch_mega_moe_rtc/cases.txt`. Numerical failures
 block the job. Manual and perf/refactor runs also enforce a 5% total latency
 regression threshold.

@@ -9,11 +9,13 @@ on:
       - 'transformer_engine/common/gemm/rtc/**'
       - 'benchmarks/gemm/replay_mega_moe.py'
       - 'benchmarks/gemm/mega_moe_tags.py'
+      - 'benchmarks/gemm/mega_moe_kernel_profile.py'
       - 'benchmarks/gemm/benchmark_mega_moe*.py'
       - 'qa/L0_pytorch_mega_moe_rtc/**'
       - 'qa/L0_pytorch_grouped_gemm_rtc/test.sh'
       - '.github/scripts/rtc_grouped_gemm_gate.py'
       - '.github/workflows/ppu-890-mega-moe-replay.yml'
+      - '.github/workflows/publish-mega-moe-report.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -104,74 +106,11 @@ jobs:
     name: Publish MegaMoE replay comparison
     needs: replay
     if: always() && !cancelled() && needs.replay.outputs.artifact_id != '' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: k8s-runner-group-cpu-flytiger
-    timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
-    container:
-      image: ghcr.io/actions/actions-runner:latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          artifact-ids: ${{ needs.replay.outputs.artifact_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/mega-moe-report
-      - uses: actions/github-script@v7
-        env:
-          REPORT_DIR: ${{ runner.temp }}/mega-moe-report
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          REPLAY_RESULT: ${{ needs.replay.result }}
-        with:
-          script: |
-            const fs = require('fs');
-            const dir = process.env.REPORT_DIR;
-            const pr = Number(process.env.PR_NUMBER);
-            const repo = context.repo;
-            const root = `${context.serverUrl}/${repo.owner}/${repo.repo}`;
-            const run = `${root}/actions/runs/${context.runId}/attempts/${process.env.GITHUB_RUN_ATTEMPT}`;
-            const marker = '<!-- te-mega-moe-replay:ZW-M890P -->';
-            const lines = [marker, '### MegaMoE replay · 890P', '',
-              `Commit \`${process.env.HEAD_SHA.slice(0, 7)}\` · [CI ${process.env.REPLAY_RESULT}](${run})`, ''];
-            if (fs.existsSync(dir + '/comparison.md')) {
-              const table = fs.readFileSync(dir + '/comparison.md', 'utf8');
-              if (fs.existsSync(dir + '/comparison.png')) {
-                const png = fs.readFileSync(dir + '/comparison.png');
-                if (png.length > 5 * 1024 * 1024 || png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') {
-                  throw new Error('Invalid comparison.png');
-                }
-                const path = `mega-moe/pr-${pr}/run-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}/comparison.png`;
-                for (let attempt = 0; ; attempt++) {
-                  try {
-                    const {data} = await github.rest.repos.createOrUpdateFileContents({
-                      ...repo, path, branch: 'ci-reports', message: `MegaMoE replay for PR #${pr}`,
-                      content: png.toString('base64')
-                    });
-                    lines.push(`![MegaMoE and DeepEP total step latency](${root}/raw/${data.commit.sha}/${path})`, '');
-                    break;
-                  } catch (error) {
-                    if (error.status === 409 && attempt < 4) continue;
-                    core.warning(`Image publication failed: ${error.message}`);
-                    lines.push(`[Download comparison.png from the run artifacts](${run})`, '');
-                    break;
-                  }
-                }
-              }
-              lines.push(table.length <= 59000 ? table : 'Full comparison table is in the CI artifact.');
-            } else {
-              core.notice('No comparison table was produced. Keeping the previous PR report.');
-              return;
-            }
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              ...repo, issue_number: pr, per_page: 100
-            });
-            const previous = comments.find(c => c.body?.startsWith(marker) &&
-              ['github-actions[bot]', process.env.PR_AUTHOR].includes(c.user.login));
-            const body = lines.join('\n');
-            if (previous) {
-              await github.rest.issues.updateComment({...repo, comment_id: previous.id, body});
-            } else {
-              await github.rest.issues.createComment({...repo, issue_number: pr, body});
-            }
+    uses: ./.github/workflows/publish-mega-moe-report.yml
+    with:
+      report: single-node
+      artifact_id: ${{ needs.replay.outputs.artifact_id }}
+      replay_result: ${{ needs.replay.result }}
