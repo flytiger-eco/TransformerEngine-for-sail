@@ -201,10 +201,22 @@ def check_training(rank, device, local_experts=2, topk=8, tokens_per_rank=2048):
         p.requires_grad_()
         dy = torch.randn((x.size(1), tokens), device=device, dtype=x.dtype).T
         expected = training_reference(x, ids, p, dy, all1, all2)
-        out = te.bf16_mega_moe(x, ids, p, w1, w2, ep_group=group)
+        cases.append((x, ids, p, dy, expected))
+
+    # Both streams depend only on input preparation. The second admission must
+    # wait for peer work from the first forward before submitting its collective.
+    current = torch.cuda.current_stream(device)
+    streams = [torch.cuda.Stream(device=device) for _ in cases]
+    outputs = []
+    for stream, (x, ids, p, _, _) in zip(streams, cases):
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            out = te.bf16_mega_moe(x, ids, p, w1, w2, ep_group=group)
         assert "TrainBackward" in type(out.grad_fn).__name__
-        cases.append((x, p, dy, out, expected))
-    for x, p, dy, out, expected in reversed(cases):
+        outputs.append(out)
+    for stream in streams:
+        current.wait_stream(stream)
+    for (x, _, p, dy, expected), out in zip(reversed(cases), reversed(outputs)):
         actual = torch.autograd.grad(out, (x, p, *w1, *w2), dy)
         drift = torch.stack(
             [

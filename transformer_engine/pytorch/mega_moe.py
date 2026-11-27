@@ -191,11 +191,11 @@ def _run_mega_moe(
             state = _workspace(ep_group)
             if _peer_supported(ep_group, x.device) and state.training_supported:
                 bf16, grad = dtype == torch.bfloat16, torch.is_grad_enabled()
-                # Admission can launch a collective on a different stream before peer_forward
-                # orders reuse of its workspace. Let the previous peer kernel finish first.
+                # Order the admission collective after outstanding peer work, including
+                # a training call on another stream that only recorded state.done.
                 if state.fused is not None:
                     torch.cuda.current_stream(x.device).wait_event(state.fused.done)
-                if not (bf16 and grad) and state.done is not None:
+                if state.done is not None:
                     torch.cuda.current_stream(x.device).wait_event(state.done)
                 if bf16 and grad:
                     from ._mega_moe_train import training_forward
