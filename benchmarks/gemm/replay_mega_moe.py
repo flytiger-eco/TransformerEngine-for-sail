@@ -40,7 +40,7 @@ def restore(layout, device, values=None):
     return tensor.requires_grad_(layout["requires_grad"])
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", help="rank tag log, legacy manifest.json or v1 ID")
     parser.add_argument("--call", help="invocation to replay when a log contains multiple calls")
@@ -63,23 +63,24 @@ def main():
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--seed", type=int, default=73)
     parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.warmup < 0 or args.iters < 1:
+        parser.error("expected warmup >= 0 and iters >= 1")
+    return args
+
+
+def replay(args, device):
     if args.backend == "deepep":
         os.environ.update(
             NVTE_USE_CUTLASS_GROUPED_GEMM="1",
             NVTE_USE_CUTLASS_GROUPED_GEMM_RTC="1",
             NVTE_FORCE_RTC_NO_FALLBACK="1",
         )
-    if args.warmup < 0 or args.iters < 1:
-        parser.error("expected warmup >= 0 and iters >= 1")
     match = re.fullmatch(r"te_mega_moe:v1:([a-f0-9]{32})", args.capture)
     path = args.directory / match[1] / "manifest.json" if match else Path(args.capture)
     legacy = match or path.name == "manifest.json"
-    world = int(os.environ.get("WORLD_SIZE", 1))
+    world = dist.get_world_size()
     os.environ.pop("NVTE_MOE_CAPTURE_TAG", None)
-    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
-    torch.cuda.set_device(device)
-    dist.init_process_group("nccl", device_id=device)
     rank = dist.get_rank()
     torch.manual_seed(args.seed + rank)
     error = None
@@ -263,7 +264,23 @@ def main():
             args.output.write_text(json.dumps(result, indent=2) + "\n")
     if baseline is not None:
         baseline.buffer.destroy()
-    dist.destroy_process_group()
+
+
+def run_replays(cases):
+    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl", device_id=device)
+    try:
+        for args in cases:
+            # A capture may change routing flags, and DeepEP forces TE RTC on its arm.
+            with patch.dict(os.environ):
+                replay(args, device)
+    finally:
+        dist.destroy_process_group()
+
+
+def main():
+    run_replays([parse_args()])
 
 
 if __name__ == "__main__":

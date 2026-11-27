@@ -448,6 +448,8 @@ verification and plotted data.
 The 890P gate captures EP2 and EP8 test calls. It runs each BF16 distributed tag
 through merge-base MegaMoE, PR MegaMoE, and DeepEP intranode dispatch/combine with
 the PR wheel's RTC grouped GEMMs. The second sweep reverses the three-way order.
+The four middle arms of each single-node case share one PR-wheel process group.
+Each arm restores the capture and seed, checks the reference, and performs its own warmup and timing.
 Use `--backend deepep` on the same replay command to measure DeepEP separately.
 For a source with zero tokens, its DeepEP adapter pads one all-dropped row and
 trims the result. This padding is timed and sends no expert rows.

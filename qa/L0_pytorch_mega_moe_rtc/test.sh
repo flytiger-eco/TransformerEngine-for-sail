@@ -14,21 +14,15 @@ replay_case() {
     local world=$1 tag=$2 log=$3 name=$4
     shift 4
     echo "$name $world $tag" >> "$out/cases.txt"
+    local launch=(-m torch.distributed.run --standalone --nproc-per-node="$world")
     for sweep in 0 1; do
-        arms=(base head deepep)
-        if (( sweep == 1 )); then arms=(deepep head base); fi
-        for arm in "${arms[@]}"; do
-            local venv=$arm
-            local flags=("$@")
-            if [[ $arm == deepep ]]; then
-                venv=head
-                flags=(--backend deepep)
-            fi
-            if [[ $arm != base && $sweep == 0 ]]; then flags+=(--profile-stages); fi
-            "$scratch/$venv-venv/bin/python" -m torch.distributed.run --standalone \
-                --nproc-per-node="$world" "$source_dir/benchmarks/gemm/replay_mega_moe.py" \
-                "$log" --call "$tag" "${flags[@]}" --output "$out/$arm/$name-$sweep.json"
-        done
+        "$scratch/base-venv/bin/python" "${launch[@]}" "$source_dir/benchmarks/gemm/replay_mega_moe.py" \
+            "$log" --call "$tag" "$@" --output "$out/base/$name-$sweep.json"
+        if (( sweep == 0 )); then
+            "$scratch/head-venv/bin/python" "${launch[@]}" \
+                "$source_dir/qa/L0_pytorch_mega_moe_rtc/replay_head_sweeps.py" \
+                "$out" "$name" "$log" --call "$tag" "$@"
+        fi
     done
 }
 
