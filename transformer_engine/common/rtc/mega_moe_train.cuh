@@ -23,9 +23,8 @@ static_assert(Gemm::MaxThreadsPerBlock == 512 && Gemm::SharedStorageSize == 1966
 #define TRAIN_SCATTER_ONLY 0
 #endif
 
-constexpr bool kBatchReturn =
-    TRAIN_SCATTER_ONLY && NVTE_GG_TRANS_B && TRAIN_K == 3072 && TRAIN_N == 3584;
-constexpr int kReturnStride = kBatchReturn ? 264 : 256;
+// Pad each shared-memory row by one vector to distribute the transpose stores across banks.
+constexpr int kReturnStride = 264;
 
 // Reuse the staged GEMM mainloop storage to transpose the accumulator fragments
 // into complete rows before sending them to the originating top-k slots.
@@ -56,9 +55,6 @@ struct ScatterEpilogue : Traits::CollectiveEpilogue {
     }
   }
 };
-using ScatterGemm =
-    cutlass::gemm::kernel::NvteNativeGrouped<Traits::CollectiveMainloop, ScatterEpilogue, false,
-                                             TRAIN_N, TRAIN_K>;
 
 // A warp-bulk x4 store sends four consecutive 128-byte stripes. Each lane
 // contributes the word at the same position in each stripe.
@@ -72,49 +68,34 @@ __device__ __forceinline__ void scatter_shared(const MegaMoETrainArgs &p, int ti
                                                const B *staging) {
   const auto *route = static_cast<const int64_t *>(p.route) + tile * 256;
   const int warp = threadIdx.x / 32;
-  if constexpr (kBatchReturn) {
-    constexpr int kRowBatch = 2;
-    // One warp owns sixteen adjacent rows. Its lanes fetch the route descriptors
-    // together, then broadcast two row destinations at a time to the senders.
-    const int64_t key = route[warp * 16 + (threadIdx.x & 15)];
-    const int peer = static_cast<int>(key >> 32);
-    const auto dest =
-        key < 0 ? 0ull
-                : reinterpret_cast<uint64_t>(
-                      static_cast<B *>(p.peer[peer]) +
-                      (int64_t(p.capacity) + static_cast<unsigned>(key)) * TRAIN_N + col * 256);
-    for (int first = 0; first < 16; first += kRowBatch) {
-      uint4 values[kRowBatch];
-      uint64_t targets[kRowBatch];
-      bool local[kRowBatch];
+  constexpr int kRowBatch = 2;
+  // One warp owns sixteen adjacent rows. Its lanes fetch the route descriptors
+  // together, then broadcast two row destinations at a time to the senders.
+  const int64_t key = route[warp * 16 + (threadIdx.x & 15)];
+  const int peer = static_cast<int>(key >> 32);
+  const auto dest =
+      key < 0 ? 0ull
+              : reinterpret_cast<uint64_t>(
+                    static_cast<B *>(p.peer[peer]) +
+                    (int64_t(p.capacity) + static_cast<unsigned>(key)) * TRAIN_N + col * 256);
+  for (int first = 0; first < 16; first += kRowBatch) {
+    uint4 values[kRowBatch];
+    uint64_t targets[kRowBatch];
+    bool local[kRowBatch];
 #pragma unroll
-      for (int r = 0; r < kRowBatch; ++r) {
-        values[r] = shared_row(staging, warp * 16 + first + r);
-        targets[r] = __shfl_sync(0xffffffffu, dest, first + r);
-        local[r] = __shfl_sync(0xffffffffu, peer, first + r) == p.rank;
-      }
-#pragma unroll
-      for (int r = 0; r < kRowBatch; ++r) {
-        if (!targets[r]) continue;
-        auto *dst = reinterpret_cast<void *>(targets[r]);
-        if (local[r])
-          __ppu_global_store_bulk_volatile_b32x4(dst, values[r]);
-        else
-          __ppu_remote_store_bulk_volatile_b32x4(dst, values[r]);
-      }
+    for (int r = 0; r < kRowBatch; ++r) {
+      values[r] = shared_row(staging, warp * 16 + first + r);
+      targets[r] = __shfl_sync(0xffffffffu, dest, first + r);
+      local[r] = __shfl_sync(0xffffffffu, peer, first + r) == p.rank;
     }
-  } else {
-    for (int row = warp; row < 256; row += 16) {
-      const int64_t key = route[row];
-      if (key < 0) continue;
-      const int peer = static_cast<int>(key >> 32);
-      auto *dst = static_cast<B *>(p.peer[peer]) +
-                  (int64_t(p.capacity) + static_cast<unsigned>(key)) * TRAIN_N + col * 256;
-      const uint4 value = shared_row(staging, row);
-      if (peer == p.rank)
-        __ppu_global_store_bulk_volatile_b32x4(dst, value);
+#pragma unroll
+    for (int r = 0; r < kRowBatch; ++r) {
+      if (!targets[r]) continue;
+      auto *dst = reinterpret_cast<void *>(targets[r]);
+      if (local[r])
+        __ppu_global_store_bulk_volatile_b32x4(dst, values[r]);
       else
-        __ppu_remote_store_bulk_volatile_b32x4(dst, value);
+        __ppu_remote_store_bulk_volatile_b32x4(dst, values[r]);
     }
   }
   // All warps must finish reading their rows before the next GEMM uses smem.
@@ -153,32 +134,27 @@ __device__ __forceinline__ void pull_row(const MegaMoETrainArgs &p, int row) {
   }
 }
 
-__device__ void transfer(const MegaMoETrainArgs &p, int tile, int column) {
-  for (int r = threadIdx.x / 32; r < 256; r += 16) {
+__device__ void scatter_output(const MegaMoETrainArgs &p, int tile, int column) {
+  for (int r = threadIdx.x / 32; r < 256; r += blockDim.x / 32) {
     const int row = tile * 256 + r;
-    if constexpr (TRAIN_PULL) {
-      constexpr int segments = TRAIN_K / 256;
-      pull_row<(segments < 8 ? segments : 8)>(p, row);
-    } else {
-      const int64_t route = static_cast<const int64_t *>(p.route)[row];
-      if (route < 0) continue;
-      const int src = static_cast<int>(route >> 32);
-      const unsigned slot = static_cast<unsigned>(route);
-      auto *from = static_cast<B *>(p.d) + int64_t(row) * TRAIN_N + column * 256;
-      auto *dst =
-          static_cast<B *>(p.peer[src]) + (int64_t(p.capacity) + slot) * TRAIN_N + column * 256;
-      auto value = __ppu_global_ldcg_bulk_b32x4(from);
-      if (src == p.rank)
-        __ppu_global_store_bulk_volatile_b32x4(dst, value);
-      else
-        __ppu_remote_store_bulk_volatile_b32x4(dst, value);
-    }
+    const int64_t route = static_cast<const int64_t *>(p.route)[row];
+    if (route < 0) continue;
+    const int src = static_cast<int>(route >> 32);
+    const unsigned slot = static_cast<unsigned>(route);
+    auto *from = static_cast<B *>(p.d) + int64_t(row) * TRAIN_N + column * 256;
+    auto *dst =
+        static_cast<B *>(p.peer[src]) + (int64_t(p.capacity) + slot) * TRAIN_N + column * 256;
+    auto value = __ppu_global_ldcg_bulk_b32x4(from);
+    if (src == p.rank)
+      __ppu_global_store_bulk_volatile_b32x4(dst, value);
+    else
+      __ppu_remote_store_bulk_volatile_b32x4(dst, value);
   }
   fused_moe::release_warp_writes();
   __syncthreads();
 }
 
-// The router pads all owner blocks to 256 rows. Every output tile is full and
+// The router pads owner blocks to 256 rows. Every output tile is full and
 // aligned, so the matrix loop can use the native full-tile BF16 store directly.
 template <class Epilogue = Traits::CollectiveEpilogue>
 __device__ __forceinline__ void project_full_tile(const B *x, const B *weight, B *out, int column,
@@ -214,7 +190,8 @@ __device__ __forceinline__ void pull_rows(const MegaMoETrainArgs &p, int cta, in
   for (int row =
            first * 256 + (cta * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x)) / 32;
        row < end * 256; row += ctas * static_cast<int>(blockDim.x) / 32) {
-    pull_row<segments>(p, row);
+    // Bound register pressure for unusually wide inputs. One segment is 512 bytes.
+    pull_row<(segments < 32 ? segments : 32)>(p, row);
   }
   fused_moe::release_warp_writes();
   __syncthreads();
@@ -282,67 +259,35 @@ __device__ __forceinline__ void pull_then_project(const MegaMoETrainArgs &p, cha
 
 extern "C" __global__ __launch_bounds__(512, 1) void TRAIN_KERNEL(MegaMoETrainArgs p) {
   extern __shared__ char smem[];
-  if constexpr (TRAIN_PULL && TRAIN_K == 3584 && (TRAIN_N == 6144 || TRAIN_N == 3072)) {
+  if constexpr (TRAIN_PULL) {
     pull_then_project(p, smem);
     return;
   }
-  // Cooperative launch makes the copy producers resident alongside the consumers.
-  const int copies = min(8, static_cast<int>(gridDim.x) - 1);
-  if constexpr (TRAIN_PULL) {
-    if (blockIdx.x < copies) {
-      for (int tile = blockIdx.x; tile < p.tiles; tile += copies) {
-        transfer(p, tile, 0);
-        if (!threadIdx.x) fused_moe::publish(p.ready + tile, 1);
-      }
-    }
-  }
   constexpr int columns = TRAIN_N / 256;
-  // Copy producers rejoin the compute queue. Scatter retains its static tile assignment.
-  int task = blockIdx.x;
-  while (true) {
-    if constexpr (TRAIN_PULL) {
-      auto *next = reinterpret_cast<int *>(smem);
-      if (!threadIdx.x) *next = atomicAdd(p.ready + p.tiles, 1);
-      __syncthreads();
-      task = *next;
-      __syncthreads();
-    }
-    if (task >= p.tiles * columns) break;
+  for (int task = blockIdx.x; task < p.tiles * columns; task += gridDim.x) {
     const int tile = task / columns, col = task % columns;
-    if constexpr (TRAIN_PULL) {
-      if (!threadIdx.x) fused_moe::wait_epoch(p.ready + tile, 1);
-      __syncthreads();
-    }
-    cutlass::gemm::kernel::NativeExpert e{};
-    e.m = 256;
-    e.n = TRAIN_N;
-    e.k = TRAIN_K;
-    e.alpha = 1.f;
-    e.a = reinterpret_cast<uint64_t>(p.a) + int64_t(tile) * 256 * TRAIN_K * sizeof(B);
-    e.b = reinterpret_cast<uint64_t>(p.weight[p.expert[tile]]);
-    e.d = reinterpret_cast<uint64_t>(p.d) + int64_t(tile) * 256 * TRAIN_N * sizeof(B);
+    const auto *x = static_cast<const B *>(p.a) + int64_t(tile) * 256 * TRAIN_K;
+    const auto *weight = static_cast<const B *>(p.weight[p.expert[tile]]);
     if constexpr (TRAIN_SCATTER_ONLY) {
-      static_assert(!TRAIN_SCATTER_ONLY || !TRAIN_PULL);
-      const int column = kBatchReturn && (tile & 1) ? columns - 1 - col : col;
+      // Adjacent row tiles visit weight columns in opposite order.
+      const int column = tile & 1 ? columns - 1 - col : col;
       auto *staging = reinterpret_cast<B *>(smem);
-      if constexpr (kBatchReturn) {
-        // Adjacent M tiles visit W2's column tiles in opposite orders.
-        project_full_tile<ScatterEpilogue>(reinterpret_cast<const B *>(e.a),
-                                           reinterpret_cast<const B *>(e.b), staging, column, smem);
-      } else {
-        e.d = reinterpret_cast<uint64_t>(smem);
-        ScatterGemm::run_tile(e, 0, column, smem);
-      }
+      project_full_tile<ScatterEpilogue>(x, weight, staging, column, smem);
       scatter_shared(p, tile, column, staging);
     } else {
+      cutlass::gemm::kernel::NativeExpert e{};
+      e.m = 256;
+      e.n = TRAIN_N;
+      e.k = TRAIN_K;
+      e.alpha = 1.f;
+      e.a = reinterpret_cast<uint64_t>(x);
+      e.b = reinterpret_cast<uint64_t>(weight);
+      e.d = reinterpret_cast<uint64_t>(p.d) + int64_t(tile) * 256 * TRAIN_N * sizeof(B);
       Gemm::run_tile(e, 0, col, smem);
-      if constexpr (!TRAIN_PULL) {
-        fused_moe::release_warp_writes();
-        __syncthreads();
-        transfer(p, tile, col);
-      }
+      fused_moe::release_warp_writes();
+      __syncthreads();
+      scatter_output(p, tile, col);
     }
-    if constexpr (!TRAIN_PULL) task += gridDim.x;
   }
   // The following stream-ordered peer barrier publishes the completed slots.
   if constexpr (TRAIN_SCATTER_ONLY) fused_moe::release_warp_writes();

@@ -41,7 +41,8 @@ __device__ void compute(const Args &p, char *smem) {
     for (int g = 0; g < p.groups; ++g) {
       const int begin = min(max(0, p.offsets[g]), p.rows);
       const int end = min(max(begin, p.offsets[g + 1]), p.rows);
-      const int count = end - begin;
+      const int count =
+          kWgrad && p.reduction_rows ? min(end - begin, max(0, p.reduction_rows[g])) : end - begin;
       if (passes == 2 && (count < mean_rows) != (pass == 1)) continue;
       Expert e{};
       e.m = kWeightRows ? kWeightRows : (kWgrad ? p.output_width : count);
@@ -64,16 +65,27 @@ __device__ void compute(const Args &p, char *smem) {
       int mtiles = int((int64_t(e.m) + Gemm::BM - 1) / Gemm::BM);
       // With four complete N tiles per work item, keep the MMA pipeline
       // live across columns instead of draining it after each epilogue.
-      const bool four_columns = NVTE_MOE_FOUR_COLUMNS && count == NVTE_MOE_COMMON_K;
-      const int per_row = four_columns ? ntiles / 4 : ntiles;
+      const bool four_columns = NVTE_MOE_FOUR_COLUMNS == 2
+                                    ? count > 0 && count <= 512 && count % 64 == 0
+                                    : NVTE_MOE_FOUR_COLUMNS == 1 && count == NVTE_MOE_COMMON_K;
+      const int groups_of_four = four_columns ? ntiles / 4 : 0;
+      const int per_row = ntiles - 3 * groups_of_four;
       int64_t tiles = int64_t(mtiles) * per_row;
       for (; work < tiles; work += gridDim.x) {
-        const int mi = int(work / per_row), ni = int(work % per_row);
+        const int mi = int(work / per_row), item = int(work % per_row);
         if constexpr (NVTE_MOE_FOUR_COLUMNS) {
-          if (four_columns) {
-            Gemm::run_nexpand(e, mi, 4 * ni, smem);
+          if (item < groups_of_four) {
+            if constexpr (NVTE_MOE_FOUR_COLUMNS == 2)
+              RaggedGemm::run_nexpand(e, mi, 4 * item, smem);
+            else
+              Gemm::run_nexpand(e, mi, 4 * item, smem);
             continue;
           }
+        }
+        const int ni = item + 3 * groups_of_four;
+        if constexpr (NVTE_MOE_FOUR_COLUMNS == 2) {
+          RaggedGemm::run_tile(e, mi, ni, smem);
+          continue;
         }
         if constexpr (kWeightRows != 0) {
           if (count != NVTE_MOE_COMMON_K) {

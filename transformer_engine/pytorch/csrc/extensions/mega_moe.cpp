@@ -251,7 +251,7 @@ bool aligned(const Tensor &tensor) {
 
 void expert_gemm(rtc::MegaMoEGradGemm op, const Tensor &a, const Tensor &b, const Tensor &d,
                  const Tensor &offsets, const Weights &expert, bool accumulate, cudaStream_t stream,
-                 int reserve_sms = 0) {
+                 int reserve_sms = 0, const int *reduction_rows = nullptr) {
   rtc::MegaMoEGradArgs p{};
   p.rows = a.size(0);
   p.output_width = expert.front().size(0);
@@ -263,6 +263,7 @@ void expert_gemm(rtc::MegaMoEGradGemm op, const Tensor &a, const Tensor &b, cons
   p.reserve_sms = reserve_sms;
   for (size_t first = 0; first < expert.size(); first += p.kMaxExperts) {
     p.offsets = offsets.data_ptr<int>() + first;
+    p.reduction_rows = reduction_rows ? reduction_rows + first : nullptr;
     p.groups = std::min<size_t>(p.kMaxExperts, expert.size() - first);
     for (int g = 0; g < p.groups; ++g) p.expert[g] = expert[first + g].data_ptr();
     rtc::mega_moe_grad_gemm(op, p, a.scalar_type() == at::kHalf,
@@ -312,10 +313,17 @@ Tensor dgrad(const Tensor &dy, const Tensor &offsets, const Weights &weights) {
 }
 
 void wgrad(const Tensor &dy, const Tensor &x, const Tensor &offsets, const Weights &grads,
-           bool accumulate) {
+           bool accumulate, const std::optional<Tensor> &reduction_rows) {
   TORCH_CHECK(dy.is_cuda(), "MegaMoE requires device routes");
   c10::cuda::CUDAGuard guard(dy.device());
   check_grad_gemm(dy, offsets, grads, true);
+  if (reduction_rows) {
+    TORCH_CHECK(reduction_rows->device() == dy.device() &&
+                    reduction_rows->scalar_type() == at::kInt && reduction_rows->dim() == 1 &&
+                    reduction_rows->is_contiguous() &&
+                    reduction_rows->numel() == static_cast<int64_t>(grads.size()),
+                "Invalid per-expert wgrad reduction lengths");
+  }
   TORCH_CHECK(x.device() == dy.device() && x.scalar_type() == dy.scalar_type() && x.dim() == 2 &&
                   x.is_contiguous() && aligned(x) && x.size(0) == dy.size(0) &&
                   x.size(1) == grads.front().size(1),
@@ -327,6 +335,7 @@ void wgrad(const Tensor &dy, const Tensor &x, const Tensor &offsets, const Weigh
     uintptr_t begin = reinterpret_cast<uintptr_t>(matrix.data_ptr());
     uintptr_t end = begin + matrix.nbytes();
     for (const auto *input : {&x, &dy, &offsets}) check_disjoint(matrix, *input);
+    if (reduction_rows) check_disjoint(matrix, *reduction_rows);
     regions.emplace_back(begin, end);
   }
   std::sort(regions.begin(), regions.end());
@@ -334,7 +343,8 @@ void wgrad(const Tensor &dy, const Tensor &x, const Tensor &offsets, const Weigh
     TORCH_CHECK(regions[j - 1].second <= regions[j].first, "Overlapping MegaMoE wgrad outputs");
   }
   expert_gemm(rtc::MegaMoEGradGemm::kWgrad, dy, x, {}, offsets, grads, accumulate,
-              at::cuda::getCurrentCUDAStream());
+              at::cuda::getCurrentCUDAStream(), 0,
+              reduction_rows ? reduction_rows->data_ptr<int>() : nullptr);
 }
 
 // The transport stream waits only for source-row gradients. Weight gradients
@@ -510,6 +520,7 @@ void init_mega_moe_bindings(pybind11::module &m) {
   m.def("mega_moe_dgrad", &dgrad, pybind11::call_guard<pybind11::gil_scoped_release>());
   m.def("mega_moe_wgrad", &wgrad, pybind11::arg("dy"), pybind11::arg("x"), pybind11::arg("offsets"),
         pybind11::arg("grads"), pybind11::arg("accumulate") = false,
+        pybind11::arg("reduction_rows") = pybind11::none(),
         pybind11::call_guard<pybind11::gil_scoped_release>());
   m.def("mega_moe_local_backward", &local_backward, pybind11::arg("dy"), pybind11::arg("x"),
         pybind11::arg("probs"), pybind11::arg("offsets"), pybind11::arg("fc1"),

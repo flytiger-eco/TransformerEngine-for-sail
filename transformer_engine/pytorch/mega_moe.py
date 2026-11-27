@@ -188,18 +188,15 @@ def _run_mega_moe(
         from ._mega_moe_peer import _peer_supported, _workspace
 
         with torch.cuda.device(x.device):
-            if _peer_supported(ep_group, x.device) and _workspace(ep_group).training_supported:
-                # All eager training peers must agree before entering different transports.
-                # Sum two binary flags to distinguish mixed precision and mixed grad mode.
-                mode = x.new_tensor(
-                    [dtype == torch.bfloat16, torch.is_grad_enabled()], dtype=torch.int32
-                )
-                torch.distributed.all_reduce(mode, group=ep_group)
-                bf16, grad = mode.tolist()
-                if bf16 not in (0, ep_group.size()):
-                    raise ValueError("Expert-parallel input dtype must match on every rank")
-                if grad not in (0, ep_group.size()):
-                    raise ValueError("Expert-parallel grad mode must match on every rank")
+            state = _workspace(ep_group)
+            if _peer_supported(ep_group, x.device) and state.training_supported:
+                bf16, grad = dtype == torch.bfloat16, torch.is_grad_enabled()
+                # Admission can launch a collective on a different stream before peer_forward
+                # orders reuse of its workspace. Let the previous peer kernel finish first.
+                if state.fused is not None:
+                    torch.cuda.current_stream(x.device).wait_event(state.fused.done)
+                if not (bf16 and grad) and state.done is not None:
+                    torch.cuda.current_stream(x.device).wait_event(state.done)
                 if bf16 and grad:
                     from ._mega_moe_train import training_forward
 
@@ -208,6 +205,10 @@ def _run_mega_moe(
                     )
                     if output is not None:
                         return output
+                else:
+                    from ._mega_moe_train_route import agree_fallback_mode
+
+                    agree_fallback_mode(x, ep_group, bf16, grad)
     return forward(
         x,
         expert_ids,

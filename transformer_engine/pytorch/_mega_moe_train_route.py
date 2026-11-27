@@ -102,7 +102,9 @@ def _bases(
         width = tl.load(counts + (BINS + 4))
         tokens = tl.load(counts + (BINS + 5))
         topk = tl.load(counts + (BINS + 6))
-        eligible = tl.load(counts + (BINS + 7))
+        flags = tl.load(counts + (BINS + 7))
+        eligible = flags & 1
+        bf16, grad = flags & 4, flags & 2
         cap = tl.max(tokens, 0)
         mismatch = (tl.min(experts, 0) != tl.max(experts, 0)) | (
             tl.min(hidden, 0) != tl.max(hidden, 0)
@@ -115,11 +117,18 @@ def _bases(
             | (tl.sum(tokens.to(tl.int64) * topk, 0) + E * 256 >= 2147483648)
         )
         status = tl.where(bad, 2, tl.where(mismatch, 3, tl.where(fallback, 1, 0)))
+        # A non-training rank participates in this same gather before falling back.
+        # Check the mode first so every participant raises the same error.
+        status = tl.where(tl.min(grad, 0) != tl.max(grad, 0), 5, status)
+        status = tl.where(tl.min(bf16, 0) != tl.max(bf16, 0), 4, status)
         tl.store(report + WORLD, status)
         tl.store(report + WORLD + 1, cap)
         tl.store(report + WORLD + 2, tl.load(reports + rank * (BINS + 8) + (BINS + 1)))
         tl.store(report + WORLD + 3, tl.max(dropped, 0))
         tl.store(sizes + expert, total, expert < E)
+        # Wgrad reduces along the token dimension in groups of 64. The remaining
+        # padding has zero input and adds no contributions to either weight gradient.
+        tl.store(sizes + E + expert, tl.cdiv(total, 64) * 64, expert < E)
         tl.store(offsets + expert, begin, expert < E)
         tl.store(offsets + E, tl.sum(padded, 0))
 
@@ -274,6 +283,24 @@ def stage_source(local, source, cap, topk, dropped):
     return slots
 
 
+def _gather_headers(header, group):
+    reports = header.new_empty((group.size(), header.numel()))
+    dist.all_gather_into_tensor(reports.view(-1), header, group=group)
+    return reports
+
+
+def agree_fallback_mode(x, group, bf16, grad):
+    """Match the training histogram gather without accessing routes in non-training modes."""
+    flags = (int(bf16) << 2) | (int(grad) << 1)
+    bins = triton.next_power_of_2(group.size() * _MAX_LOCAL_EXPERTS)
+    header = torch.full((bins + 8,), flags, dtype=torch.int32, device=x.device)
+    modes = _gather_headers(header, group)[:, -1].tolist()
+    if any(bool(m & 4) != bf16 for m in modes):
+        raise ValueError("Expert-parallel input dtype must match on every rank")
+    if any(bool(m & 2) != grad for m in modes):
+        raise ValueError("Expert-parallel grad mode must match on every rank")
+
+
 def prepare(x, ids, probs, experts, width, aligned, group):
     """Agree on dimensions, then publish each (slot, probability) in owner-row order."""
     world = group.size()
@@ -318,7 +345,7 @@ def prepare(x, ids, probs, experts, width, aligned, group):
         width,
         tokens,
         k,
-        int(eligible),
+        4 | 2 | int(eligible),  # BF16, grad enabled, local route eligibility.
         bins,
         triton.next_power_of_2(scan_blocks),
     )
@@ -326,20 +353,23 @@ def prepare(x, ids, probs, experts, width, aligned, group):
         cumulative = torch.cumsum(hist, dim=0, dtype=torch.int32)
         torch.sub(cumulative[:, :bins], hist[:, :bins], out=prefix)
         header[: bins + 2].copy_(cumulative[-1])
-    reports = torch.empty((world, bins + 8), **kwargs)
-    dist.all_gather_into_tensor(reports.view(-1), header, group=group)
+    reports = _gather_headers(header, group)
     rank = group.rank()
     # Read only the fixed-size summary. Bases and segment sizes stay on the device.
     e = min(experts, _MAX_LOCAL_EXPERTS)
     bases = torch.empty(world * e, **kwargs)
     offsets = torch.empty(e + 1, **kwargs)
-    sizes = torch.empty(e, **kwargs)
+    sizes = torch.empty(2 * e, **kwargs)
     summary = torch.empty(world + 4, **kwargs)
     _bases[(world,)](
         reports, bases, offsets, sizes, summary, rank, e, triton.next_power_of_2(e), world, bins
     )
     host = summary.cpu().tolist()
     status, cap, dropped, any_dropped = host[world:]
+    if status == 4:
+        raise ValueError("Expert-parallel input dtype must match on every rank")
+    if status == 5:
+        raise ValueError("Expert-parallel grad mode must match on every rank")
     if status == 2:
         raise ValueError("Expected expert IDs in range or -1")
     if status == 3:
@@ -389,7 +419,7 @@ def prepare(x, ids, probs, experts, width, aligned, group):
             )
         scratch.done.record(torch.cuda.current_stream(x.device))
     plan = TrainingRoute(group, cap, tokens, k, bool(dropped), bool(any_dropped))
-    return plan, route, tiles, offsets, packed_prob, (peers, output_slots)
+    return plan, route, tiles, offsets, packed_prob, (peers, output_slots), sizes[e:]
 
 
 def return_grad(dp, route, plan):

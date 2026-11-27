@@ -248,7 +248,7 @@ static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &rout
     p.peer[r] = peers[r].data_ptr();
   }
   auto d = scatter_only ? Tensor() : at::empty({a.size(0), p.n}, a.options());
-  auto flags = at::zeros({pull ? p.tiles + 1 : 0}, expert.options());
+  auto flags = at::zeros({pull ? 2 : 0}, expert.options());
   p.a = a.data_ptr();
   p.d = scatter_only ? nullptr : d.data_ptr();
   p.route = route.data_ptr<int64_t>();

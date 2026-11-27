@@ -146,6 +146,33 @@ def test_wgrad_checks_each_experts_reduction_length():
             _assert_gradient(grad[m[:, None], n], ref, 0.006)
 
 
+def test_wgrad_uses_live_rows_with_padded_offsets():
+    torch.manual_seed(303)
+    # The 33rd expert uses a second pointer window. The nine N tiles also
+    # exercise the remainder after two four-column work items.
+    counts = [0, 64, 128, 192, 256] * 6 + [64, 192, 129]
+    device = "cuda"
+    m, n, stride = 1024, 2304, 256
+    lengths = torch.tensor(counts, device=device, dtype=torch.int32)
+    offsets = torch.arange(len(counts) + 1, device=device, dtype=torch.int32) * stride
+    x = torch.randn(len(counts) * stride, n, device=device, dtype=torch.bfloat16)
+    dy = torch.randn(len(counts) * stride, m, device=device, dtype=x.dtype)
+    grads = [x.new_full((m, n), 1) for _ in counts]
+    # Nonzero padding makes accidental reductions beyond the live rows observable.
+    rows = torch.tensor([0, 255, 256, m - 1], device=device)
+    columns = torch.arange(0, n, 256, device=device)
+    columns = torch.cat((columns, columns + 255))
+    for accumulate in (True, False):
+        tex.mega_moe_wgrad(dy, x, offsets, grads, accumulate, lengths)
+        for i, count in enumerate(counts):
+            start = i * stride
+            active = slice(start, start + count)
+            ref = dy[active, rows].float().T @ x[active, columns].float()
+            if accumulate:
+                ref = ref + 1
+            _assert_gradient(grads[i][rows[:, None], columns], ref.to(x.dtype), 0.006)
+
+
 def test_backward_rejects_overlapping_outputs_with_separate_storage():
     rows, hidden, intermediate = 5, 256, 128
     x = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")

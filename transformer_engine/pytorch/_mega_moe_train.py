@@ -20,7 +20,8 @@ def _activation(z, prob, raw, y, I: tl.constexpr, B: tl.constexpr):
     g = tl.load(z + 2 * base + j, j < I, 0).to(tl.float32)
     u = tl.load(z + 2 * base + I + j, j < I, 0).to(tl.float32)
     h = g * tl.sigmoid(g) * u
-    tl.store(raw + base + j, h, j < I)
+    if raw is not None:
+        tl.store(raw + base + j, h, j < I)
     tl.store(y + base + j, h * tl.load(prob + r), j < I)
 
 
@@ -43,7 +44,8 @@ def _activation_grad(dy, z, prob, raw, dz, dp, I: tl.constexpr, B: tl.constexpr)
     scaled = grad * tl.load(prob + r)
     tl.store(dz + 2 * base + j, scaled * u * s * (1.0 + g * (1.0 - s)), j < I)
     tl.store(dz + 2 * base + I + j, scaled * (g * s), j < I)
-    tl.store(dp + r, tl.sum(grad * tl.load(raw + base + j, j < I, 0), 0))
+    h = g * s * u if raw is None else tl.load(raw + base + j, j < I, 0)
+    tl.store(dp + r, tl.sum(grad * h, 0))
 
 
 def _stage(state, group, source, cap, topk, dropped):
@@ -57,7 +59,7 @@ def _stage(state, group, source, cap, topk, dropped):
 
 class _Train(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, probs, plan, route, tiles, offsets, prob, staged, *weights):
+    def forward(ctx, x, probs, plan, route, tiles, offsets, prob, staged, reduction_rows, *weights):
         cap = plan.cap
         group = plan.group
         e = len(weights) // 2
@@ -70,18 +72,17 @@ class _Train(torch.autograd.Function):
             args = (route, tiles, peers, group.rank(), cap)
             z = tex._mega_moe_train_linear(packed, w1, *args, True, True, topk=plan.topk)
             y = x.new_empty((rows, width))
-            raw = prob.new_empty((rows, width))
-            _save_activation(z, prob, raw, y)
+            _save_activation(z, prob, None, y)
             tex._mega_moe_train_linear(y, w2, *args, False, True, True, topk=plan.topk)
             state.handle.barrier(channel=2)
             out = tex.mega_moe_combine(slots)
-        ctx.save_for_backward(packed, z, raw, y, prob, route, tiles, offsets, *weights)
+        ctx.save_for_backward(packed, z, y, prob, route, tiles, offsets, reduction_rows, *weights)
         ctx.plan, ctx.cap, ctx.experts = plan, cap, e
         return out
 
     @staticmethod
     def backward(ctx, dy):
-        x, z, raw, y, prob, route, tiles, offsets, *weights = ctx.saved_tensors
+        x, z, y, prob, route, tiles, offsets, reduction_rows, *weights = ctx.saved_tensors
         plan, cap, e = ctx.plan, ctx.cap, ctx.experts
         group = plan.group
         w1, w2 = weights[:e], weights[e:]
@@ -95,7 +96,7 @@ class _Train(torch.autograd.Function):
             if x.size(0):
                 width = y.size(1)
                 _activation_grad[(x.size(0),)](
-                    dh, z, prob, raw, dz, dp, width, triton.next_power_of_2(width)
+                    dh, z, prob, None, dz, dp, width, triton.next_power_of_2(width)
                 )
             tex._mega_moe_train_linear(dz, w1, *args, False, False, True, topk=plan.topk)
             state.handle.barrier(channel=2)
@@ -103,9 +104,21 @@ class _Train(torch.autograd.Function):
             state.done.record(torch.cuda.current_stream(x.device))
         dw1 = [torch.empty_like(w) for w in w1]
         dw2 = [torch.empty_like(w) for w in w2]
-        tex.mega_moe_wgrad(routed_dy, y, offsets, dw2, False)
-        tex.mega_moe_wgrad(dz, x, offsets, dw1, False)
-        return dx, return_grad(dp, route, plan), None, None, None, None, None, None, *dw1, *dw2
+        tex.mega_moe_wgrad(routed_dy, y, offsets, dw2, False, reduction_rows)
+        tex.mega_moe_wgrad(dz, x, offsets, dw1, False, reduction_rows)
+        return (
+            dx,
+            return_grad(dp, route, plan),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            *dw1,
+            *dw2,
+        )
 
 
 def training_forward(x, ids, probs, w1, w2, group):

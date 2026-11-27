@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from weakref import ref
 from unittest.mock import patch
 
 import pytest
@@ -220,6 +221,65 @@ def check_training(rank, device, local_experts=2, topk=8, tokens_per_rank=2048):
 
 
 @torch.enable_grad()
+def check_saved_route_hooks(rank, device):
+    """Offload the weight-gradient row bounds and release them while the output is still live."""
+    import transformer_engine.pytorch as te
+
+    class SavedRows:
+        def __init__(self, tensor):
+            self.cpu = tensor.detach().cpu()
+
+    local_experts = 2
+    packed, restored = [], []
+
+    def pack(tensor):
+        if tensor.dtype == torch.int32 and tensor.shape == (local_experts,):
+            saved = SavedRows(tensor)
+            packed.append(ref(saved))
+            return saved
+        return tensor.detach()
+
+    def unpack(value):
+        if isinstance(value, SavedRows):
+            restored.append(True)
+            return value.cpu.to(device)
+        return value
+
+    x, ids, probs = make_case(2048, rank, 87074, device, special=True)
+    all1, all2 = make_weights(512, 256, local_experts * dist.get_world_size(), device, 87075)
+    owner = slice(rank * local_experts, (rank + 1) * local_experts)
+    w1, w2 = all1[owner], all2[owner]
+    inputs = (x, probs, *w1, *w2)
+    for t in inputs:
+        t.requires_grad_()
+    dy = torch.randn_like(x)
+    expected = training_reference(x, ids, probs, dy, all1, all2)
+    current = torch.cuda.current_stream(device)
+    side = torch.cuda.Stream(device=device)
+    side.wait_stream(current)
+    with torch.cuda.stream(side), torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        out = te.bf16_mega_moe(x, ids, probs, w1, w2, ep_group=dist.group.WORLD)
+    current.wait_stream(side)
+    assert "TrainBackward" in type(out.grad_fn).__name__
+    assert len(packed) == 1 and packed[0]() is not None
+    assert not any(torch.is_tensor(value) for value in vars(out.grad_fn.plan).values())
+
+    actual = (out.detach(), *torch.autograd.grad(out, inputs, dy))
+    current.wait_stream(side)
+    assert restored == [True] and packed[0]() is None
+    errors = torch.stack(
+        [
+            (v.float() - w.float()).norm() / w.float().norm().clamp_min(1e-10)
+            for v, w in zip(actual, expected)
+        ]
+    )
+    dist.all_reduce(errors, op=dist.ReduceOp.MAX)
+    assert errors.max().item() < 0.01, errors
+    if rank == 0:
+        print("EP8 saved route hooks and cross-stream backward passed", flush=True)
+
+
+@torch.enable_grad()
 def check_training_tile_tails(rank, device):
     """Exercise the tuned widths with uneven owner tile counts and skipped source slots."""
     import transformer_engine.pytorch as te
@@ -275,6 +335,7 @@ def main():
     assert dist.get_world_size() == 8
     if args.training:
         check_admission(rank, device)
+        check_saved_route_hooks(rank, device)
         check_training(rank, device)
         check_training(rank, device, local_experts=32)
         check_training(rank, device, local_experts=48, topk=6, tokens_per_rank=1024)
