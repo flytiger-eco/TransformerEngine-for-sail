@@ -73,29 +73,60 @@ __device__ __forceinline__ void scatter_shared(const MegaMoETrainArgs &p, int ti
   // together, then broadcast two row destinations at a time to the senders.
   const int64_t key = route[warp * 16 + (threadIdx.x & 15)];
   const int peer = static_cast<int>(key >> 32);
-  const auto dest =
-      key < 0 ? 0ull
-              : reinterpret_cast<uint64_t>(
-                    static_cast<B *>(p.peer[peer]) +
-                    (int64_t(p.capacity) + static_cast<unsigned>(key)) * TRAIN_N + col * 256);
-  for (int first = 0; first < 16; first += kRowBatch) {
-    uint4 values[kRowBatch];
-    uint64_t targets[kRowBatch];
-    bool local[kRowBatch];
+#if TRAIN_UNIFORM_SOURCE
+  // Each half-warp has the same sixteen route keys. On a full source run,
+  // broadcast just the 32-bit slot; the page and transport are warp-uniform.
+  const int first_peer = __shfl_sync(0xffffffffu, peer, 0);
+  const bool uniform = __all_sync(0xffffffffu, peer == first_peer);
+  if (uniform && first_peer >= 0) {
+    auto *base = static_cast<B *>(p.peer[first_peer]) + int64_t(p.capacity) * TRAIN_N + col * 256;
+    const bool local = first_peer == p.rank;
+    const auto slot = static_cast<unsigned>(key);
+    for (int first = 0; first < 16; first += kRowBatch) {
+      uint4 values[kRowBatch];
+      unsigned slots[kRowBatch];
 #pragma unroll
-    for (int r = 0; r < kRowBatch; ++r) {
-      values[r] = shared_row(staging, warp * 16 + first + r);
-      targets[r] = __shfl_sync(0xffffffffu, dest, first + r);
-      local[r] = __shfl_sync(0xffffffffu, peer, first + r) == p.rank;
+      for (int r = 0; r < kRowBatch; ++r) {
+        values[r] = shared_row(staging, warp * 16 + first + r);
+        slots[r] = __shfl_sync(0xffffffffu, slot, first + r);
+      }
+#pragma unroll
+      for (int r = 0; r < kRowBatch; ++r) {
+        auto *dst = base + int64_t(slots[r]) * TRAIN_N;
+        if (local)
+          __ppu_global_store_bulk_volatile_b32x4(dst, values[r]);
+        else
+          __ppu_remote_store_bulk_volatile_b32x4(dst, values[r]);
+      }
     }
+  }
+  if (!uniform)
+#endif
+  {
+    const auto dest =
+        key < 0 ? 0ull
+                : reinterpret_cast<uint64_t>(
+                      static_cast<B *>(p.peer[peer]) +
+                      (int64_t(p.capacity) + static_cast<unsigned>(key)) * TRAIN_N + col * 256);
+    for (int first = 0; first < 16; first += kRowBatch) {
+      uint4 values[kRowBatch];
+      uint64_t targets[kRowBatch];
+      bool local[kRowBatch];
 #pragma unroll
-    for (int r = 0; r < kRowBatch; ++r) {
-      if (!targets[r]) continue;
-      auto *dst = reinterpret_cast<void *>(targets[r]);
-      if (local[r])
-        __ppu_global_store_bulk_volatile_b32x4(dst, values[r]);
-      else
-        __ppu_remote_store_bulk_volatile_b32x4(dst, values[r]);
+      for (int r = 0; r < kRowBatch; ++r) {
+        values[r] = shared_row(staging, warp * 16 + first + r);
+        targets[r] = __shfl_sync(0xffffffffu, dest, first + r);
+        local[r] = __shfl_sync(0xffffffffu, peer, first + r) == p.rank;
+      }
+#pragma unroll
+      for (int r = 0; r < kRowBatch; ++r) {
+        if (!targets[r]) continue;
+        auto *dst = reinterpret_cast<void *>(targets[r]);
+        if (local[r])
+          __ppu_global_store_bulk_volatile_b32x4(dst, values[r]);
+        else
+          __ppu_remote_store_bulk_volatile_b32x4(dst, values[r]);
+      }
     }
   }
   // All warps must finish reading their rows before the next GEMM uses smem.
@@ -103,21 +134,26 @@ __device__ __forceinline__ void scatter_shared(const MegaMoETrainArgs &p, int ti
 }
 
 // Each warp transfers one row, keeping independent 512-byte segments in flight.
-template <int Batch>
-__device__ __forceinline__ void pull_row(const MegaMoETrainArgs &p, int row) {
+template <int Batch, bool Ordered = false>
+__device__ __forceinline__ void pull_row(const MegaMoETrainArgs &p, int row, int src = 0,
+                                         unsigned token = 0) {
   constexpr int segments = TRAIN_K / 256;
   int first_link = 0;
   if constexpr (TRAIN_FANOUT) {
     first_link = p.links[row];
     if (first_link < 0) return;
   }
-  const int64_t route = static_cast<const int64_t *>(p.route)[row];
-  const int src = route < 0 ? 0 : static_cast<int>(route >> 32);
-  const auto token = route < 0 ? 0u : static_cast<unsigned>(route) / TRAIN_TOPK;
+  bool padding = false;
+  if constexpr (!Ordered) {
+    const int64_t route = static_cast<const int64_t *>(p.route)[row];
+    padding = route < 0;
+    src = padding ? 0 : static_cast<int>(route >> 32);
+    token = padding ? 0u : static_cast<unsigned>(route) / TRAIN_TOPK;
+  }
   const auto *from = static_cast<const B *>(p.peer[src]) + int64_t(token) * TRAIN_K;
   for (int first = 0; first < segments; first += Batch) {
     uint4 values[Batch];
-    if (route < 0) {
+    if (padding) {
 #pragma unroll
       for (int j = 0; j < Batch; ++j) values[j] = make_uint4(0, 0, 0, 0);
     } else if (src == p.rank) {
@@ -147,6 +183,40 @@ __device__ __forceinline__ void pull_row(const MegaMoETrainArgs &p, int row) {
     }
   }
 }
+
+#if TRAIN_ORDERED_HEADS
+// The route producer interleaves 64-token blocks from the eight source ranks.
+// Each warp issues one source read and fans that payload out through owner rows.
+__device__ __forceinline__ void pull_ordered_heads(const MegaMoETrainArgs &p) {
+  static_assert(TRAIN_FANOUT && TRAIN_PULL && TRAIN_TOPK == 8);
+  constexpr int segments = TRAIN_K / 256;
+  constexpr int batch = segments < 32 ? segments : 32;
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int stride = gridDim.x * blockDim.x / 32;
+  const int rows = p.tiles * 256;
+  const int entries = ((p.capacity - 1) / 64 + 1) * 512;
+  // Use a wide induction variable: index + stride can exceed INT_MAX after the final entry.
+  for (int64_t index = warp; index < entries; index += stride) {
+    const int head = p.heads[index];
+    if (head <= 0 || head > rows) continue;
+    const int slot = static_cast<int>(index);
+    const unsigned token = (slot / 512) * 64 + (slot & 63);
+    const int src = (p.rank + slot / 64) & 7;
+    if (token < static_cast<unsigned>(p.capacity)) pull_row<batch, true>(p, head - 1, src, token);
+  }
+  // Head chains write live rows once. GEMM also reads the physical zero padding.
+  for (int64_t row = warp; row < rows; row += stride) {
+    if (static_cast<const int64_t *>(p.route)[row] < 0) {
+      auto *dst = static_cast<B *>(p.a) + row * TRAIN_K;
+#pragma unroll
+      for (int j = 0; j < segments; ++j)
+        __ppu_global_store_bulk_volatile_b32x4(dst + j * 256, make_uint4(0, 0, 0, 0));
+    }
+  }
+  fused_moe::release_warp_writes();
+  __syncthreads();
+}
+#endif
 
 __device__ void scatter_output(const MegaMoETrainArgs &p, int tile, int column) {
   for (int r = threadIdx.x / 32; r < 256; r += blockDim.x / 32) {
@@ -264,7 +334,11 @@ __device__ __forceinline__ void pull_then_project(const MegaMoETrainArgs &p, cha
     grid_barrier(p.ready + 1);
     project_rows(p, cta, ctas, first_tiles, p.tiles, smem);
   } else {
+#if TRAIN_ORDERED_HEADS
+    pull_ordered_heads(p);
+#else
     pull_rows(p, cta, ctas, 0, p.tiles);
+#endif
     grid_barrier(p.ready);
     project_rows(p, cta, ctas, 0, p.tiles, smem);
   }

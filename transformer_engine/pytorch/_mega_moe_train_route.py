@@ -215,7 +215,19 @@ def _push(
 
 
 @triton.jit
-def _unpack(buf, offsets, sizes, route, prob, links, tiles, E: tl.constexpr, NE: tl.constexpr):
+def _unpack(
+    buf,
+    offsets,
+    sizes,
+    route,
+    prob,
+    links,
+    tiles,
+    E: tl.constexpr,
+    NE: tl.constexpr,
+    heads=None,
+    rank=0,
+):
     tile = tl.program_id(0)
     row = tile * 256 + tl.arange(0, 256)
     index = tl.arange(0, NE)
@@ -224,10 +236,18 @@ def _unpack(buf, offsets, sizes, route, prob, links, tiles, E: tl.constexpr, NE:
     valid = row < tl.load(offsets + expert) + tl.load(sizes + expert)
     tl.store(tiles + tile, expert)
     source = buf + 2 * row.to(tl.int64)
-    tl.store(route + row, tl.load(source, valid, -1))
+    key = tl.load(source, valid, -1)
+    tl.store(route + row, key)
     payload = tl.load(source + 1, valid, 0)
     if links is not None:
-        tl.store(links + row, (payload >> 32).to(tl.int32))
+        link = (payload >> 32).to(tl.int32)
+        tl.store(links + row, link)
+        if heads is not None:
+            # Each source token has at most one chain head at this owner.
+            token = key.to(tl.uint32) // 8
+            peer = (key >> 32).to(tl.int32)
+            index = ((token // 64) * 8 + ((peer - rank) & 7)) * 64 + token % 64
+            tl.store(heads + index, row + 1, valid & (link >= 0))
     bits = payload.to(tl.int32)
     tl.store(prob + row, bits.to(tl.float32, bitcast=True))
 
@@ -439,6 +459,11 @@ def prepare(x, ids, probs, experts, width, aligned, group):
         route = torch.empty(rows, dtype=torch.int64, device=x.device)
         packed_prob = torch.empty(rows, dtype=torch.float32, device=x.device)
         links = torch.empty(rows, **kwargs) if use_fanout else None
+        # Round the final 64-token block up before interleaving its eight sources.
+        # Both the writer and the cooperative reader index the table using signed int.
+        head_entries = world * triton.cdiv(cap, 64) * 64
+        ordered = world == 8 and k == 8 and width == 512 and rows and head_entries < 2**31
+        heads = torch.zeros(head_entries, **kwargs) if ordered else None
         tiles = torch.empty(rows // 256, **kwargs)
         if rows:
             _unpack[(rows // 256,)](
@@ -451,10 +476,12 @@ def prepare(x, ids, probs, experts, width, aligned, group):
                 tiles,
                 experts,
                 triton.next_power_of_2(experts),
+                heads,
+                rank if heads is not None else 0,
             )
         scratch.done.record(torch.cuda.current_stream(x.device))
     plan = TrainingRoute(group, cap, tokens, k, bool(dropped), bool(any_dropped))
-    return plan, route, tiles, offsets, packed_prob, (peers, output_slots), sizes[e:], links
+    return plan, route, tiles, offsets, packed_prob, (peers, output_slots), sizes[e:], links, heads
 
 
 def return_grad(dp, route, plan):

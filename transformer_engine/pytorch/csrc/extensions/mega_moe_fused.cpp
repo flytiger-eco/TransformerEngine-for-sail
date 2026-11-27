@@ -208,7 +208,7 @@ std::tuple<Tensor, int, int> fused_forward(const Tensor &x, const Tensor &ids, c
 static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &route,
                            const Tensor &expert, const Weights &peers, int rank, int capacity,
                            bool pull, bool transpose, bool scatter_only, int topk,
-                           const std::optional<Tensor> &links) {
+                           const std::optional<Tensor> &links, const std::optional<Tensor> &heads) {
   TORCH_CHECK(topk == 6 || topk == 8, "Unsupported MegaMoE training top-k");
   TORCH_CHECK(!scatter_only || !pull, "Scatter-only mode needs a return operation");
   TORCH_CHECK(a.is_cuda() && a.is_contiguous() && a.dim() == 2 &&
@@ -261,6 +261,15 @@ static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &rout
                 "Invalid source-token fanout");
     p.links = links->data_ptr<int>();
   }
+  if (heads) {
+    const int64_t entries = ((static_cast<int64_t>(capacity) + 63) / 64) * 64 * 8;
+    TORCH_CHECK(links && peers.size() == 8 && topk == 8 && p.n == (transpose ? 1024 : 512) &&
+                    entries <= INT_MAX && heads->device() == a.device() && heads->is_contiguous() &&
+                    heads->scalar_type() == at::kInt && heads->dim() == 1 &&
+                    heads->numel() == entries,
+                "Invalid source-token head table");
+    p.heads = heads->data_ptr<int>();
+  }
   p.ready = flags.data_ptr<int>();
   rtc::mega_moe_train_linear(p, pull, transpose, at::cuda::getCurrentCUDAStream());
   return d;
@@ -272,6 +281,7 @@ void init_mega_moe_fused_bindings(pybind11::module &m) {
         pybind11::arg("rank"), pybind11::arg("capacity"), pybind11::arg("pull"),
         pybind11::arg("transpose"), pybind11::arg("scatter_only") = false,
         pybind11::arg("topk") = 8, pybind11::arg("links") = pybind11::none(),
+        pybind11::arg("heads") = pybind11::none(),
         pybind11::call_guard<pybind11::gil_scoped_release>());
   pybind11::class_<FusedStatus>(m, "MegaMoEFusedStatus").def(pybind11::init<const Tensor &>());
   m.def("mega_moe_fused_available", &fused_available);

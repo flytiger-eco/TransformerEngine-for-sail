@@ -100,8 +100,12 @@ void mega_moe_train_linear(const MegaMoETrainArgs &p, bool pull, bool transpose,
   const auto name =
       concat_strings("nvte_mega_moe_", transpose ? "fwd_" : "dgrad_", pull ? "pull" : "scatter");
   const bool scatter_only = !pull && p.d == nullptr;
-  const auto label = concat_strings(name, "_k", p.k, "_n", p.n, "_topk", p.topk,
-                                    scatter_only ? "_direct" : "", p.links ? "_fanout" : "");
+  const bool uniform_source = scatter_only && p.peer[7] && !p.peer[8] && p.topk == 8 &&
+                              p.n == 2048 && p.k == (transpose ? 512 : 1024);
+  const auto label =
+      concat_strings(name, "_k", p.k, "_n", p.n, "_topk", p.topk, scatter_only ? "_direct" : "",
+                     p.links ? "_fanout" : "", p.heads ? "_ordered_heads" : "",
+                     uniform_source ? "_uniform_source" : "");
   static std::mutex mutex;
   static std::set<std::pair<int, std::string>> configured;
   {
@@ -115,6 +119,8 @@ void mega_moe_train_linear(const MegaMoETrainArgs &p, bool pull, bool transpose,
            "-DNVTE_GG_COMMON_K=1", "-DNVTE_GG_N_EXPAND=1", concat_strings("-DTRAIN_KERNEL=", name),
            concat_strings("-DTRAIN_PULL=", static_cast<int>(pull)),
            concat_strings("-DTRAIN_FANOUT=", static_cast<int>(p.links != nullptr)),
+           concat_strings("-DTRAIN_ORDERED_HEADS=", static_cast<int>(p.heads != nullptr)),
+           concat_strings("-DTRAIN_UNIFORM_SOURCE=", static_cast<int>(uniform_source)),
            concat_strings("-DTRAIN_SCATTER_ONLY=", static_cast<int>(scatter_only)),
            concat_strings("-DTRAIN_TOPK=", p.topk), concat_strings("-DTRAIN_K=", p.k),
            concat_strings("-DTRAIN_N=", p.n)});

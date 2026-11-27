@@ -16,6 +16,7 @@ struct MegaMoETrainArgs {
   const int *links;
   int *ready;
   int tiles, k, n, rank, capacity, topk;
+  const int *heads;  // Optional source-token order, row+1 per head and zero for unused slots.
 };
 
 // Passed by value to all three RTC kernels. Peer-visible arrays use group-rank order.

@@ -103,7 +103,19 @@ def _stage(state, group, source, cap, topk, dropped):
 class _Train(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, x, probs, plan, route, tiles, offsets, prob, staged, reduction_rows, links, *weights
+        ctx,
+        x,
+        probs,
+        plan,
+        route,
+        tiles,
+        offsets,
+        prob,
+        staged,
+        reduction_rows,
+        links,
+        heads,
+        *weights
     ):
         cap = plan.cap
         group = plan.group
@@ -116,7 +128,7 @@ class _Train(torch.autograd.Function):
             peers, slots = staged
             args = (route, tiles, peers, group.rank(), cap)
             z = tex._mega_moe_train_linear(
-                packed, w1, *args, True, True, topk=plan.topk, links=links
+                packed, w1, *args, True, True, topk=plan.topk, links=links, heads=heads
             )
             y = x.new_empty((rows, width))
             # Sparse expert owners have significant 256-row GEMM padding.
@@ -126,17 +138,21 @@ class _Train(torch.autograd.Function):
             state.handle.barrier(channel=2)
             out = tex.mega_moe_combine(slots)
         ctx.save_for_backward(
-            packed, z, y, prob, route, tiles, offsets, reduction_rows, links, *weights
+            packed, z, y, prob, route, tiles, offsets, reduction_rows, links, heads, *weights
         )
         ctx.plan, ctx.cap, ctx.experts = plan, cap, e
         return out
 
     @staticmethod
     def backward(ctx, dy):
-        x, z, y, prob, route, tiles, offsets, reduction_rows, links, *weights = ctx.saved_tensors
-        # Saved-tensor hooks may restore a strided view of the packed links.
+        x, z, y, prob, route, tiles, offsets, reduction_rows, links, heads, *weights = (
+            ctx.saved_tensors
+        )
+        # Saved-tensor hooks can restore a strided view of either routing array.
         if links is not None:
             links = links.contiguous()
+        if heads is not None:
+            heads = heads.contiguous()
         plan, cap, e = ctx.plan, ctx.cap, ctx.experts
         group = plan.group
         w1, w2 = weights[:e], weights[e:]
@@ -146,7 +162,7 @@ class _Train(torch.autograd.Function):
             peers, slots = _stage(state, group, dy, cap, plan.topk, plan.dropped)
             args = (route, tiles, peers, group.rank(), cap)
             dh = tex._mega_moe_train_linear(
-                routed_dy, w2, *args, True, False, topk=plan.topk, links=links
+                routed_dy, w2, *args, True, False, topk=plan.topk, links=links, heads=heads
             )
             dz, dp = torch.empty_like(z), torch.empty_like(prob)
             if x.size(0):
@@ -173,6 +189,7 @@ class _Train(torch.autograd.Function):
         return (
             dx,
             return_grad(dp, route, plan),
+            None,
             None,
             None,
             None,

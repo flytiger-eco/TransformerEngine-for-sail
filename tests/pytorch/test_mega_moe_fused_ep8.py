@@ -240,7 +240,7 @@ def check_training(rank, device, local_experts=2, topk=8, tokens_per_rank=2048):
 
 @torch.enable_grad()
 def check_saved_route_hooks(rank, device, width):
-    """Offload row bounds and restore optional fanout links with a noncontiguous layout."""
+    """Offload row bounds and restore link and head arrays from strided views."""
     import transformer_engine.pytorch as te
 
     class SavedRows:
@@ -249,14 +249,19 @@ def check_saved_route_hooks(rank, device, width):
             self.strided = strided
 
     local_experts = 2
-    packed, restored, link_strides = [], [], []
+    packed, restored, strides = [], [], []
+    tokens = 2048 + rank if width == 512 else 2048
+    cap = 2048 + dist.get_world_size() - 1 if width == 512 else tokens
+    table_entries = ((cap + 63) // 64) * 64 * dist.get_world_size()
 
     def pack(tensor):
         if tensor.dtype == torch.int32 and tensor.shape == (local_experts,):
             saved = SavedRows(tensor)
             packed.append(ref(saved))
             return saved
-        if tensor.dtype == torch.int32 and tensor.shape == (owner_rows,):
+        if tensor.dtype == torch.int32 and (
+            tensor.shape == (owner_rows,) or (width == 512 and tensor.shape == (table_entries,))
+        ):
             return SavedRows(tensor, strided=True)
         return tensor.detach()
 
@@ -264,14 +269,14 @@ def check_saved_route_hooks(rank, device, width):
         if isinstance(value, SavedRows):
             tensor = value.cpu.to(device)
             if value.strided:
-                links = torch.stack((tensor, tensor), dim=1)[:, 0]
-                link_strides.append(links.stride(0))
-                return links
+                view = torch.stack((tensor, tensor), dim=1)[:, 0]
+                strides.append((view.numel(), view.stride(0)))
+                return view
             restored.append(True)
             return tensor
         return value
 
-    x, ids, probs = make_case(2048, rank, 87074, device, special=True)
+    x, ids, probs = make_case(tokens, rank, 87074, device, special=True)
     total_experts = local_experts * dist.get_world_size()
     all1, all2 = make_weights(512, width, total_experts, device, 87075)
     owner = slice(rank * local_experts, (rank + 1) * local_experts)
@@ -298,7 +303,10 @@ def check_saved_route_hooks(rank, device, width):
     actual = (out.detach(), *torch.autograd.grad(out, inputs, dy))
     current.wait_stream(side)
     assert restored == [True] and packed[0]() is None
-    assert link_strides == ([2] if width <= 512 else [])
+    expected_strides = [(owner_rows, 2)] if width <= 512 else []
+    if width == 512:
+        expected_strides.append((table_entries, 2))
+    assert sorted(strides) == sorted(expected_strides)
     assert len(actual) == len(expected)
     errors = torch.stack(
         [
@@ -370,7 +378,7 @@ def main():
     assert dist.get_world_size() == 8
     if args.training:
         check_admission(rank, device)
-        for width in (256, 768):
+        for width in (256, 512, 768):
             check_saved_route_hooks(rank, device, width)
         check_training(rank, device)
         check_training(rank, device, local_experts=32)
