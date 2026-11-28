@@ -94,26 +94,30 @@ static_assert(Gemm::SharedStorageSize == (NVTE_MOE_WGRAD_M128 ? 98304 : 196608))
 #if NVTE_MOE_WGRAD_M128
 // Every expert owns a complete, identically shaped dW matrix. A work item
 // always owns the same columns, even when a ragged K uses individual GEMMs.
+template <bool Octets = false>
 __device__ void compact_wgrad(const Args &p, char *smem) {
   constexpr int n = NVTE_MOE_COMMON_N, m = NVTE_MOE_WEIGHT_ROWS;
   constexpr int ntiles = n / RaggedGemm::BN, groups_of_four = ntiles / 4;
-  constexpr int items_per_row = groups_of_four + ntiles % 4;
+  static_assert(!Octets || ntiles == 20);
+  constexpr int items_per_row = Octets ? 3 : groups_of_four + ntiles % 4;
   constexpr int per_group = (m / RaggedGemm::BM) * items_per_row;
   static_assert(n % RaggedGemm::BN == 0 && m % RaggedGemm::BM == 0);
   for (int work = blockIdx.x; work < p.groups * per_group; work += gridDim.x) {
     const int group = work / per_group;
     const int row = work % per_group / items_per_row;
     int item = work % items_per_row;
-    if constexpr (m == 5120 && n == 2304) {
-      // Nine column tiles form two four-column groups and a one-column tail.
+    if constexpr (Octets || (m == 5120 && n == 2304)) {
       // Rotate the tail between CTAs when the persistent grid is divisible by three.
-      if (gridDim.x % items_per_row == 0) {
+      if (Octets || gridDim.x % items_per_row == 0) {
         const int phase = work / items_per_row % items_per_row;
         item += phase;
         if (item >= items_per_row) item -= items_per_row;
       }
     }
-    const int first_col = item < groups_of_four ? 4 * item : item + 3 * groups_of_four;
+    const int first_col =
+        Octets ? 8 * item : (item < groups_of_four ? 4 * item : item + 3 * groups_of_four);
+    const int octet_columns = item < 2 ? 8 : 4;
+
     const int begin = min(max(0, p.offsets[group]), p.rows);
     const int end = min(max(begin, p.offsets[group + 1]), p.rows);
     cutlass::gemm::kernel::NativeExpert e{};
@@ -124,10 +128,14 @@ __device__ void compact_wgrad(const Args &p, char *smem) {
     e.n = n;
     e.k = min(end - begin, max(0, p.reduction_rows[group]));
     e.alpha = 1.f;
-    if (item < groups_of_four && e.k > 0 && e.k <= 512 && e.k % 64 == 0) {
-      RaggedGemm::run_nexpand(e, row, first_col, smem);
+    if ((Octets || item < groups_of_four) && e.k > 0 && e.k <= 512 && e.k % 64 == 0) {
+      if constexpr (Octets) {
+        RaggedGemm::run_nexpand(e, row, first_col, smem, octet_columns);
+      } else {
+        RaggedGemm::run_nexpand(e, row, first_col, smem);
+      }
     } else {
-      const int columns = item < groups_of_four ? 4 : 1;
+      const int columns = Octets ? octet_columns : (item < groups_of_four ? 4 : 1);
       CUTLASS_PRAGMA_NO_UNROLL
       for (int col = 0; col < columns; ++col)
         RaggedGemm::run_tile<true>(e, row, first_col + col, smem);
@@ -295,6 +303,13 @@ __device__ void compute(const Args &p, char *smem) {
 extern "C" __global__ __launch_bounds__(2 * kTileM, 1) void NVTE_MOE_GRAD_KERNEL(Args p) {
   extern __shared__ char smem[];
 #if NVTE_MOE_WGRAD_M128
+  if constexpr (NVTE_MOE_WEIGHT_ROWS == 4608 && NVTE_MOE_COMMON_N == 5120) {
+    // Twenty N tiles form two eight-column rings and a four-column tail.
+    if (gridDim.x % 3 == 0) {
+      compact_wgrad<true>(p, smem);
+      return;
+    }
+  }
   compact_wgrad(p, smem);
 #elif NVTE_MOE_DENSE_WGRAD
   dense_wgrad(p, smem);

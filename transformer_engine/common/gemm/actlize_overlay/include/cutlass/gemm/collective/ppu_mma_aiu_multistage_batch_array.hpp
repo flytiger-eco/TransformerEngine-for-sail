@@ -454,11 +454,11 @@ struct CollectiveMma<
     // cp_async_wait<0>();
     // __syncthreads();
   }
-  // 专用 noC 四列持续 ring；普通 operator() 的生产流水保持原样。
+  // Keep the K pipeline active across adjacent N tiles.
   template <class Acc, class TensorA, class TensorB, class AfterNTile>
   CUTLASS_DEVICE void compute_nexpand(Acc& accum, TensorA gA, TensorB gB,
                                       int k_tiles_per_n, int thread_idx, char* smem_buf,
-                                      AfterNTile&& after_n_tile, int n_tile_start) {
+                                      AfterNTile&& after_n_tile, int n_tile_start, int columns = 4) {
     constexpr bool persistent_tile =
         (DispatchPolicy::Stages == 3 && size<0>(TileShape{}) == 256) ||
         (DispatchPolicy::Stages == 2 && size<0>(TileShape{}) == 128 && size<1>(TileShape{}) == 256);
@@ -475,7 +475,7 @@ struct CollectiveMma<
     Tensor tAsA = gmem_thr_A.partition_D(sA);
     Tensor tBgB = gmem_thr_B.partition_S(gB);
     Tensor tBsB = gmem_thr_B.partition_D(sB);
-    int remaining = 4 * k_tiles_per_n;
+    int remaining = columns * k_tiles_per_n;
     int load_k = 0, load_n = 0;
     auto issue_stage = [&](int pipe, auto initial_full_tile) {
       auto issue_load = [&]() {

@@ -49,7 +49,8 @@ struct NvteNativeGrouped {
     return stride;
   }
 
-  CUTLASS_DEVICE static void run_nexpand(NativeExpert e, int mi, int ni, char* smem) {
+  CUTLASS_DEVICE static void run_nexpand(NativeExpert e, int mi, int ni, char* smem,
+                                         int columns = 4) {
     using namespace cute;
     static_assert(BN == 256 && BK == 64 &&
                   ((BM == 256 && Mainloop::DispatchPolicy::Stages == 3) ||
@@ -74,7 +75,7 @@ struct NvteNativeGrouped {
     Tensor gb = local_tile(make_mix_tensor_like(b), take<1, 3>(TileShape{}),
                            make_coord(_, _));
     Mainloop mainloop(make_shape(e.m, e.n, e.k), da, db);
-    // The four columns share one ring; only the final column drains it.
+    // Consecutive columns share one ring. The last column drains it.
     mainloop.compute_nexpand(
         acc, ga, gb, size<2>(ga), tid, smem,
         [&](int column) {
@@ -82,7 +83,7 @@ struct NvteNativeGrouped {
           Epilogue::store_full_tile(
               dst, e.m, e.n, TileShape{}, coordinate, acc, mma, tid);
           clear(acc);
-        }, ni);
+        }, ni, columns);
     cp_async_wait<0>();
     __syncthreads();
   }
