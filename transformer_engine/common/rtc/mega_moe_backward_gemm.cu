@@ -103,7 +103,16 @@ __device__ void compact_wgrad(const Args &p, char *smem) {
   for (int work = blockIdx.x; work < p.groups * per_group; work += gridDim.x) {
     const int group = work / per_group;
     const int row = work % per_group / items_per_row;
-    const int item = work % items_per_row;
+    int item = work % items_per_row;
+    if constexpr (m == 5120 && n == 2304) {
+      // Nine column tiles form two four-column groups and a one-column tail.
+      // Rotate the tail between CTAs when the persistent grid is divisible by three.
+      if (gridDim.x % items_per_row == 0) {
+        const int phase = work / items_per_row % items_per_row;
+        item += phase;
+        if (item >= items_per_row) item -= items_per_row;
+      }
+    }
     const int first_col = item < groups_of_four ? 4 * item : item + 3 * groups_of_four;
     const int begin = min(max(0, p.offsets[group]), p.rows);
     const int end = min(max(begin, p.offsets[group + 1]), p.rows);

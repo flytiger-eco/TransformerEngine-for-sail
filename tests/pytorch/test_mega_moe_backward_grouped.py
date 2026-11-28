@@ -173,7 +173,7 @@ def test_dense_wgrad_overwrites_empty_and_partial_reductions():
         torch.testing.assert_close(grad, reference.to(grad.dtype), atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("m", [1024, 2048])
+@pytest.mark.parametrize("m", [1024, 2048, 5120])
 def test_wgrad_uses_live_rows_with_padded_offsets(m):
     torch.manual_seed(303)
     # The 33rd expert uses a second pointer window. The nine N tiles also
@@ -181,7 +181,8 @@ def test_wgrad_uses_live_rows_with_padded_offsets(m):
     counts = [0, 64, 128, 192, 256] * 6 + [64, 192, 129]
     counts[2] = 129  # Exercise a partial K tile in both pointer windows.
     device = "cuda"
-    # M=2048 exercises the compact BF16 overwrite kernel in the first window.
+    # The compact overwrite path rotates the one-column tail at M=5120.
+    # Sample the first three tile rows to check every group phase.
     n, stride = 2304, 256
     lengths = torch.tensor(counts, device=device, dtype=torch.int32)
     offsets = torch.arange(len(counts) + 1, device=device, dtype=torch.int32) * stride
