@@ -113,10 +113,17 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
       wgrad && p.reduction_rows && !p.accumulate && !fp32_out && n >= 1024 && n % 256 == 0 &&
       p.output_width % 256 == 0 &&
       int64_t(p.output_width / 256) * (n / 1024) * p.groups >= 2 * cuda::sm_count();
-  const int common_n = fixed || fixed_wgrad || ragged_columns ? n : 0;
+  // In these full pointer windows the two Qwen gradient shapes have a fixed
+  // number of tasks per expert. Index their tiles directly for the observed
+  // 1024..1280 padded rows per expert, while reading each expert's live K.
+  const bool direct_tiles =
+      wgrad && !fp16 && !fp32_out && !p.accumulate && !p.reserve_sms && p.reduction_rows &&
+      p.groups == p.kMaxExperts && mean >= 1024 && mean <= 1280 &&
+      ((p.output_width == 1024 && n == 2048) || (p.output_width == 2048 && n == 512));
+  const int common_n = fixed || fixed_wgrad || ragged_columns || direct_tiles ? n : 0;
   const int common_k =
       fixed_wgrad ? mean : (fixed ? (recompute ? p.input_width : p.output_width) : 0);
-  const int weight_rows = fixed_wgrad || ragged_columns ? p.output_width : 0;
+  const int weight_rows = fixed_wgrad || ragged_columns || direct_tiles ? p.output_width : 0;
   const bool four_columns =
       fixed_wgrad && mean == 512 && n % 1024 == 0 &&
       int64_t(p.output_width / 256) * (n / 1024) * p.groups >= cuda::sm_count() * 2;
@@ -143,9 +150,9 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
       long_w1_columns ? 3 : (ragged_columns ? 2 : static_cast<int>(four_columns));
   const int threads = compact_wgrad ? 256 : 512;
   const int smem = compact_wgrad ? 98304 : 196608;
-  const auto label =
-      concat_strings(name, "_", fp16, "_", fp32_out, "_", common_n, "_", common_k, "_", weight_rows,
-                     "_", column_mode, "_", dense, compact_wgrad ? "_m128" : "");
+  const auto label = concat_strings(name, "_", fp16, "_", fp32_out, "_", common_n, "_", common_k,
+                                    "_", weight_rows, "_", column_mode, "_", dense,
+                                    compact_wgrad ? "_m128" : "", direct_tiles ? "_direct" : "");
   // Function attributes belong to a device even if its architecture shares a compiled image.
   static std::mutex mutex;
   static std::map<std::pair<int, std::string>, int> residency;
@@ -169,6 +176,7 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
                       concat_strings("-DNVTE_MOE_WGRAD_M128=", static_cast<int>(compact_wgrad)),
                       concat_strings("-DNVTE_MOE_COMMON_N=", common_n),
                       concat_strings("-DNVTE_MOE_COMMON_K=", common_k)});
+      if (direct_tiles) options.emplace_back("-DNVTE_MOE_DIRECT_WGRAD=1");
       manager.compile(label, name, string_code_mega_moe_backward_gemm_cu,
                       "mega_moe_backward_gemm.cu", options,
                       {{string_code_mega_moe_grad_args_h, "mega_moe_grad_args.h"}});

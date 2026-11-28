@@ -211,6 +211,39 @@ __device__ __forceinline__ void dense_wgrad(const Args &p, char *smem) {
 }
 #endif
 
+#if NVTE_MOE_DIRECT_WGRAD
+__device__ void direct_wgrad(const Args &p, char *smem) {
+  constexpr int m = NVTE_MOE_WEIGHT_ROWS, n = NVTE_MOE_COMMON_N;
+  static_assert((m == 1024 && n == 2048) || (m == 2048 && n == 512));
+  constexpr int columns = n == 2048 ? 4 : 1;
+  constexpr int tasks_per_row = n / (256 * columns);
+  constexpr int tasks_per_expert = (m / 256) * tasks_per_row;
+  for (int task = blockIdx.x; task < Args::kMaxExperts * tasks_per_expert; task += gridDim.x) {
+    const int g = task / tasks_per_expert;
+    const int row = (task % tasks_per_expert) / tasks_per_row;
+    const int col = (task % tasks_per_row) * columns;
+    const int begin = min(max(0, p.offsets[g]), p.rows);
+    const int end = min(max(begin, p.offsets[g + 1]), p.rows);
+    cutlass::gemm::kernel::NativeExpert e{};
+    e.m = m;
+    e.n = n;
+    e.k = min(end - begin, max(0, p.reduction_rows[g]));
+    e.alpha = 1.f;
+    e.a = reinterpret_cast<uint64_t>(p.a) + int64_t(begin) * m * sizeof(Element);
+    e.b = reinterpret_cast<uint64_t>(p.b) + int64_t(begin) * n * sizeof(Element);
+    e.d = reinterpret_cast<uint64_t>(p.expert[g]);
+    e.c = e.d;
+    if constexpr (columns == 4) {
+      if (e.k % 64 == 0 && ((e.k > 0 && e.k <= 512) || (e.k >= 960 && e.k <= 1152))) {
+        RaggedGemm::run_nexpand(e, row, col, smem);
+        continue;
+      }
+    }
+    for (int i = 0; i < columns; ++i) RaggedGemm::run_tile(e, row, col + i, smem);
+  }
+}
+#endif
+
 __device__ void compute(const Args &p, char *smem) {
   using Expert = cutlass::gemm::kernel::NativeExpert;
   // For NN and TN, A is dY [R,O]. Recompute receives X [R,I] and W [O,I].
@@ -302,7 +335,9 @@ __device__ void compute(const Args &p, char *smem) {
 #endif
 extern "C" __global__ __launch_bounds__(2 * kTileM, 1) void NVTE_MOE_GRAD_KERNEL(Args p) {
   extern __shared__ char smem[];
-#if NVTE_MOE_WGRAD_M128
+#if NVTE_MOE_DIRECT_WGRAD
+  direct_wgrad(p, smem);
+#elif NVTE_MOE_WGRAD_M128
   if constexpr (NVTE_MOE_WEIGHT_ROWS == 4608 && NVTE_MOE_COMMON_N == 5120) {
     // Twenty N tiles form two eight-column rings and a four-column tail.
     if (gridDim.x % 3 == 0) {

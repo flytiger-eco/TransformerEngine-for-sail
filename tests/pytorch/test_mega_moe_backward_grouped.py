@@ -146,9 +146,10 @@ def test_wgrad_checks_each_experts_reduction_length():
             _assert_gradient(grad[m[:, None], n], ref, 0.006)
 
 
-def test_long_wgrad_ring_uses_each_experts_reduction_length():
+@pytest.mark.parametrize("m,n", [(1024, 2048), (2048, 512)])
+def test_indexed_wgrad_uses_each_experts_reduction_length(m, n):
     torch.manual_seed(613)
-    m, n, stride = 1024, 2048, 1216
+    stride = 1216
     counts = [0, 512, 959, 960, 1024, 1088, 1152, 1153] * 4
     counts[8] = 1025
     lengths = torch.tensor(counts, dtype=torch.int32, device="cuda")
@@ -161,7 +162,7 @@ def test_long_wgrad_ring_uses_each_experts_reduction_length():
         x[active].random_(-1, 2)
         dy[active].random_(-1, 2)
     tex.mega_moe_wgrad(dy, x, offsets, grads, False, lengths)
-    # Check both sides of every column tile, including the boundary between the two rings.
+    # Check both sides of every output tile, including the two four-column W1 groups.
     rows = torch.arange(0, m, 256, device=x.device)
     rows = torch.cat((rows, rows + 255))
     cols = torch.arange(0, n, 256, device=x.device)
