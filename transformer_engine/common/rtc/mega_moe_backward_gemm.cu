@@ -246,17 +246,20 @@ __device__ void compute(const Args &p, char *smem) {
       int mtiles = int((int64_t(e.m) + Gemm::BM - 1) / Gemm::BM);
       // With four complete N tiles per work item, keep the MMA pipeline
       // live across columns instead of draining it after each epilogue.
-      const bool four_columns = NVTE_MOE_FOUR_COLUMNS == 2
+      const bool four_columns = NVTE_MOE_FOUR_COLUMNS >= 2
                                     ? count > 0 && count <= 512 && count % 64 == 0
                                     : NVTE_MOE_FOUR_COLUMNS == 1 && count == NVTE_MOE_COMMON_K;
-      const int groups_of_four = four_columns ? ntiles / 4 : 0;
+      int groups_of_four = four_columns ? ntiles / 4 : 0;
+      if constexpr (NVTE_MOE_FOUR_COLUMNS == 3) {
+        if (count >= 960 && count <= 1152 && count % 64 == 0) groups_of_four = ntiles / 4;
+      }
       const int per_row = ntiles - 3 * groups_of_four;
       int64_t tiles = int64_t(mtiles) * per_row;
       for (; work < tiles; work += gridDim.x) {
         const int mi = int(work / per_row), item = int(work % per_row);
         if constexpr (NVTE_MOE_FOUR_COLUMNS) {
           if (item < groups_of_four) {
-            if constexpr (NVTE_MOE_FOUR_COLUMNS == 2)
+            if constexpr (NVTE_MOE_FOUR_COLUMNS >= 2)
               RaggedGemm::run_nexpand(e, mi, 4 * item, smem);
             else
               Gemm::run_nexpand(e, mi, 4 * item, smem);
@@ -264,7 +267,7 @@ __device__ void compute(const Args &p, char *smem) {
           }
         }
         const int ni = item + 3 * groups_of_four;
-        if constexpr (NVTE_MOE_FOUR_COLUMNS == 2) {
+        if constexpr (NVTE_MOE_FOUR_COLUMNS >= 2) {
           RaggedGemm::run_tile(e, mi, ni, smem);
           continue;
         }

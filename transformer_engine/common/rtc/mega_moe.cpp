@@ -120,7 +120,6 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
   const bool four_columns =
       fixed_wgrad && mean == 512 && n % 1024 == 0 &&
       int64_t(p.output_width / 256) * (n / 1024) * p.groups >= cuda::sm_count() * 2;
-  const int column_mode = ragged_columns ? 2 : static_cast<int>(four_columns);
   // For 16 experts with a 1024x2048 weight gradient, long reductions run faster
   // with the regular ragged tiles. Keep the fixed-K case at mean == 1536.
   const bool prefer_ragged = p.groups == 16 && p.output_width == 1024 && n == 2048 && mean > 1536;
@@ -137,6 +136,11 @@ void mega_moe_grad_gemm(MegaMoEGradGemm op, const MegaMoEGradArgs &p, bool fp16,
     dense = dense && aligned;
     compact_wgrad = compact_wgrad && aligned;
   }
+  // Give the 32-expert long ring its own RTC cache key. Smaller groups keep mode 2.
+  const bool long_w1_columns =
+      ragged_columns && !fp16 && !dense && p.groups == 32 && p.output_width == 1024 && n == 2048;
+  const int column_mode =
+      long_w1_columns ? 3 : (ragged_columns ? 2 : static_cast<int>(four_columns));
   const int threads = compact_wgrad ? 256 : 512;
   const int smem = compact_wgrad ? 98304 : 196608;
   const auto label =

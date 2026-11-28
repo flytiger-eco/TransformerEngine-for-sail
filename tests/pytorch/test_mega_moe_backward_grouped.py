@@ -146,6 +146,32 @@ def test_wgrad_checks_each_experts_reduction_length():
             _assert_gradient(grad[m[:, None], n], ref, 0.006)
 
 
+def test_long_wgrad_ring_uses_each_experts_reduction_length():
+    torch.manual_seed(613)
+    m, n, stride = 1024, 2048, 1216
+    counts = [0, 512, 959, 960, 1024, 1088, 1152, 1153] * 4
+    counts[8] = 1025
+    lengths = torch.tensor(counts, dtype=torch.int32, device="cuda")
+    offsets = torch.arange(len(counts) + 1, dtype=torch.int32, device="cuda") * stride
+    x = torch.full((len(counts) * stride, n), 7, dtype=torch.bfloat16, device="cuda")
+    dy = x.new_full((len(counts) * stride, m), -5)
+    grads = [x.new_full((m, n), float("nan")) for _ in counts]
+    for expert, count in enumerate(counts):
+        active = slice(expert * stride, expert * stride + count)
+        x[active].random_(-1, 2)
+        dy[active].random_(-1, 2)
+    tex.mega_moe_wgrad(dy, x, offsets, grads, False, lengths)
+    # Check both sides of every column tile, including the boundary between the two rings.
+    rows = torch.arange(0, m, 256, device=x.device)
+    rows = torch.cat((rows, rows + 255))
+    cols = torch.arange(0, n, 256, device=x.device)
+    cols = torch.cat((cols, cols + 255))
+    for expert, (grad, count) in enumerate(zip(grads, counts)):
+        active = slice(expert * stride, expert * stride + count)
+        expected = dy[active, rows].float().T @ x[active, cols].float()
+        torch.testing.assert_close(grad[rows[:, None], cols], expected.to(x.dtype), atol=0, rtol=0)
+
+
 def test_dense_wgrad_overwrites_empty_and_partial_reductions():
     torch.manual_seed(361)
     stride, n = 1536, 2048
