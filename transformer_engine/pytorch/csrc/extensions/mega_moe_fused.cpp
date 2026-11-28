@@ -207,7 +207,8 @@ std::tuple<Tensor, int, int> fused_forward(const Tensor &x, const Tensor &ids, c
 // Internal entry point. route/expert come from the collectively validated router.
 static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &route,
                            const Tensor &expert, const Weights &peers, int rank, int capacity,
-                           bool pull, bool transpose, bool scatter_only, int topk) {
+                           bool pull, bool transpose, bool scatter_only, int topk,
+                           const std::optional<Tensor> &links) {
   TORCH_CHECK(topk == 6 || topk == 8, "Unsupported MegaMoE training top-k");
   TORCH_CHECK(!scatter_only || !pull, "Scatter-only mode needs a return operation");
   TORCH_CHECK(a.is_cuda() && a.is_contiguous() && a.dim() == 2 &&
@@ -253,6 +254,13 @@ static Tensor train_linear(const Tensor &a, const Weights &w, const Tensor &rout
   p.d = scatter_only ? nullptr : d.data_ptr();
   p.route = route.data_ptr<int64_t>();
   p.expert = expert.data_ptr<int>();
+  if (links) {
+    TORCH_CHECK(pull && links->device() == a.device() && links->is_contiguous() &&
+                    links->scalar_type() == at::kInt && links->dim() == 1 &&
+                    links->numel() == a.size(0),
+                "Invalid source-token fanout");
+    p.links = links->data_ptr<int>();
+  }
   p.ready = flags.data_ptr<int>();
   rtc::mega_moe_train_linear(p, pull, transpose, at::cuda::getCurrentCUDAStream());
   return d;
@@ -263,7 +271,8 @@ void init_mega_moe_fused_bindings(pybind11::module &m) {
         pybind11::arg("route"), pybind11::arg("expert"), pybind11::arg("peers"),
         pybind11::arg("rank"), pybind11::arg("capacity"), pybind11::arg("pull"),
         pybind11::arg("transpose"), pybind11::arg("scatter_only") = false,
-        pybind11::arg("topk") = 8, pybind11::call_guard<pybind11::gil_scoped_release>());
+        pybind11::arg("topk") = 8, pybind11::arg("links") = pybind11::none(),
+        pybind11::call_guard<pybind11::gil_scoped_release>());
   pybind11::class_<FusedStatus>(m, "MegaMoEFusedStatus").def(pybind11::init<const Tensor &>());
   m.def("mega_moe_fused_available", &fused_available);
   m.def("mega_moe_fused_workspace_sizes", &workspace_sizes, pybind11::arg("capacity"),

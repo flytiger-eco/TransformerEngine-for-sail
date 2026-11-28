@@ -100,8 +100,8 @@ void mega_moe_train_linear(const MegaMoETrainArgs &p, bool pull, bool transpose,
   const auto name =
       concat_strings("nvte_mega_moe_", transpose ? "fwd_" : "dgrad_", pull ? "pull" : "scatter");
   const bool scatter_only = !pull && p.d == nullptr;
-  const auto label =
-      concat_strings(name, "_k", p.k, "_n", p.n, "_topk", p.topk, scatter_only ? "_direct" : "");
+  const auto label = concat_strings(name, "_k", p.k, "_n", p.n, "_topk", p.topk,
+                                    scatter_only ? "_direct" : "", p.links ? "_fanout" : "");
   static std::mutex mutex;
   static std::set<std::pair<int, std::string>> configured;
   {
@@ -114,6 +114,7 @@ void mega_moe_train_linear(const MegaMoETrainArgs &p, bool pull, bool transpose,
            concat_strings("-DNVTE_GG_TRANS_B=", static_cast<int>(transpose)),
            "-DNVTE_GG_COMMON_K=1", "-DNVTE_GG_N_EXPAND=1", concat_strings("-DTRAIN_KERNEL=", name),
            concat_strings("-DTRAIN_PULL=", static_cast<int>(pull)),
+           concat_strings("-DTRAIN_FANOUT=", static_cast<int>(p.links != nullptr)),
            concat_strings("-DTRAIN_SCATTER_ONLY=", static_cast<int>(scatter_only)),
            concat_strings("-DTRAIN_TOPK=", p.topk), concat_strings("-DTRAIN_K=", p.k),
            concat_strings("-DTRAIN_N=", p.n)});
@@ -124,6 +125,15 @@ void mega_moe_train_linear(const MegaMoETrainArgs &p, bool pull, bool transpose,
       configured.insert({cuda::current_device(), label});
     }
   }
-  manager.launch_cooperative(label, cuda::sm_count(), 512, 196608, stream, p);
+  const int sms = cuda::sm_count();
+  // The peer array is zero-initialized and contains either eight or sixteen nonempty buffers.
+  // Direct scatter has no grid barrier. With at least three waves of row tiles, its eight
+  // column tiles per row provide enough work for four waves of independently scheduled CTAs.
+  if (scatter_only && p.peer[8] == nullptr && p.topk == 8 && p.n == 2048 &&
+      p.k == (transpose ? 512 : 1024) && p.capacity == 4096 && p.tiles >= 3 * sms) {
+    manager.launch(label, 4 * sms, 512, 196608, stream, p);
+  } else {
+    manager.launch_cooperative(label, sms, 512, 196608, stream, p);
+  }
 }
 }  // namespace transformer_engine::rtc

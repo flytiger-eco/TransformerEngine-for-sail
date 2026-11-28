@@ -106,11 +106,15 @@ __device__ __forceinline__ void scatter_shared(const MegaMoETrainArgs &p, int ti
 template <int Batch>
 __device__ __forceinline__ void pull_row(const MegaMoETrainArgs &p, int row) {
   constexpr int segments = TRAIN_K / 256;
+  int first_link = 0;
+  if constexpr (TRAIN_FANOUT) {
+    first_link = p.links[row];
+    if (first_link < 0) return;
+  }
   const int64_t route = static_cast<const int64_t *>(p.route)[row];
   const int src = route < 0 ? 0 : static_cast<int>(route >> 32);
   const auto token = route < 0 ? 0u : static_cast<unsigned>(route) / TRAIN_TOPK;
   const auto *from = static_cast<const B *>(p.peer[src]) + int64_t(token) * TRAIN_K;
-  auto *to = static_cast<B *>(p.a) + int64_t(row) * TRAIN_K;
   for (int first = 0; first < segments; first += Batch) {
     uint4 values[Batch];
     if (route < 0) {
@@ -127,10 +131,20 @@ __device__ __forceinline__ void pull_row(const MegaMoETrainArgs &p, int row) {
         if (first + j < segments)
           values[j] = __ppu_remote_load_bulk_b32x4(from + (first + j) * 256);
     }
+    int dest = row, next = first_link;
+#pragma unroll 1
+    for (int copy = 0; copy < (TRAIN_FANOUT ? TRAIN_TOPK : 1); ++copy) {
+      auto *to = static_cast<B *>(p.a) + int64_t(dest) * TRAIN_K;
 #pragma unroll
-    for (int j = 0; j < Batch; ++j)
-      if (first + j < segments)
-        __ppu_global_store_bulk_volatile_b32x4(to + (first + j) * 256, values[j]);
+      for (int j = 0; j < Batch; ++j)
+        if (first + j < segments)
+          __ppu_global_store_bulk_volatile_b32x4(to + (first + j) * 256, values[j]);
+      if constexpr (TRAIN_FANOUT) {
+        if (!next || next - 1 <= dest || next > p.tiles * 256) break;
+        dest = next - 1;
+        next = ~p.links[dest];
+      }
+    }
   }
 }
 

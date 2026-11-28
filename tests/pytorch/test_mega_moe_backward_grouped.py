@@ -146,20 +146,76 @@ def test_wgrad_checks_each_experts_reduction_length():
             _assert_gradient(grad[m[:, None], n], ref, 0.006)
 
 
-def test_wgrad_uses_live_rows_with_padded_offsets():
+@pytest.mark.parametrize("m,n", [(1024, 2048), (2048, 512)])
+def test_indexed_wgrad_uses_each_experts_reduction_length(m, n):
+    torch.manual_seed(613)
+    stride = 1216
+    counts = [0, 512, 959, 960, 1024, 1088, 1152, 1153] * 4
+    counts[8] = 1025
+    lengths = torch.tensor(counts, dtype=torch.int32, device="cuda")
+    offsets = torch.arange(len(counts) + 1, dtype=torch.int32, device="cuda") * stride
+    x = torch.full((len(counts) * stride, n), 7, dtype=torch.bfloat16, device="cuda")
+    dy = x.new_full((len(counts) * stride, m), -5)
+    grads = [x.new_full((m, n), float("nan")) for _ in counts]
+    for expert, count in enumerate(counts):
+        active = slice(expert * stride, expert * stride + count)
+        x[active].random_(-1, 2)
+        dy[active].random_(-1, 2)
+    tex.mega_moe_wgrad(dy, x, offsets, grads, False, lengths)
+    # Check both sides of every output tile, including the two four-column W1 groups.
+    rows = torch.arange(0, m, 256, device=x.device)
+    rows = torch.cat((rows, rows + 255))
+    cols = torch.arange(0, n, 256, device=x.device)
+    cols = torch.cat((cols, cols + 255))
+    for expert, (grad, count) in enumerate(zip(grads, counts)):
+        active = slice(expert * stride, expert * stride + count)
+        expected = dy[active, rows].float().T @ x[active, cols].float()
+        torch.testing.assert_close(grad[rows[:, None], cols], expected.to(x.dtype), atol=0, rtol=0)
+
+
+def test_dense_wgrad_overwrites_empty_and_partial_reductions():
+    torch.manual_seed(361)
+    stride, n = 1536, 2048
+    counts = (0, 129, stride, 64)
+    # The dense launcher needs (m // 256) * (n // 1024) * groups >= 2 * CUs.
+    cus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    tiles_per_m = (n // 1024) * len(counts)
+    m = 256 * ((2 * cus + tiles_per_m - 1) // tiles_per_m)
+    rows = len(counts) * stride
+    x = torch.full((rows, n), 7, dtype=torch.bfloat16, device="cuda")
+    dy = x.new_full((rows, m), -5)
+    lengths = torch.tensor(counts, dtype=torch.int32, device=x.device)
+    offsets = torch.arange(len(counts) + 1, dtype=torch.int32, device=x.device) * stride
+    grads = [x.new_full((m, n), float("nan")) for _ in counts]
+
+    # Small integers accumulate exactly in FP32. Keep every padded element nonzero.
+    for expert, count in enumerate(counts):
+        live = slice(expert * stride, expert * stride + count)
+        x[live].random_(-1, 2)
+        dy[live].random_(-1, 2)
+    tex.mega_moe_wgrad(dy, x, offsets, grads, False, lengths)
+    for expert, (count, grad) in enumerate(zip(counts, grads)):
+        live = slice(expert * stride, expert * stride + count)
+        reference = dy[live].float().T @ x[live].float()
+        torch.testing.assert_close(grad, reference.to(grad.dtype), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("m,n", [(1024, 2304), (2048, 2304), (5120, 2304), (4608, 5120)])
+def test_wgrad_uses_live_rows_with_padded_offsets(m, n):
     torch.manual_seed(303)
-    # The 33rd expert uses a second pointer window. The nine N tiles also
-    # exercise the remainder after two four-column work items.
+    # The 33rd expert uses a second pointer window.
     counts = [0, 64, 128, 192, 256] * 6 + [64, 192, 129]
+    counts[2] = 129  # Exercise a partial K tile in both pointer windows.
     device = "cuda"
-    m, n, stride = 1024, 2304, 256
+    # Both the 4+4+1 and 8+8+4 schedules rotate their tail across three tile rows.
+    stride = 256
     lengths = torch.tensor(counts, device=device, dtype=torch.int32)
     offsets = torch.arange(len(counts) + 1, device=device, dtype=torch.int32) * stride
     x = torch.randn(len(counts) * stride, n, device=device, dtype=torch.bfloat16)
     dy = torch.randn(len(counts) * stride, m, device=device, dtype=x.dtype)
     grads = [x.new_full((m, n), 1) for _ in counts]
     # Nonzero padding makes accidental reductions beyond the live rows observable.
-    rows = torch.tensor([0, 255, 256, m - 1], device=device)
+    rows = torch.tensor([0, 127, 128, 255, 256, m - 1], device=device)
     columns = torch.arange(0, n, 256, device=device)
     columns = torch.cat((columns, columns + 255))
     for accumulate in (True, False):
@@ -197,3 +253,35 @@ def test_backward_rejects_overlapping_outputs_with_separate_storage():
         tex.mega_moe_bulk_pull(ids, ids, dy, x, 1, 0, out=torch.from_dlpack(dy))
     torch.testing.assert_close(dy, saved_dy, atol=0, rtol=0)
     torch.testing.assert_close(probs, saved_probs, atol=0, rtol=0)
+
+
+def test_routed_activation_skips_padded_rows():
+    from transformer_engine.pytorch._mega_moe_train import _activation_grad, _save_activation
+
+    # At width 2304 a 2048-element flat block crosses live/padded rows in both
+    # directions. The adjacent padding rows also contain a fully padded block.
+    width = 2304
+    route = torch.tensor([0, -1, -1, 1 << 32], dtype=torch.int64, device="cuda")
+    live = route >= 0
+    prob = torch.tensor([0.0, float("nan"), float("nan"), 0.75], device=route.device)
+    torch.manual_seed(733)
+    z = torch.randn(route.numel(), 2 * width, dtype=torch.bfloat16, device=route.device)
+    dy = torch.randn(route.numel(), width, dtype=z.dtype, device=route.device)
+    z[0] = dy[0] = 1
+    z[~live] = dy[~live] = float("nan")
+
+    def run(routes):
+        y = torch.full_like(dy, float("nan"))
+        dz = torch.full_like(z, float("nan"))
+        dp = torch.full_like(prob, float("nan"))
+        _save_activation(z, prob, None, y, routes)
+        _activation_grad[(route.numel(),)](dy, z, prob, None, dz, dp, width, 4096, routes)
+        return y, dz, dp
+
+    expected = run(None)
+    y, dz, dp = run(route)
+    for value, reference in zip((y, dz, dp), expected):
+        torch.testing.assert_close(value[live], reference[live], atol=0, rtol=0)
+        torch.testing.assert_close(value[~live], torch.zeros_like(value[~live]), atol=0, rtol=0)
+    # A valid zero-probability route still has a derivative with respect to its weight.
+    assert dp[0] > 0

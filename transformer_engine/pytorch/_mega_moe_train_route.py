@@ -163,6 +163,7 @@ def _push(
     TOPK: tl.constexpr,
     BINS: tl.constexpr,
     B: tl.constexpr,
+    FANOUT: tl.constexpr = False,
 ):
     block = tl.program_id(0)
     lane = tl.arange(0, B)
@@ -181,15 +182,40 @@ def _push(
         - first
     )
     source_slot = block * B + key % B
+    if FANOUT:
+        # Invert the expert sort once. Slots of one source token pointing to
+        # the same owner share one activation and one output gradient.
+        inverse = tl.sort((key % B) * B + lane, descending=False) % B
+        owner = expert // E
+        head = tl.full((B,), 1, tl.int1)
+        successor = tl.full((B,), 2147483647, tl.int32)
+        for k in tl.static_range(TOPK):
+            other_slot = source_slot // TOPK * TOPK + k
+            other_lane = tl.gather(inverse, other_slot % B, 0)
+            same = (other_slot // B == block) & (tl.gather(owner, other_lane, 0) == owner)
+            other_row = tl.gather(row, other_lane, 0)
+            head = head & (~same | (other_row >= row))
+            successor = tl.minimum(
+                successor, tl.where(same & (other_row > row), other_row, 2147483647)
+            )
+        # A chain only moves forward in packed-row order. The pull for a projected
+        # prefix therefore also populates every duplicate row needed by the prefix.
+        link = tl.where(successor == 2147483647, 0, successor + 1)
+        link = tl.where(head, link, ~link)
     prob = tl.load(probs + source_slot // TOPK * ps0 + source_slot % TOPK * ps1, valid, 0)
     target = _peer(peers, expert // E) + 2 * row.to(tl.int64)
     route = ((tl.full((1,), 0, tl.int64) + rank) << 32) | source_slot.to(tl.int64)
     tl.store(target, route, valid)
-    tl.store(target + 1, prob.to(tl.int32, bitcast=True).to(tl.int64), valid)
+    if FANOUT:
+        bits = prob.to(tl.uint32, bitcast=True).to(tl.uint64)
+        payload = (link.to(tl.int64) << 32) | bits.to(tl.int64)
+    else:
+        payload = prob.to(tl.int32, bitcast=True).to(tl.int64)
+    tl.store(target + 1, payload, valid)
 
 
 @triton.jit
-def _unpack(buf, offsets, sizes, route, prob, tiles, E: tl.constexpr, NE: tl.constexpr):
+def _unpack(buf, offsets, sizes, route, prob, links, tiles, E: tl.constexpr, NE: tl.constexpr):
     tile = tl.program_id(0)
     row = tile * 256 + tl.arange(0, 256)
     index = tl.arange(0, NE)
@@ -199,7 +225,10 @@ def _unpack(buf, offsets, sizes, route, prob, tiles, E: tl.constexpr, NE: tl.con
     tl.store(tiles + tile, expert)
     source = buf + 2 * row.to(tl.int64)
     tl.store(route + row, tl.load(source, valid, -1))
-    bits = tl.load(source + 1, valid, 0).to(tl.int32)
+    payload = tl.load(source + 1, valid, 0)
+    if links is not None:
+        tl.store(links + row, (payload >> 32).to(tl.int32))
+    bits = payload.to(tl.int32)
     tl.store(prob + row, bits.to(tl.float32, bitcast=True))
 
 
@@ -377,6 +406,9 @@ def prepare(x, ids, probs, experts, width, aligned, group):
     if status:
         return None
     rows = host[rank]
+    # For at most two dgrad2 output-column tiles, routing overhead is small
+    # relative to repeated peer reads. The gathered width is identical on all ranks.
+    use_fanout = width <= 2 * 256
     # Storage is shared across steps. The results saved for backward have independent lifetimes.
     state = _workspace(group)
     with state.lock:
@@ -401,10 +433,12 @@ def prepare(x, ids, probs, experts, width, aligned, group):
                 k,
                 bins,
                 256,
+                use_fanout,
             )
         scratch.handle.barrier(channel=1)
         route = torch.empty(rows, dtype=torch.int64, device=x.device)
         packed_prob = torch.empty(rows, dtype=torch.float32, device=x.device)
+        links = torch.empty(rows, **kwargs) if use_fanout else None
         tiles = torch.empty(rows // 256, **kwargs)
         if rows:
             _unpack[(rows // 256,)](
@@ -413,13 +447,14 @@ def prepare(x, ids, probs, experts, width, aligned, group):
                 sizes,
                 route,
                 packed_prob,
+                links,
                 tiles,
                 experts,
                 triton.next_power_of_2(experts),
             )
         scratch.done.record(torch.cuda.current_stream(x.device))
     plan = TrainingRoute(group, cap, tokens, k, bool(dropped), bool(any_dropped))
-    return plan, route, tiles, offsets, packed_prob, (peers, output_slots), sizes[e:]
+    return plan, route, tiles, offsets, packed_prob, (peers, output_slots), sizes[e:], links
 
 
 def return_grad(dp, route, plan):
